@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import * as NodeChildProcess from "node:child_process";
 
 const fullShaPattern = /^[0-9a-f]{40}$/i;
 const stableTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
@@ -62,7 +62,7 @@ export function validateOfficialStableRelease(release, expectedTag) {
 }
 
 function git(root, ...args) {
-  return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  return NodeChildProcess.execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
 }
 
 function resolveCommit(root, expression, label) {
@@ -77,7 +77,7 @@ function resolveCommit(root, expression, label) {
 
 function assertAncestor(root, ancestor, descendant, label) {
   try {
-    execFileSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    NodeChildProcess.execFileSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
       cwd: root,
       stdio: "ignore",
     });
