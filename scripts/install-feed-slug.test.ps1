@@ -33,3 +33,4 @@ Remove-Item Env:T3CODE_HOME -ErrorAction SilentlyContinue
 Remove-Item Env:T3CODE_VERSION -ErrorAction SilentlyContinue
 Remove-Item Env:T3CODE_RELEASE_BASE_URL -ErrorAction SilentlyContinue
 Write-Output "PowerShell feed slug fixtures passed."
+$global:LASTEXITCODE = 0
