@@ -4,7 +4,10 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { capturePackageVersions, verifyCandidatePackageVersions } from "./fork-candidate-versions.mjs";
+import {
+  capturePackageVersions,
+  verifyCandidatePackageVersions,
+} from "./fork-candidate-versions.mjs";
 
 const files = [
   "apps/server/package.json",
@@ -32,8 +35,16 @@ test("records original package versions and verifies an explicit release-version
   const root = await fixture();
   t.after(() => rm(root, { recursive: true, force: true }));
   const record = await capturePackageVersions(root, "0.0.43-fork.1", "downstream/custom");
-  await assert.rejects(capturePackageVersions(root, "0.0.43-fork.1", "../custom"), /GitHub owner\/repository/);
-  assert.deepEqual(Object.values(record.sourcePackageVersions), ["0.0.1", "0.0.2", "0.0.3", "0.0.4"]);
+  await assert.rejects(
+    capturePackageVersions(root, "0.0.43-fork.1", "../custom"),
+    /GitHub owner\/repository/,
+  );
+  assert.deepEqual(Object.values(record.sourcePackageVersions), [
+    "0.0.1",
+    "0.0.2",
+    "0.0.3",
+    "0.0.4",
+  ]);
   assert.equal(record.applied, false);
   assert.equal(record.releaseRepository, "downstream/custom");
   for (const file of files) {
@@ -51,7 +62,10 @@ test("does not attest substitution if source identity or one package version mov
   const root = await fixture();
   t.after(() => rm(root, { recursive: true, force: true }));
   const record = await capturePackageVersions(root, "0.0.43-fork.1", "downstream/custom");
-  await assert.rejects(verifyCandidatePackageVersions(root, { ...record, sourceCommitSha: "f".repeat(40) }), /source commit changed/);
+  await assert.rejects(
+    verifyCandidatePackageVersions(root, { ...record, sourceCommitSha: "f".repeat(40) }),
+    /source commit changed/,
+  );
   const serverManifest = JSON.parse(await readFile(join(root, files[0]), "utf8"));
   serverManifest.version = record.candidateVersion;
   await writeFile(join(root, files[0]), `${JSON.stringify(serverManifest)}\n`);

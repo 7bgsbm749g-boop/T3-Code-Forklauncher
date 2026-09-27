@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 
 const fullShaPattern = /^[0-9a-f]{40}$/i;
 const stableTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?$/;
+const versionPattern =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 export function validateCandidateMetadata(input) {
   const sha = (value, label) => {
@@ -94,10 +95,16 @@ export function verifyCandidateGit(root, input, officialRelease) {
     throw new Error("checked-out HEAD does not match candidate_sha");
   }
   const sourceCommitSha = resolveCommit(root, metadata.sourceSha, "source_sha");
-  if (sourceCommitSha !== metadata.sourceSha) throw new Error("source_sha resolved to a different commit");
+  if (sourceCommitSha !== metadata.sourceSha)
+    throw new Error("source_sha resolved to a different commit");
   const targetCommitSha = resolveCommit(root, metadata.targetSha, "target_sha");
-  if (targetCommitSha !== metadata.targetSha) throw new Error("target_sha resolved to a different commit");
-  const peeledStableTagSha = resolveCommit(root, `refs/tags/${metadata.officialStableTag}`, "stable tag");
+  if (targetCommitSha !== metadata.targetSha)
+    throw new Error("target_sha resolved to a different commit");
+  const peeledStableTagSha = resolveCommit(
+    root,
+    `refs/tags/${metadata.officialStableTag}`,
+    "stable tag",
+  );
   if (peeledStableTagSha !== metadata.targetSha) {
     throw new Error("peeled official stable tag does not match target_sha");
   }

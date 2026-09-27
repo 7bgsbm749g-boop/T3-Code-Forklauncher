@@ -66,7 +66,9 @@ test("shell bootstrap uses a namespaced runtime and preserves unknown legacy dat
   await mkdir(bin);
   const archive = "candidate archive bytes";
   const archiveHash = createHash("sha256").update(archive).digest("hex");
-  await writeFile(join(bin, "curl"), `#!/bin/sh
+  await writeFile(
+    join(bin, "curl"),
+    `#!/bin/sh
 url= out=
 while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) url="$1"; shift ;; esac; done
 printf '%s\\n' "$url" >> "$CURL_URLS"
@@ -76,9 +78,12 @@ case "$url" in
   *) printf '%s' 'candidate archive bytes' > "$out" ;;
 esac
 printf 200
-`);
+`,
+  );
   await chmod(join(bin, "curl"), 0o755);
-  await writeFile(join(bin, "tar"), `#!/bin/sh
+  await writeFile(
+    join(bin, "tar"),
+    `#!/bin/sh
 target=
 while [ "$#" -gt 0 ]; do case "$1" in -C) target="$2"; shift 2 ;; *) shift ;; esac; done
 cat > "$target/t3" <<'T3'
@@ -86,7 +91,8 @@ cat > "$target/t3" <<'T3'
 printf 't3 v1.2.3\\n'
 T3
 chmod +x "$target/t3"
-`);
+`,
+  );
   await chmod(join(bin, "tar"), 0o755);
   const legacy = join(home, "runtime", "versions", "1.2.3");
   await mkdir(legacy, { recursive: true });
@@ -114,5 +120,8 @@ chmod +x "$target/t3"
     "1.2.3\ndownstream/custom\nhttps://github.com/downstream/custom/releases/download",
   );
   assert.equal(await readFile(join(legacy, "t3"), "utf8"), "legacy unknown runtime");
-  assert.match(await readFile(urlsPath, "utf8"), /github\.com\/downstream\/custom\/releases\/download\/v1\.2\.3\/SHA256SUMS/);
+  assert.match(
+    await readFile(urlsPath, "utf8"),
+    /github\.com\/downstream\/custom\/releases\/download\/v1\.2\.3\/SHA256SUMS/,
+  );
 });

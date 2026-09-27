@@ -66,7 +66,9 @@ export async function verifyCandidatePackageVersions(root, record) {
 if (import.meta.url === pathToFileURL(resolve(process.argv[1] ?? "")).href) {
   const [command, version, repository, alignmentPath] = process.argv.slice(2);
   if (!version || !repository || !alignmentPath || !["capture", "verify"].includes(command)) {
-    throw new Error("usage: fork-candidate-versions.mjs <capture|verify> <version> <owner/repo> <record.json>");
+    throw new Error(
+      "usage: fork-candidate-versions.mjs <capture|verify> <version> <owner/repo> <record.json>",
+    );
   }
   const path = resolve(alignmentPath);
   if (command === "capture") {
@@ -74,7 +76,8 @@ if (import.meta.url === pathToFileURL(resolve(process.argv[1] ?? "")).href) {
     await writeFile(path, `${JSON.stringify(record, null, 2)}\n`);
   } else {
     const record = JSON.parse(await readFile(path, "utf8"));
-    if (record.candidateVersion !== version || record.releaseRepository !== repository) throw new Error("version/feed record does not match candidate build input");
+    if (record.candidateVersion !== version || record.releaseRepository !== repository)
+      throw new Error("version/feed record does not match candidate build input");
     const verified = await verifyCandidatePackageVersions(process.cwd(), record);
     await writeFile(path, `${JSON.stringify(verified, null, 2)}\n`);
   }

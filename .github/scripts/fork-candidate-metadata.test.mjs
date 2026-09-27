@@ -79,25 +79,44 @@ test("validates full identities and exact official latest stable release metadat
     officialStableTag: tag,
     candidateVersion,
   };
-  assert.equal(validateCandidateMetadata({ ...input, candidateSha: input.candidateSha.toUpperCase() }).candidateSha, "a".repeat(40));
+  assert.equal(
+    validateCandidateMetadata({ ...input, candidateSha: input.candidateSha.toUpperCase() })
+      .candidateSha,
+    "a".repeat(40),
+  );
   assert.equal(validateOfficialStableRelease(release, tag).releaseId, 42);
   for (const bad of [
     { ...input, sourceSha: "abc" },
     { ...input, candidateSha: "z".repeat(40) },
     { ...input, officialStableTag: "v0.0.42-nightly.20260927.1" },
     { ...input, candidateVersion: "0.0.43-nightly.20260927.1" },
-  ]) assert.throws(() => validateCandidateMetadata(bad));
+  ])
+    assert.throws(() => validateCandidateMetadata(bad));
   assert.throws(() => validateOfficialStableRelease({ ...release, draft: true }, tag), /published/);
-  assert.throws(() => validateOfficialStableRelease({ ...release, prerelease: true }, tag), /published/);
-  assert.throws(() => validateOfficialStableRelease({ ...release, tag_name: "v0.0.41" }, tag), /tag/);
-  assert.throws(() => validateOfficialStableRelease({ ...release, html_url: "https://evil.invalid" }, tag), /URL/);
+  assert.throws(
+    () => validateOfficialStableRelease({ ...release, prerelease: true }, tag),
+    /published/,
+  );
+  assert.throws(
+    () => validateOfficialStableRelease({ ...release, tag_name: "v0.0.41" }, tag),
+    /tag/,
+  );
+  assert.throws(
+    () => validateOfficialStableRelease({ ...release, html_url: "https://evil.invalid" }, tag),
+    /URL/,
+  );
 });
 
 test("verifies real merge ancestry, exact candidate HEAD, and peeled annotated stable tag", async (t) => {
   const fixture = await createFixture(t);
   const evidence = verifyCandidateGit(fixture.root, fixture.input, release);
   assert.deepEqual(evidence.ancestry, { sourceInCandidate: true, targetInCandidate: true });
-  const manifest = createCandidateManifest(fixture.input, release, evidence, validAlignment(fixture.input));
+  const manifest = createCandidateManifest(
+    fixture.input,
+    release,
+    evidence,
+    validAlignment(fixture.input),
+  );
   assert.equal(manifest.gitEvidence.candidateCommitSha, fixture.input.candidateSha);
   assert.equal(manifest.targetSha, fixture.input.targetSha);
 });
@@ -130,18 +149,31 @@ test("rejects a tag moved after release metadata, a candidate mismatch, and miss
     sourceSha: missingSourceSha,
     targetSha: detachedTagSha,
   };
-  assert.throws(() => verifyCandidateGit(unrelatedRoot, unrelatedInput, release), /source_sha is not an ancestor/);
+  assert.throws(
+    () => verifyCandidateGit(unrelatedRoot, unrelatedInput, release),
+    /source_sha is not an ancestor/,
+  );
 });
 
 test("manifest refuses caller-written relationship booleans or mismatched version provenance", async (t) => {
   const fixture = await createFixture(t);
   const evidence = verifyCandidateGit(fixture.root, fixture.input, release);
   assert.throws(
-    () => createCandidateManifest(fixture.input, release, { relationshipsVerified: true }, validAlignment(fixture.input)),
+    () =>
+      createCandidateManifest(
+        fixture.input,
+        release,
+        { relationshipsVerified: true },
+        validAlignment(fixture.input),
+      ),
     /candidateCommitSha/,
   );
   assert.throws(
-    () => createCandidateManifest(fixture.input, release, evidence, { applied: true, candidateVersion: "0.0.99" }),
+    () =>
+      createCandidateManifest(fixture.input, release, evidence, {
+        applied: true,
+        candidateVersion: "0.0.99",
+      }),
     /version\/feed build inputs/,
   );
 });
