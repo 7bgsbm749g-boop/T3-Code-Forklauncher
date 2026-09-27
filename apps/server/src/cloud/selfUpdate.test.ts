@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
@@ -18,6 +19,8 @@ import * as ProcessRunner from "../processRunner.ts";
 import * as ServiceLauncherClient from "./serviceLauncherClient.ts";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
 import * as ServerSelfUpdate from "./selfUpdate.ts";
+
+const isServerSelfUpdateError = Schema.is(ServerSelfUpdateError);
 
 interface HarnessOptions {
   readonly mode?: "web" | "desktop";
@@ -144,7 +147,7 @@ it.layer(NodeServices.layer)("server self update", (it) => {
   it.effect("returns invalid feed configuration as a typed update error", () =>
     Effect.gen(function* () {
       const error = yield* makeHarness({ releaseRepository: "../invalid" }).pipe(Effect.flip);
-      if (!(error instanceof ServerSelfUpdateError)) {
+      if (!isServerSelfUpdateError(error)) {
         throw new Error(
           "Expected invalid release feed selection to produce a server self-update error.",
         );
