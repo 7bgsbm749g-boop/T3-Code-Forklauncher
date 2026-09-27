@@ -1,0 +1,59 @@
+name: Fork release feed checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - forklauncher
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-validation-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  windows-feed-slugs:
+    name: Windows feed slug fixtures
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Checkout without credentials
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/install.ps1
+            scripts/install-feed-slug.test.ps1
+          sparse-checkout-cone-mode: false
+      - name: Execute PowerShell bootstrap validation fixtures
+        shell: pwsh
+        run: ./scripts/install-feed-slug.test.ps1
+  validate:
+    name: Release feed and candidate metadata behavior tests
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout without credentials
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - name: Check candidate metadata logic
+        run: node --test .github/scripts/fork-candidate-metadata.test.mjs .github/scripts/fork-candidate-versions.test.mjs .github/scripts/install-feed-slug.test.mjs
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install focused shared dependencies
+        run: vp install --frozen-lockfile --filter=@t3tools/shared...
+      - name: Test CLI release feed resolution
+        run: vp test run packages/shared/src/cliRelease.test.ts

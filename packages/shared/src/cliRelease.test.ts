@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  BUILT_CLI_RELEASE_REPOSITORY,
   cliArchiveFileName,
   cliArchivePlatformKey,
   cliArchiveTarCommand,
@@ -9,6 +10,8 @@ import {
   cliReleaseIndexPageUrl,
   newestCliReleaseVersion,
   parseChecksums,
+  resolveCliReleaseBuildRepository,
+  resolveCliReleaseRepository,
 } from "./cliRelease.ts";
 
 describe("cliRelease", () => {
@@ -33,10 +36,23 @@ describe("cliRelease", () => {
 
   it("resolves download URLs under the tagged release, honoring a mirror", () => {
     expect(cliReleaseDownloadBaseUrl("1.2.3")).toBe(
-      "https://github.com/pingdotgg/t3code/releases/download/v1.2.3",
+      "https://github.com/7bgsbm749g-boop/t3-code-forklauncher/releases/download/v1.2.3",
     );
     expect(cliReleaseDownloadBaseUrl("1.2.3", "https://mirror.example/t3/")).toBe(
       "https://mirror.example/t3/v1.2.3",
+    );
+    expect(cliReleaseDownloadBaseUrl("1.2.3", undefined, "downstream/t3-custom")).toBe(
+      "https://github.com/downstream/t3-custom/releases/download/v1.2.3",
+    );
+    expect(
+      cliReleaseDownloadBaseUrl(
+        "1.2.3",
+        "https://mirror.example/releases/",
+        "downstream/t3-custom",
+      ),
+    ).toBe("https://mirror.example/releases/v1.2.3");
+    expect(cliReleaseDownloadBaseUrl("1.2.3", undefined, "DownStream/T3-Custom")).toBe(
+      "https://github.com/downstream/t3-custom/releases/download/v1.2.3",
     );
   });
 
@@ -87,8 +103,46 @@ describe("cliRelease", () => {
 
   it("pages through the release index at the largest page GitHub allows", () => {
     expect(cliReleaseIndexPageUrl(1)).toBe(
-      "https://api.github.com/repos/pingdotgg/t3code/releases?per_page=100&page=1",
+      "https://api.github.com/repos/7bgsbm749g-boop/T3-Code-Forklauncher/releases?per_page=100&page=1",
+    );
+    expect(cliReleaseIndexPageUrl(2, "downstream/t3-custom")).toBe(
+      "https://api.github.com/repos/downstream/t3-custom/releases?per_page=100&page=2",
     );
     expect(cliReleaseIndexPageUrl(3)).toContain("page=3");
+  });
+
+  it("validates explicit downstream repository selection", () => {
+    expect(resolveCliReleaseRepository(undefined)).toBe("7bgsbm749g-boop/T3-Code-Forklauncher");
+    expect(resolveCliReleaseRepository(" \t ")).toBe("7bgsbm749g-boop/T3-Code-Forklauncher");
+    expect(resolveCliReleaseRepository(" downstream/t3-custom ")).toBe("downstream/t3-custom");
+    expect(resolveCliReleaseRepository("\tdownstream/t3-custom\t")).toBe("downstream/t3-custom");
+    expect(resolveCliReleaseRepository("owner/repo..mirror")).toBe("owner/repo..mirror");
+    for (const invalid of ["owner", "owner/repo/extra", "owner /repo", "../repo"]) {
+      expect(() => resolveCliReleaseRepository(invalid)).toThrow(
+        "T3CODE_RELEASE_REPOSITORY must be a GitHub owner/repository slug",
+      );
+    }
+  });
+
+  it("persists the validated build feed while retaining a runtime override", () => {
+    expect(BUILT_CLI_RELEASE_REPOSITORY).toBe("7bgsbm749g-boop/T3-Code-Forklauncher");
+    const baseBuild = resolveCliReleaseBuildRepository({});
+    const downstreamBuild = resolveCliReleaseBuildRepository({
+      GITHUB_REPOSITORY: "downstream/custom",
+    });
+    const explicitBuild = resolveCliReleaseBuildRepository({
+      T3CODE_RELEASE_REPOSITORY: " downstream/explicit ",
+      GITHUB_REPOSITORY: "upstream/ignored",
+    });
+    expect(baseBuild).toBe("7bgsbm749g-boop/T3-Code-Forklauncher");
+    expect(downstreamBuild).toBe("downstream/custom");
+    expect(explicitBuild).toBe("downstream/explicit");
+    expect(resolveCliReleaseRepository(undefined, downstreamBuild)).toBe("downstream/custom");
+    expect(resolveCliReleaseRepository("runtime/override", downstreamBuild)).toBe(
+      "runtime/override",
+    );
+    expect(cliReleaseDownloadBaseUrl("1.2.3", undefined, downstreamBuild)).toBe(
+      "https://github.com/downstream/custom/releases/download/v1.2.3",
+    );
   });
 });

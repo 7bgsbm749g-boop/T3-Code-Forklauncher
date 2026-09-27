@@ -284,7 +284,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
           ConfigProvider.layer(
             ConfigProvider.fromEnv({
               env: {
-                T3CODE_DESKTOP_UPDATE_REPOSITORY: "pingdotgg/t3code",
+                T3CODE_DESKTOP_UPDATE_REPOSITORY: "downstream/t3-custom",
               },
             }),
           ),
@@ -295,25 +295,47 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
           ConfigProvider.layer(
             ConfigProvider.fromEnv({
               env: {
-                GITHUB_REPOSITORY: "pingdotgg/t3code",
+                GITHUB_REPOSITORY: "downstream/t3-custom",
               },
             }),
           ),
         ),
       );
+      const defaultConfig = yield* resolveGitHubPublishConfig("latest").pipe(
+        Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
+      );
 
       assert.deepStrictEqual(latestConfig, {
         provider: "github",
-        owner: "pingdotgg",
-        repo: "t3code",
+        owner: "downstream",
+        repo: "t3-custom",
         releaseType: "release",
       });
       assert.deepStrictEqual(nightlyConfig, {
         provider: "github",
-        owner: "pingdotgg",
-        repo: "t3code",
+        owner: "downstream",
+        repo: "t3-custom",
         releaseType: "prerelease",
         channel: "nightly",
+      });
+      assert.deepStrictEqual(defaultConfig, {
+        provider: "github",
+        owner: "7bgsbm749g-boop",
+        repo: "T3-Code-Forklauncher",
+        releaseType: "release",
+      });
+      const commonConfig = yield* resolveGitHubPublishConfig("latest").pipe(
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({ env: { T3CODE_RELEASE_REPOSITORY: "common/downstream" } }),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(commonConfig, {
+        provider: "github",
+        owner: "common",
+        repo: "downstream",
+        releaseType: "release",
       });
     }),
   );
@@ -354,18 +376,12 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.deepStrictEqual(release.publish, [
         {
           provider: "github",
-          owner: "pingdotgg",
-          repo: "t3code",
+          owner: "7bgsbm749g-boop",
+          repo: "T3-Code-Forklauncher",
           releaseType: "release",
         },
       ]);
-    }).pipe(
-      Effect.provide(
-        ConfigProvider.layer(
-          ConfigProvider.fromEnv({ env: { GITHUB_REPOSITORY: "pingdotgg/t3code" } }),
-        ),
-      ),
-    ),
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
   it("stages only the desktop main-process externals", () => {

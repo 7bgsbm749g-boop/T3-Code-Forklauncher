@@ -91,6 +91,11 @@ on:
       relay_url:
         required: true
         type: string
+      # The updater feed is embedded in the installed desktop app, so callers
+      # must select its repository at build time rather than relying on CI env.
+      update_repository:
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -105,6 +110,8 @@ jobs:
       T3CODE_CLERK_JWT_TEMPLATE: ${{ inputs.clerk_jwt_template }}
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ inputs.clerk_cli_oauth_client_id }}
       T3CODE_RELAY_URL: ${{ inputs.relay_url }}
+      T3CODE_RELEASE_REPOSITORY: ${{ inputs.update_repository || github.repository }}
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ inputs.update_repository || github.repository }}
     steps:
       # This repository is public, so Git needs no credentials. checkout's
       # credential cleanup runs submodule foreach even with submodules disabled,
@@ -154,7 +161,7 @@ jobs:
       - name: Install desktop dependencies
         env:
           pnpm_config_cache_dir: ${{ runner.temp }}/pnpm-metadata
-        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+        run: vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
 
       - name: Cache resource monitor
         id: resource_monitor_cache
@@ -197,7 +204,9 @@ jobs:
           cat "$config_path" >> "$GITHUB_ENV"
 
       - name: Align package versions to release version
-        run: node scripts/update-release-package-versions.ts "${{ inputs.version }}"
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: node scripts/update-release-package-versions.ts "$RELEASE_VERSION"
 
       # The artifact root is `apps/` (upload-artifact keeps the least common
       # ancestor of its paths), so extracting into `apps` restores
@@ -220,13 +229,16 @@ jobs:
       - name: Install Spectre-mitigated MSVC libs
         if: inputs.platform == 'win'
         shell: pwsh
+        env:
+          RELEASE_ARCH: ${{ inputs.arch }}
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $installPath = & $vswhere -products * -latest -property installationPath
           $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $runtimeComponent = if ($env:RELEASE_ARCH -eq "arm64") { "ARM64" } else { "x86.x64" }
           $proc = Start-Process -FilePath $setupExe `
             -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
-            "Microsoft.VisualStudio.Component.VC.Runtimes.${{ inputs.arch == 'arm64' && 'ARM64' || 'x86.x64' }}.Spectre", "--quiet", "--norestart" `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.$runtimeComponent.Spectre", "--quiet", "--norestart" `
             -Wait -PassThru -NoNewWindow
           if ($null -eq $proc -or $proc.ExitCode -ne 0) {
             $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
@@ -318,6 +330,10 @@ jobs:
       - name: Build desktop artifact
         shell: bash
         env:
+          RELEASE_PLATFORM: ${{ inputs.platform }}
+          RELEASE_TARGET: ${{ inputs.target }}
+          RELEASE_ARCH: ${{ inputs.arch }}
+          RELEASE_VERSION: ${{ inputs.version }}
           pnpm_config_cache_dir: ${{ runner.temp }}/pnpm-metadata
           T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
           T3CODE_DESKTOP_REUSE_LINUX_CAPTURE_HELPERS: ${{ steps.capture_helper_cache.outputs.cache-hit == 'true' }}
@@ -338,10 +354,10 @@ jobs:
           AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
         run: |
           args=(
-            --platform "${{ inputs.platform }}"
-            --target "${{ inputs.target }}"
-            --arch "${{ inputs.arch }}"
-            --build-version "${{ inputs.version }}"
+            --platform "$RELEASE_PLATFORM"
+            --target "$RELEASE_TARGET"
+            --arch "$RELEASE_ARCH"
+            --build-version "$RELEASE_VERSION"
             --skip-build
             --verbose
           )
@@ -355,7 +371,7 @@ jobs:
             return 0
           }
 
-          if [[ "${{ inputs.platform }}" == "mac" ]]; then
+          if [[ "$RELEASE_PLATFORM" == "mac" ]]; then
             if has_all "$CSC_LINK" "$CSC_KEY_PASSWORD" "$APPLE_API_KEY" "$APPLE_API_KEY_ID" "$APPLE_API_ISSUER"; then
               if ! has_all "$APPLE_TEAM_ID" "$MACOS_PROVISIONING_PROFILE"; then
                 echo "macOS signing is configured, but APPLE_TEAM_ID or MACOS_PROVISIONING_PROFILE is missing." >&2
@@ -377,10 +393,10 @@ jobs:
             else
               echo "macOS signing disabled (missing one or more Apple signing secrets)."
             fi
-          elif [[ "${{ inputs.platform }}" == "win" ]]; then
+          elif [[ "$RELEASE_PLATFORM" == "win" ]]; then
             # Embed the Linux CLI archive built by the same-arch Linux job as
             # the WSL runtime. Required for a working WSL backend on Windows.
-            args+=(--wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-${{ inputs.arch }}.tar.gz)
+            args+=(--wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-${RELEASE_ARCH}.tar.gz)
             if has_all \
               "$AZURE_TENANT_ID" \
               "$AZURE_CLIENT_ID" \
@@ -395,7 +411,7 @@ jobs:
               echo "Windows signing disabled (missing one or more Azure Trusted Signing secrets)."
             fi
           else
-            echo "Signing disabled for ${{ inputs.platform }}."
+            echo "Signing disabled for $RELEASE_PLATFORM."
           fi
 
           vp run dist:desktop:artifact "${args[@]}"
@@ -449,20 +465,27 @@ jobs:
       - name: Stage resource monitor for the CLI archive
         if: inputs.cli_archive
         shell: bash
+        env:
+          RELEASE_PLATFORM: ${{ inputs.platform }}
+          RELEASE_RESOURCE_KEY: ${{ inputs.resource_key }}
+          RELEASE_RUST_TARGET: ${{ inputs.rust_target }}
         run: |
           set -euo pipefail
           binary_name="t3-resource-monitor"
-          if [[ "${{ inputs.platform }}" == "win" ]]; then
+          if [[ "$RELEASE_PLATFORM" == "win" ]]; then
             binary_name="${binary_name}.exe"
           fi
-          target_dir="$RUNNER_TEMP/cli-resource-monitor/${{ inputs.resource_key }}"
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/$RELEASE_RESOURCE_KEY"
           mkdir -p "$target_dir"
-          cp "native/resource-monitor/target/${{ inputs.rust_target }}/release/${binary_name}" "$target_dir/$binary_name"
+          cp "native/resource-monitor/target/$RELEASE_RUST_TARGET/release/${binary_name}" "$target_dir/$binary_name"
 
       - name: Build CLI archive
         if: inputs.cli_archive
         shell: bash
         env:
+          RELEASE_PLATFORM: ${{ inputs.platform }}
+          RELEASE_ARCH: ${{ inputs.arch }}
+          RELEASE_VERSION: ${{ inputs.version }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -474,22 +497,24 @@ jobs:
           AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.platform }}" == "mac" && -n "${APPLE_API_KEY:-}" ]]; then
+          if [[ "$RELEASE_PLATFORM" == "mac" && -n "${APPLE_API_KEY:-}" ]]; then
             key_path="$RUNNER_TEMP/AuthKey_cli_${APPLE_API_KEY_ID}.p8"
             printf '%s' "$APPLE_API_KEY" > "$key_path"
             export APPLE_API_KEY="$key_path"
           fi
           node scripts/build-cli-archive.ts \
-            --platform "${{ inputs.platform }}" \
-            --arch "${{ inputs.arch }}" \
-            --version "${{ inputs.version }}" \
+            --platform "$RELEASE_PLATFORM" \
+            --arch "$RELEASE_ARCH" \
+            --version "$RELEASE_VERSION" \
             --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
             --output-dir release-cli
 
       - name: Smoke-test CLI archive
         if: inputs.cli_archive
         shell: bash
-        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ inputs.version }}"
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$RELEASE_VERSION"
 
       - name: Upload CLI archive
         if: inputs.cli_archive
@@ -498,9 +523,14 @@ jobs:
           name: cli-${{ inputs.platform }}-${{ inputs.arch }}
           path: release-cli/*
           if-no-files-found: error
+          retention-days: 3
 
       - name: Collect release assets
         shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
+          RELEASE_PLATFORM: ${{ inputs.platform }}
+          RELEASE_ARCH: ${{ inputs.arch }}
         run: |
           set -euo pipefail
           mkdir -p release-publish
@@ -515,7 +545,7 @@ jobs:
           # Preview builds have no publish config, so electron-builder writes
           # no feed manifest for them, but it still emits blockmaps beside the
           # installers. Neither belongs on a release no updater may follow.
-          if [[ "${{ inputs.release_channel }}" != "preview" ]]; then
+          if [[ "$RELEASE_CHANNEL" != "preview" ]]; then
             patterns+=("release/*.blockmap" "release/*.yml")
           fi
           for pattern in "${patterns[@]}"; do
@@ -524,10 +554,10 @@ jobs:
             done
           done
 
-          if [[ "${{ inputs.platform }}" == "mac" && "${{ inputs.arch }}" != "arm64" ]]; then
+          if [[ "$RELEASE_PLATFORM" == "mac" && "$RELEASE_ARCH" != "arm64" ]]; then
             shopt -s nullglob
             for manifest in release-publish/*-mac.yml; do
-              mv "$manifest" "${manifest%.yml}-${{ inputs.arch }}.yml"
+              mv "$manifest" "${manifest%.yml}-${RELEASE_ARCH}.yml"
             done
           fi
 
@@ -536,23 +566,27 @@ jobs:
           # arm64 jobs would upload the same name. Suffix each per-arch copy;
           # the release job merges them back into one manifest per channel.
           # builder-debug.yml is electron-builder's config dump, not a feed.
-          if [[ "${{ inputs.platform }}" == "win" ]]; then
+          if [[ "$RELEASE_PLATFORM" == "win" ]]; then
             for manifest in release-publish/*.yml; do
               [[ "$manifest" == */builder-debug.yml ]] && continue
-              mv "$manifest" "${manifest%.yml}-win-${{ inputs.arch }}.yml"
+              mv "$manifest" "${manifest%.yml}-win-${RELEASE_ARCH}.yml"
             done
           fi
 
       - name: Collect resource monitor
         shell: bash
+        env:
+          RELEASE_PLATFORM: ${{ inputs.platform }}
+          RELEASE_RUST_TARGET: ${{ inputs.rust_target }}
+          RELEASE_RESOURCE_KEY: ${{ inputs.resource_key }}
         run: |
           set -euo pipefail
           binary_name="t3-resource-monitor"
-          if [[ "${{ inputs.platform }}" == "win" ]]; then
+          if [[ "$RELEASE_PLATFORM" == "win" ]]; then
             binary_name="${binary_name}.exe"
           fi
-          source_path="native/resource-monitor/target/${{ inputs.rust_target }}/release/${binary_name}"
-          target_dir="resource-monitor-publish/${{ inputs.resource_key }}"
+          source_path="native/resource-monitor/target/$RELEASE_RUST_TARGET/release/${binary_name}"
+          target_dir="resource-monitor-publish/$RELEASE_RESOURCE_KEY"
           mkdir -p "$target_dir"
           cp "$source_path" "$target_dir/$binary_name"
 
@@ -562,6 +596,7 @@ jobs:
           name: desktop-${{ inputs.platform }}-${{ inputs.arch }}
           path: release-publish/*
           if-no-files-found: error
+          retention-days: 3
 
       - name: Upload resource monitor
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -569,3 +604,4 @@ jobs:
           name: resource-monitor-${{ inputs.resource_key }}
           path: resource-monitor-publish/${{ inputs.resource_key }}/*
           if-no-files-found: error
+          retention-days: 3

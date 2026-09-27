@@ -24,7 +24,8 @@ import {
   serviceStateHasPendingUpdate,
 } from "./serviceProtocol.ts";
 
-const linuxRuntime = "/home/theo/.t3/runtime/versions/1.2.3/t3";
+const linuxRuntime =
+  "/home/theo/.t3/runtime/versions/.feeds/7bgsbm749g-boop/t3-code-forklauncher/1.2.3/t3";
 const linuxPlan = {
   program: [linuxRuntime, "__service-launcher"],
   baseDir: "/home/theo/.t3",
@@ -40,9 +41,29 @@ it("runs the pinned runtime's own executable as the systemd launcher", () => {
   expect(unit).not.toContain("node");
 });
 
+it("keeps an explicit downstream release feed in the service child environment", () => {
+  const plan = {
+    ...linuxPlan,
+    releaseRepository: "downstream/t3-custom",
+    releaseBaseUrl: "https://mirror.example/releases",
+  };
+  const unit = BootService.renderBootServiceUnit(plan);
+  expect(unit).toContain("Environment=T3CODE_RELEASE_REPOSITORY=downstream/t3-custom");
+  expect(unit).toContain("Environment=T3CODE_RELEASE_BASE_URL=https://mirror.example/releases");
+
+  const plist = BootService.renderBootServicePlist(plan, macRenderOptions);
+  expect(plist).toContain("<key>T3CODE_RELEASE_REPOSITORY</key>");
+  expect(plist).toContain("<string>downstream/t3-custom</string>");
+  expect(plist).toContain("<key>T3CODE_RELEASE_BASE_URL</key>");
+  expect(plist).toContain("<string>https://mirror.example/releases</string>");
+});
+
 it("reads the served T3 home back out of a rendered unit or plist", () => {
   const plan = (baseDir: string) => ({
-    program: [`${baseDir}/runtime/versions/1.2.3/t3`, "__service-launcher"],
+    program: [
+      `${baseDir}/runtime/versions/.feeds/7bgsbm749g-boop/t3-code-forklauncher/1.2.3/t3`,
+      "__service-launcher",
+    ],
     baseDir,
     logPath: `${baseDir}/userdata/logs/boot-service.log`,
     unitPath: "/home/theo/.config/systemd/user/t3code.service",
@@ -74,7 +95,8 @@ it("survives the kernel OOM-killing a greedy agent child", () => {
   expect(unit).toContain("OOMPolicy=continue");
 });
 
-const macRuntime = "/Users/theo/.t3/runtime/versions/1.2.3/t3";
+const macRuntime =
+  "/Users/theo/.t3/runtime/versions/.feeds/7bgsbm749g-boop/t3-code-forklauncher/1.2.3/t3";
 const macPlan = {
   program: [macRuntime, "__service-launcher"],
   baseDir: "/Users/theo/.t3",
@@ -133,6 +155,7 @@ it("escapes XML in host paths", () => {
 const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
   platform: NodeJS.Platform = "linux",
   installerPath = macInstallerPath,
+  releaseRepository?: string,
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -144,7 +167,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
   const runtime = pinnedRuntimePaths(path, baseDir, "1.2.3", platform);
   yield* fs.makeDirectory(path.dirname(runtime.entryPath), { recursive: true });
   yield* fs.writeFileString(runtime.entryPath, "#!/bin/sh\n");
-  yield* fs.writeFileString(runtime.sentinelPath, "1.2.3\n");
+  yield* fs.writeFileString(runtime.sentinelPath, runtime.sentinelContents);
 
   const commands: string[] = [];
   const timeouts = new Map<string, unknown>();
@@ -184,7 +207,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
           input.args[0] === "--version"
             ? // The runtime under test reports the version of the directory it
               // was launched from, like the real executable.
-              `t3 v${/versions\/([^/]+)\//.exec(input.command)?.[1] ?? "1.2.3"}\n`
+              `t3 v${/versions\/(?:\.feeds\/[^/]+\/[^/]+\/)?([^/]+)\//.exec(input.command)?.[1] ?? "1.2.3"}\n`
             : input.command === "loginctl" && input.args[0] === "show-user"
               ? `${control.linger}\n`
               : input.args[1] === "is-enabled"
@@ -215,7 +238,7 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
       const paths = pinnedRuntimePaths(path, serviceBaseDir, cliVersion, platform);
       yield* fs.makeDirectory(path.dirname(paths.entryPath), { recursive: true });
       yield* fs.writeFileString(paths.entryPath, "#!/bin/sh\n");
-      yield* fs.writeFileString(paths.sentinelPath, `${cliVersion}\n`);
+      yield* fs.writeFileString(paths.sentinelPath, paths.sentinelContents);
       return yield* BootService.make({
         baseDir: serviceBaseDir,
         logsDir: path.join(serviceBaseDir, "userdata", "logs"),
@@ -240,6 +263,9 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
                 ...(environmentPath === undefined || environmentPath === ""
                   ? {}
                   : { PATH: environmentPath }),
+                ...(releaseRepository === undefined
+                  ? {}
+                  : { T3CODE_RELEASE_REPOSITORY: releaseRepository }),
               },
             }),
           ),
@@ -251,6 +277,13 @@ const makeHarness = Effect.fn("test.make_boot_service_harness")(function* (
 });
 
 it.layer(NodeServices.layer)("boot service install", (it) => {
+  it.effect("returns invalid feed configuration as a typed install error", () =>
+    Effect.gen(function* () {
+      const error = yield* makeHarness("linux", macInstallerPath, "../invalid").pipe(Effect.flip);
+      expect(error._tag).toBe("BootServiceInstallError");
+    }),
+  );
+
   it.effect(
     "fails before installing files or validating a runtime when lingering needs an administrator",
     () =>
@@ -502,7 +535,9 @@ it.layer(NodeServices.layer)("boot service install", (it) => {
         protocol: SERVICE_LAUNCHER_PROTOCOL,
         activeVersion: "1.2.4",
       });
-      expect(yield* fs.readFileString(plan.unitPath)).toContain("versions/1.2.4/t3");
+      expect(yield* fs.readFileString(plan.unitPath)).toContain(
+        "versions/.feeds/7bgsbm749g-boop/t3-code-forklauncher/1.2.4/t3",
+      );
       expect(
         commands.filter(
           (command) => command.startsWith("systemctl ") && !command.includes("show-environment"),

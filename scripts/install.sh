@@ -10,15 +10,17 @@
 #   T3CODE_VERSION           exact version to install (overrides T3CODE_CHANNEL)
 #   T3CODE_HOME              T3 home directory (default: ~/.t3)
 #   T3CODE_INSTALL_BIN_DIR   where the `t3` symlink goes (default: ~/.local/bin)
-#   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
+#   T3CODE_RELEASE_REPOSITORY owner/repo for release index and assets
+#                            (default: 7bgsbm749g-boop/T3-Code-Forklauncher)
+#   T3CODE_RELEASE_BASE_URL  mirror for release assets (default: GitHub)
 #
-# The archive is unpacked into $T3CODE_HOME/runtime/versions/<version>, the
-# same layout `t3 service install` uses, so the service reuses this download
-# instead of fetching the release again.
+# Every feed is unpacked into a repository-scoped .feeds path. Version-only
+# entries from older installers have unknown provenance and are left unused.
 set -eu
 
-repo="pingdotgg/t3code"
-base_url="${T3CODE_RELEASE_BASE_URL:-https://github.com/${repo}/releases/download}"
+raw_repo="${T3CODE_RELEASE_REPOSITORY:-7bgsbm749g-boop/T3-Code-Forklauncher}"
+repo="$(printf '%s' "$raw_repo" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+if [ -z "$repo" ]; then repo="7bgsbm749g-boop/T3-Code-Forklauncher"; fi
 t3_home="${T3CODE_HOME:-$HOME/.t3}"
 bin_dir="${T3CODE_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 
@@ -26,6 +28,21 @@ fail() {
   printf 't3 install: %s\n' "$1" >&2
   exit 1
 }
+
+case "$repo" in
+  */*) owner="${repo%%/*}"; name="${repo#*/}" ;;
+  *) owner=""; name="" ;;
+esac
+case "$repo" in
+  */*/*|/*|*/) fail "T3CODE_RELEASE_REPOSITORY must be a GitHub owner/repository slug" ;;
+esac
+case "$owner$name" in *[!A-Za-z0-9_.-]*|'') fail "T3CODE_RELEASE_REPOSITORY must be a GitHub owner/repository slug" ;; esac
+case "$owner:$name" in .:*|..:*|*:.|*:..) fail "T3CODE_RELEASE_REPOSITORY must be a GitHub owner/repository slug" ;; esac
+normalized_repo="$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')"
+base_url="${T3CODE_RELEASE_BASE_URL:-https://github.com/${normalized_repo}/releases/download}"
+base_url="$(printf '%s' "$base_url" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+if [ -z "$base_url" ]; then base_url="https://github.com/${normalized_repo}/releases/download"; fi
+while [ "${base_url%/}" != "$base_url" ]; do base_url="${base_url%/}"; done
 
 # Exit 44 on a 404 so callers can tell "no such asset" from a network failure.
 fetch() {
@@ -97,12 +114,15 @@ esac
 stem="t3-${version}-${platform}-${arch}"
 archive="${stem}.tar.gz"
 versions_dir="${t3_home}/runtime/versions"
-target_dir="${versions_dir}/${version}"
+owner="$(printf '%s' "${repo%%/*}" | tr '[:upper:]' '[:lower:]')"
+name="$(printf '%s' "${repo#*/}" | tr '[:upper:]' '[:lower:]')"
+target_dir="${versions_dir}/.feeds/${owner}/${name}/${version}"
+expected_marker="$(printf '%s\n%s\n%s' "$version" "$normalized_repo" "$base_url")"
 
-if [ -f "${target_dir}/.install-complete" ] && [ "$(cat "${target_dir}/.install-complete")" = "$version" ]; then
+if [ -f "${target_dir}/.install-complete" ] && [ "$(cat "${target_dir}/.install-complete")" = "$expected_marker" ]; then
   printf 't3 %s is already installed at %s\n' "$version" "$target_dir"
 else
-  mkdir -p "$versions_dir"
+  mkdir -p "$(dirname "$target_dir")"
   staging="$(mktemp -d "${versions_dir}/.staging-XXXXXX")"
   trap 'rm -rf "$staging"' EXIT
 
@@ -124,7 +144,7 @@ else
   tar -xzf "${staging}/${archive}" -C "$staging" --strip-components=1
   rm -f "${staging}/${archive}" "${staging}/SHA256SUMS"
   "${staging}/t3" --version >/dev/null || fail "the downloaded executable does not run"
-  printf '%s\n' "$version" > "${staging}/.install-complete"
+  printf '%s' "$expected_marker" > "${staging}/.install-complete"
 
   rm -rf "$target_dir"
   mv "$staging" "$target_dir"

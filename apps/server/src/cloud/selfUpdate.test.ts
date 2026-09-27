@@ -3,6 +3,7 @@ import { expect, it } from "@effect/vitest";
 import { ServerSelfUpdateError, ThreadId } from "@t3tools/contracts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Cause from "effect/Cause";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -24,6 +25,7 @@ interface HarnessOptions {
   readonly preflight?: "ready" | "blocked";
   readonly requestUpdate?: ServiceLauncherClient.ServiceLauncherClient["Service"]["requestUpdate"];
   readonly desktopAppUpdate?: DesktopAppUpdate.DesktopAppUpdate["Service"];
+  readonly releaseRepository?: string;
 }
 
 // The staged runtime is a release archive: the fake client serves SHA256SUMS
@@ -124,11 +126,29 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
     Effect.provideService(HostProcessPlatform, "linux"),
     Effect.provideService(HostProcessArchitecture, "x64"),
     Effect.provide(ServerConfig.layer({ ...config, mode: options.mode ?? "web" })),
+    Effect.provide(
+      ConfigProvider.layer(
+        ConfigProvider.fromEnv({
+          env:
+            options.releaseRepository === undefined
+              ? {}
+              : { T3CODE_RELEASE_REPOSITORY: options.releaseRepository },
+        }),
+      ),
+    ),
   );
   return { selfUpdate, order };
 });
 
 it.layer(NodeServices.layer)("server self update", (it) => {
+  it.effect("returns invalid feed configuration as a typed update error", () =>
+    Effect.gen(function* () {
+      const error = yield* makeHarness({ releaseRepository: "../invalid" }).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(ServerSelfUpdateError);
+      expect(error.reason).toBe("Invalid T3 release repository.");
+    }),
+  );
+
   it.effect("marks running threads at the boot-service handoff", () =>
     Effect.gen(function* () {
       const events: string[] = [];

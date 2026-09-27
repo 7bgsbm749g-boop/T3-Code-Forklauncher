@@ -9,15 +9,17 @@
 #   T3CODE_VERSION           exact version to install (overrides T3CODE_CHANNEL)
 #   T3CODE_HOME              T3 home directory (default: ~\.t3)
 #   T3CODE_INSTALL_BIN_DIR   where t3.exe is linked (default: ~\.local\bin)
-#   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
+#   T3CODE_RELEASE_REPOSITORY owner/repo for release index and assets
+#                            (default: 7bgsbm749g-boop/T3-Code-Forklauncher)
+#   T3CODE_RELEASE_BASE_URL  mirror for release assets (default: GitHub)
 #
-# The archive is unpacked into $T3CODE_HOME\runtime\versions\<version>, the
-# same layout `t3 service install` uses, so the service reuses this download.
+# Every feed is unpacked into a repository-scoped .feeds path. Version-only
+# entries from older installers have unknown provenance and are left unused.
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$repo = "pingdotgg/t3code"
-$baseUrl = if ($env:T3CODE_RELEASE_BASE_URL) { $env:T3CODE_RELEASE_BASE_URL.TrimEnd("/") } else { "https://github.com/$repo/releases/download" }
+$repo = if ($env:T3CODE_RELEASE_REPOSITORY) { $env:T3CODE_RELEASE_REPOSITORY.Trim() } else { "7bgsbm749g-boop/T3-Code-Forklauncher" }
+if ([string]::IsNullOrWhiteSpace($repo)) { $repo = "7bgsbm749g-boop/T3-Code-Forklauncher" }
 $t3Home = if ($env:T3CODE_HOME) { $env:T3CODE_HOME } else { Join-Path $HOME ".t3" }
 $binDir = if ($env:T3CODE_INSTALL_BIN_DIR) { $env:T3CODE_INSTALL_BIN_DIR } else { Join-Path $HOME ".local\bin" }
 
@@ -25,6 +27,13 @@ function Fail([string] $message) {
   Write-Error "t3 install: $message"
   exit 1
 }
+
+if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or $repo -match '(^|/)\.\.?(/|$)') {
+  Fail "T3CODE_RELEASE_REPOSITORY must be a GitHub owner/repository slug"
+}
+$normalizedRepo = $repo.ToLowerInvariant()
+$baseUrl = if ($env:T3CODE_RELEASE_BASE_URL) { $env:T3CODE_RELEASE_BASE_URL.Trim().TrimEnd("/") } else { "https://github.com/$normalizedRepo/releases/download" }
+if ([string]::IsNullOrWhiteSpace($baseUrl)) { $baseUrl = "https://github.com/$normalizedRepo/releases/download" }
 
 # PROCESSOR_ARCHITEW6432 reports the real machine when a 32-bit PowerShell
 # runs under WOW64; RuntimeInformation needs .NET 4.7.1+, which 5.1 hosts
@@ -63,13 +72,20 @@ if ($version -match '-preview\.') {
 $stem = "t3-$version-win32-$arch"
 $archive = "$stem.zip"
 $versionsDir = Join-Path $t3Home "runtime\versions"
-$targetDir = Join-Path $versionsDir $version
+$owner = ($repo.Split("/")[0]).ToLowerInvariant()
+$name = ($repo.Split("/")[1]).ToLowerInvariant()
+$targetDir = Join-Path (Join-Path (Join-Path (Join-Path $versionsDir ".feeds") $owner) $name) $version
+$expectedMarker = "$version`n$normalizedRepo`n$baseUrl"
 $marker = Join-Path $targetDir ".install-complete"
+if ($env:T3CODE_INSTALL_VALIDATE_ONLY -eq "1") {
+  Write-Output (ConvertTo-Json -Compress @{ repository = $repo; targetDir = $targetDir; marker = $expectedMarker })
+  exit 0
+}
 
-if ((Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $version)) {
+if ((Test-Path $marker) -and ([System.IO.File]::ReadAllText($marker, [System.Text.Encoding]::UTF8) -eq $expectedMarker)) {
   Write-Host "t3 $version is already installed at $targetDir"
 } else {
-  New-Item -ItemType Directory -Force -Path $versionsDir | Out-Null
+  New-Item -ItemType Directory -Force -Path (Split-Path $targetDir -Parent) | Out-Null
   $staging = Join-Path $versionsDir (".staging-" + [System.IO.Path]::GetRandomFileName())
   New-Item -ItemType Directory -Path $staging | Out-Null
   try {
@@ -98,7 +114,11 @@ if ((Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $version)) {
 
     & (Join-Path $staging "t3.exe") --version | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "the downloaded executable does not run" }
-    Set-Content -Path (Join-Path $staging ".install-complete") -Value $version -NoNewline
+    [System.IO.File]::WriteAllText(
+      (Join-Path $staging ".install-complete"),
+      $expectedMarker,
+      (New-Object System.Text.UTF8Encoding $false)
+    )
 
     if (Test-Path $targetDir) { Remove-Item $targetDir -Recurse -Force }
     Move-Item $staging $targetDir

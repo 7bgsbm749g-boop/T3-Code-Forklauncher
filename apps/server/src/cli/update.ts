@@ -8,10 +8,13 @@ import {
 } from "@t3tools/shared/hostProcess";
 import {
   CLI_RELEASE_BASE_URL_ENV,
+  CLI_RELEASE_REPOSITORY_ENV,
+  BUILT_CLI_RELEASE_REPOSITORY,
   CLI_RELEASE_CHANNELS,
   cliReleaseIndexPageUrl,
   cliReleaseChannelOf,
   newestCliReleaseVersion,
+  resolveCliReleaseRepository,
   type CliReleaseChannel,
 } from "@t3tools/shared/cliRelease";
 import * as Console from "effect/Console";
@@ -37,6 +40,7 @@ import {
   pinnedRuntimeCommand,
   PinnedRuntimeInstallError,
   pinnedRuntimePaths,
+  pinnedRuntimeVersionsDir,
 } from "../cloud/pinnedRuntime.ts";
 import { compareExactServiceVersions, isExactServiceVersion } from "../cloud/serviceProtocol.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -68,12 +72,13 @@ const RELEASE_INDEX_MAX_PAGES = 10;
 /** Asks GitHub for the newest published version on a channel, page by page. */
 const resolveNewestVersion = Effect.fn("cli.update.resolve_newest")(function* (
   channel: CliReleaseChannel,
+  repository: string,
 ) {
   const httpClient = yield* HttpClient.HttpClient;
   for (let page = 1; page <= RELEASE_INDEX_MAX_PAGES; page += 1) {
     const body = yield* httpClient
       .execute(
-        HttpClientRequest.get(cliReleaseIndexPageUrl(page)).pipe(
+        HttpClientRequest.get(cliReleaseIndexPageUrl(page, repository)).pipe(
           HttpClientRequest.setHeader("Accept", "application/vnd.github+json"),
         ),
       )
@@ -347,17 +352,30 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   const platform = yield* HostProcessPlatform;
   const arch = yield* HostProcessArchitecture;
   const environment = yield* HostProcessEnvironment;
+  const releaseBaseUrl = environment[CLI_RELEASE_BASE_URL_ENV]?.trim() || undefined;
   const httpClient = yield* HttpClient.HttpClient;
   const service = yield* BootService.BootService;
 
   const currentVersion = packageJson.version;
   const channel = input.channel ?? cliReleaseChannelOf(currentVersion);
+  let releaseRepository: string;
+  try {
+    releaseRepository = resolveCliReleaseRepository(
+      environment[CLI_RELEASE_REPOSITORY_ENV],
+      BUILT_CLI_RELEASE_REPOSITORY,
+    );
+  } catch (cause) {
+    return yield* new CliUpdateError({
+      reason: cause instanceof Error ? cause.message : "Invalid T3 release repository.",
+    });
+  }
   if (input.requestedVersion !== undefined && !isExactServiceVersion(input.requestedVersion)) {
     return yield* new CliUpdateError({
       reason: `'${input.requestedVersion}' is not an exact t3 version.`,
     });
   }
-  const targetVersion = input.requestedVersion ?? (yield* resolveNewestVersion(channel));
+  const targetVersion =
+    input.requestedVersion ?? (yield* resolveNewestVersion(channel, releaseRepository));
   const targetChannel = cliReleaseChannelOf(targetVersion);
 
   // Preview is a maintainers' dogfooding train: it is cut by hand from
@@ -440,9 +458,29 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   }
 
   const alreadyOnDisk = yield* fs
-    .readFileString(pinnedRuntimePaths(path, input.baseDir, targetVersion, platform).sentinelPath)
+    .readFileString(
+      pinnedRuntimePaths(
+        path,
+        input.baseDir,
+        targetVersion,
+        platform,
+        releaseRepository,
+        releaseBaseUrl,
+      ).sentinelPath,
+    )
     .pipe(
-      Effect.map((sentinel) => sentinel.trim() === targetVersion),
+      Effect.map(
+        (sentinel) =>
+          sentinel ===
+          pinnedRuntimePaths(
+            path,
+            input.baseDir,
+            targetVersion,
+            platform,
+            releaseRepository,
+            releaseBaseUrl,
+          ).sentinelContents,
+      ),
       Effect.orElseSucceed(() => false),
     );
 
@@ -485,7 +523,8 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
     httpClient,
     platform,
     arch,
-    releaseBaseUrl: environment[CLI_RELEASE_BASE_URL_ENV]?.trim() || undefined,
+    releaseBaseUrl,
+    releaseRepository,
     validate: (paths) =>
       runner
         .run({
@@ -527,7 +566,7 @@ const runUpdate = Effect.fn("cli.update.run")(function* (input: {
   const launchedAs = (yield* HostProcessIsExecutable) ? yield* resolveLauncherPath : undefined;
   const repointed = yield* repointLauncher({
     launchedAs,
-    versionsDir: path.dirname(runtime.versionDir),
+    versionsDir: pinnedRuntimeVersionsDir(path, input.baseDir),
     targetEntryPath: runtime.entryPath,
   });
 

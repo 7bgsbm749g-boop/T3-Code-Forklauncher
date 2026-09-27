@@ -8,13 +8,14 @@ on:
   issues:
     types: [opened, closed, reopened]
   discussion:
-    types: [created, closed, reopened]
+    types: [created, answered, unanswered]
 
 permissions:
   contents: read
 
 jobs:
   forward:
+    if: github.repository == 'pingdotgg/t3code'
     name: POST to Cursor
     runs-on: ubuntu-24.04
     steps:

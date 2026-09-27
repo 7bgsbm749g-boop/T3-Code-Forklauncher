@@ -36,6 +36,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.repository == 'pingdotgg/t3code'
     name: Validate and publish
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30

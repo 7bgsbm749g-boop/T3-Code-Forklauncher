@@ -16,7 +16,12 @@ import * as Path from "effect/Path";
 import { HttpClient } from "effect/unstable/http";
 import * as Schema from "effect/Schema";
 
-import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
+import {
+  BUILT_CLI_RELEASE_REPOSITORY,
+  CLI_RELEASE_BASE_URL_ENV,
+  CLI_RELEASE_REPOSITORY_ENV,
+  resolveCliReleaseRepository,
+} from "@t3tools/shared/cliRelease";
 
 import * as ProcessRunner from "../processRunner.ts";
 import {
@@ -89,6 +94,8 @@ export interface BootServicePlan {
   readonly baseDir: string;
   readonly logPath: string;
   readonly unitPath: string;
+  readonly releaseRepository?: string;
+  readonly releaseBaseUrl?: string;
 }
 
 /** Pure renderer: service units cannot rely on the user's shell or PATH. */
@@ -104,6 +111,12 @@ export function renderBootServiceUnit(plan: BootServicePlan): string {
     "Type=simple",
     "WorkingDirectory=%h",
     `Environment=T3CODE_HOME=${quoteSystemdValue(plan.baseDir)}`,
+    ...(plan.releaseRepository
+      ? [`Environment=${CLI_RELEASE_REPOSITORY_ENV}=${quoteSystemdValue(plan.releaseRepository)}`]
+      : []),
+    ...(plan.releaseBaseUrl
+      ? [`Environment=${CLI_RELEASE_BASE_URL_ENV}=${quoteSystemdValue(plan.releaseBaseUrl)}`]
+      : []),
     `Environment=${BOOT_SERVICE_UNIT_ENV}=${BOOT_SERVICE_UNIT_FILE}`,
     `ExecStart=${plan.program.map(quoteSystemdValue).join(" ")}`,
     // Let the launcher mark an explicit stop before it signals the server.
@@ -164,6 +177,18 @@ export function renderBootServicePlist(
     `    <string>${escapeXmlText(options.environmentPath)}</string>`,
     `    <key>T3CODE_HOME</key>`,
     `    <string>${escapeXmlText(plan.baseDir)}</string>`,
+    ...(plan.releaseRepository
+      ? [
+          `    <key>${CLI_RELEASE_REPOSITORY_ENV}</key>`,
+          `    <string>${escapeXmlText(plan.releaseRepository)}</string>`,
+        ]
+      : []),
+    ...(plan.releaseBaseUrl
+      ? [
+          `    <key>${CLI_RELEASE_BASE_URL_ENV}</key>`,
+          `    <string>${escapeXmlText(plan.releaseBaseUrl)}</string>`,
+        ]
+      : []),
     `    <key>${BOOT_SERVICE_UNIT_ENV}</key>`,
     `    <string>${BOOT_SERVICE_PLIST_FILE}</string>`,
     `  </dict>`,
@@ -564,6 +589,13 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
   const releaseBaseUrl = Option.getOrUndefined(
     yield* Config.string(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
   );
+  const configuredRepository = Option.getOrUndefined(
+    yield* Config.string(CLI_RELEASE_REPOSITORY_ENV).pipe(Config.option),
+  );
+  const releaseRepository = yield* Effect.try({
+    try: () => resolveCliReleaseRepository(configuredRepository, BUILT_CLI_RELEASE_REPOSITORY),
+    catch: (cause) => new BootServiceInstallError({ cause }),
+  });
   const homeDir = yield* Config.string("HOME").pipe(Config.withDefault(""));
   const installerPath = yield* Config.string("PATH").pipe(Config.withDefault(""));
   const fs = yield* FileSystem.FileSystem;
@@ -602,7 +634,14 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
   const logPath = path.join(input.logsDir, "boot-service.log");
   const statePath = path.join(input.baseDir, "runtime", SERVICE_STATE_FILE);
   const restartPendingPath = path.join(input.baseDir, "runtime", SERVICE_RESTART_PENDING_FILE);
-  const runtimePaths = pinnedRuntimePaths(path, input.baseDir, input.cliVersion, platform);
+  const runtimePaths = pinnedRuntimePaths(
+    path,
+    input.baseDir,
+    input.cliVersion,
+    platform,
+    releaseRepository,
+    releaseBaseUrl,
+  );
   const writeDurably = (filePath: string, contents: string) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -629,6 +668,8 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
     baseDir: input.baseDir,
     logPath,
     unitPath,
+    releaseRepository,
+    ...(releaseBaseUrl === undefined ? {} : { releaseBaseUrl }),
   };
 
   const requireManager = Effect.suspend(() =>
@@ -769,6 +810,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
       platform,
       arch,
       releaseBaseUrl,
+      releaseRepository,
       validate: (runtime) =>
         runner
           .run({
@@ -977,7 +1019,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
         normalizeUnit(unit) === normalizeUnit(detectedManager.render(plan)) &&
         runtimeEntryExists &&
         Option.isSome(runtimeSentinel) &&
-        runtimeSentinel.value.trim() === input.cliVersion &&
+        runtimeSentinel.value === runtimePaths.sentinelContents &&
         state?.activeVersion === input.cliVersion &&
         state?.update?.status !== "pending",
       unitPath,

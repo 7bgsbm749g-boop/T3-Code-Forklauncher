@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
+import { runtimeFeedIdentity, runtimeVersionDirectory } from "./runtimePaths.ts";
 import { Launcher, readServiceState, writeServiceState } from "./serviceLauncher.ts";
 import {
   compareExactServiceVersions,
@@ -84,6 +85,7 @@ const writeFakeRuntime = (
   path: Path.Path,
   versionDir: string,
   childSource: string,
+  repository = "7bgsbm749g-boop/T3-Code-Forklauncher",
 ) =>
   Effect.gen(function* () {
     const entryPath = path.join(versionDir, "t3");
@@ -92,7 +94,7 @@ const writeFakeRuntime = (
     yield* fs.chmod(entryPath, 0o755);
     yield* fs.writeFileString(
       path.join(versionDir, ".install-complete"),
-      `${path.basename(versionDir)}\n`,
+      runtimeFeedIdentity(path.basename(versionDir), repository),
     );
     return entryPath;
   });
@@ -124,7 +126,7 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
       yield* writeFakeRuntime(
         fs,
         path,
-        path.join(root, "runtime", "versions", "1.0.0"),
+        runtimeVersionDirectory(path.join, root, "1.0.0"),
         "setInterval(() => {}, 1_000);\n",
       );
       yield* Effect.promise(() =>
@@ -167,7 +169,7 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
       yield* writeFakeRuntime(
         fs,
         path,
-        path.join(root, "runtime", "versions", "1.0.0"),
+        runtimeVersionDirectory(path.join, root, "1.0.0"),
         "setInterval(() => {}, 1_000);\n",
       );
       yield* Effect.promise(() =>
@@ -218,7 +220,7 @@ if (context.update?.status === "pending") {
         yield* writeFakeRuntime(
           fs,
           path,
-          path.join(root, "runtime", "versions", version),
+          runtimeVersionDirectory(path.join, root, version),
           childSource,
         );
       }
@@ -269,7 +271,7 @@ if (context.update?.status === "pending") {
         yield* writeFakeRuntime(
           fs,
           path,
-          path.join(root, "runtime", "versions", version),
+          runtimeVersionDirectory(path.join, root, version),
           childSource,
         );
       }
@@ -329,7 +331,7 @@ if (context.update?.status === "pending") {
         yield* writeFakeRuntime(
           fs,
           path,
-          path.join(root, "runtime", "versions", version),
+          runtimeVersionDirectory(path.join, root, version),
           childSource,
         );
       }
@@ -359,4 +361,80 @@ if (context.update?.status === "pending") {
       assert.isFalse(yield* fs.exists(path.join(root, "runtime", "db-backup", updateId)));
     }),
   );
+
+  it.effect("launches and rolls back only runtimes from the selected downstream feed", () => {
+    const previousRepository = process.env.T3CODE_RELEASE_REPOSITORY;
+    const previousLog = process.env.T3_LAUNCHER_FEED_TEST_LOG;
+    const selected = "downstream/custom-t3";
+    const other = "another/downstream";
+    const base = "7bgsbm749g-boop/T3-Code-Forklauncher";
+    process.env.T3CODE_RELEASE_REPOSITORY = selected;
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-launcher-feed-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const databasePath = path.join(root, "userdata", "state.sqlite");
+      const logPath = path.join(root, "launcher-starts.log");
+      process.env.T3_LAUNCHER_FEED_TEST_LOG = logPath;
+      yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+      yield* fs.writeFileString(databasePath, "database before trial");
+      const activeSource = `
+const fs = require("node:fs");
+const context = JSON.parse(process.env.T3_SERVICE_LAUNCHER_CONTEXT);
+fs.appendFileSync(process.env.T3_LAUNCHER_FEED_TEST_LOG, context.childVersion + ":" + __filename + "\\n");
+if (context.update === undefined) {
+  const request = (targetVersion) => process.send({ type: "request-update", targetVersion, dbPath: process.env.T3_LAUNCHER_FEED_TEST_DB });
+  request("1.2.0");
+  process.on("message", (message) => { if (message.type === "update-rejected") request("1.1.0"); });
+  setInterval(() => {}, 1_000);
+} else if (context.update.status === "pending") {
+  process.exit(17);
+} else {
+  process.exit(0);
+}
+`;
+      process.env.T3_LAUNCHER_FEED_TEST_DB = databasePath;
+      const selectedActive = runtimeVersionDirectory(path.join, root, "1.0.0", selected);
+      const baseActive = runtimeVersionDirectory(path.join, root, "1.0.0", base);
+      const wrongFeedTarget = runtimeVersionDirectory(path.join, root, "1.2.0", other);
+      const selectedTarget = runtimeVersionDirectory(path.join, root, "1.1.0", selected);
+      yield* writeFakeRuntime(fs, path, selectedActive, activeSource, selected);
+      yield* writeFakeRuntime(fs, path, baseActive, "process.exit(90);\n", base);
+      yield* writeFakeRuntime(fs, path, wrongFeedTarget, "process.exit(91);\n", other);
+      yield* writeFakeRuntime(fs, path, selectedTarget, activeSource, selected);
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+        }),
+      );
+
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      yield* Effect.promise(() =>
+        launcher.run().then(
+          () => Promise.reject(new Error("launcher unexpectedly completed")),
+          () => Promise.resolve(),
+        ),
+      );
+      const state = yield* Effect.promise(() => readServiceState(statePath));
+      assert.equal(state.activeVersion, "1.0.0");
+      assert.equal(state.update?.status, "rolled-back");
+      const starts = yield* fs.readFileString(logPath);
+      assert.include(starts, `${selectedActive}${path.sep}t3`);
+      assert.include(starts, `${selectedTarget}${path.sep}t3`);
+      assert.notInclude(starts, `${baseActive}${path.sep}t3`);
+      assert.notInclude(starts, `${wrongFeedTarget}${path.sep}t3`);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (previousRepository === undefined) delete process.env.T3CODE_RELEASE_REPOSITORY;
+          else process.env.T3CODE_RELEASE_REPOSITORY = previousRepository;
+          if (previousLog === undefined) delete process.env.T3_LAUNCHER_FEED_TEST_LOG;
+          else process.env.T3_LAUNCHER_FEED_TEST_LOG = previousLog;
+          delete process.env.T3_LAUNCHER_FEED_TEST_DB;
+        }),
+      ),
+    );
+  });
 });

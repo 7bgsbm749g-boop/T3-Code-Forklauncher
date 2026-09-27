@@ -9,6 +9,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import { runtimeFeedIdentity, runtimeVersionDirectory } from "./runtimePaths.ts";
 
 import type {
   PendingServiceUpdate,
@@ -43,17 +44,15 @@ interface ManagedChild {
   readonly process: NodeChildProcess.ChildProcess;
 }
 
-// Mirrors pinnedRuntimePaths: a runtime is an unpacked release archive whose
-// executable runs on its own. Kept inline so this file stays on Node
-// built-ins only.
 const runtimePaths = (baseDir: string, version: string) => {
-  const versionDir = NodePath.join(baseDir, "runtime", "versions", version);
+  const versionDir = runtimeVersionDirectory(NodePath.join, baseDir, version);
   // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone launcher has no Effect runtime.
   const executableName = process.platform === "win32" ? "t3.exe" : "t3";
   return {
     versionDir,
     entryPath: NodePath.join(versionDir, executableName),
     sentinelPath: NodePath.join(versionDir, ".install-complete"),
+    sentinelContents: runtimeFeedIdentity(version),
   };
 };
 
@@ -220,7 +219,7 @@ async function runtimeExists(baseDir: string, version: string): Promise<boolean>
       NodeFSP.stat(paths.entryPath),
       NodeFSP.readFile(paths.sentinelPath, "utf8"),
     ]);
-    return entry.isFile() && sentinel.trim() === version;
+    return entry.isFile() && sentinel === paths.sentinelContents;
   } catch {
     return false;
   }

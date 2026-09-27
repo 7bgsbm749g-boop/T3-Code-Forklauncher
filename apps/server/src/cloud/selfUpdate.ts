@@ -20,7 +20,12 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import { HttpClient } from "effect/unstable/http";
 
-import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
+import {
+  BUILT_CLI_RELEASE_REPOSITORY,
+  CLI_RELEASE_BASE_URL_ENV,
+  CLI_RELEASE_REPOSITORY_ENV,
+  resolveCliReleaseRepository,
+} from "@t3tools/shared/cliRelease";
 
 import * as ServerConfig from "../config.ts";
 import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
@@ -184,6 +189,14 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   const releaseBaseUrl = Option.getOrUndefined(
     yield* Config.string(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
   );
+  const configuredRepository = Option.getOrUndefined(
+    yield* Config.string(CLI_RELEASE_REPOSITORY_ENV).pipe(Config.option),
+  );
+  const releaseRepository = yield* Effect.try({
+    try: () => resolveCliReleaseRepository(configuredRepository, BUILT_CLI_RELEASE_REPOSITORY),
+    catch: (cause) =>
+      new ServerSelfUpdateError({ reason: "Invalid T3 release repository.", cause }),
+  });
   const inFlight = yield* Ref.make(false);
 
   const capability: ServerSelfUpdateCapability | null =
@@ -233,6 +246,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
         platform,
         arch,
         releaseBaseUrl,
+        releaseRepository,
         validate: (runtime) =>
           runner
             .run({

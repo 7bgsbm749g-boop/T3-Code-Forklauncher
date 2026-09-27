@@ -10,18 +10,23 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstab
 
 import {
   CLI_RELEASE_CHECKSUMS_FILE,
+  CLI_RELEASE_REPOSITORY_ENV,
+  BUILT_CLI_RELEASE_REPOSITORY,
   cliArchiveFileName,
   cliArchivePlatformKey,
   cliArchiveTarCommand,
   cliReleaseDownloadBaseUrl,
   parseChecksums,
+  resolveCliReleaseRepository,
 } from "@t3tools/shared/cliRelease";
 
 import * as ProcessRunner from "../processRunner.ts";
+import { runtimeFeedIdentity, runtimeVersionDirectory } from "../runtimePaths.ts";
 
 /**
  * A pinned runtime is an exact t3 release archive unpacked into
- * <baseDir>/runtime/versions/<version>: the self-contained executable, the
+ * <baseDir>/runtime/versions/.feeds/<owner>/<repository>/<version>: the
+ * repository-scoped self-contained executable, the
  * web client, and the native packages beside it. The boot service points its
  * unit or launch agent at the executable, and server self-update installs the
  * target version here before switching over. The runtime never depends on a
@@ -41,6 +46,7 @@ export interface PinnedRuntimePaths {
   /** The executable. Its existence is what marks a runtime as present. */
   readonly entryPath: string;
   readonly sentinelPath: string;
+  readonly sentinelContents: string;
 }
 
 /** The exact command that runs a pinned runtime. */
@@ -60,12 +66,19 @@ export function pinnedRuntimePaths(
   baseDir: string,
   version: string,
   platform: NodeJS.Platform,
+  releaseRepository?: string,
+  releaseBaseUrl?: string,
 ): PinnedRuntimePaths {
-  const versionDir = path.join(pinnedRuntimeVersionsDir(path, baseDir), version);
+  const repository = resolveCliReleaseRepository(
+    releaseRepository ?? process.env[CLI_RELEASE_REPOSITORY_ENV],
+    BUILT_CLI_RELEASE_REPOSITORY,
+  );
+  const versionDir = runtimeVersionDirectory(path.join, baseDir, version, repository);
   return {
     versionDir,
     entryPath: path.join(versionDir, platform === "win32" ? "t3.exe" : "t3"),
     sentinelPath: path.join(versionDir, ".install-complete"),
+    sentinelContents: runtimeFeedIdentity(version, repository, releaseBaseUrl),
   };
 }
 
@@ -119,6 +132,7 @@ interface PinnedRuntimeInstallInput {
   readonly arch: string;
   readonly httpClient: HttpClient.HttpClient;
   readonly releaseBaseUrl?: string | undefined;
+  readonly releaseRepository?: string | undefined;
 }
 
 const fetchReleaseAsset = Effect.fn("cloud.pinned_runtime.fetch_release_asset")(function* (
@@ -158,7 +172,19 @@ const installFromArchive = Effect.fn("cloud.pinned_runtime.install_archive")(fun
     });
   }
   const httpClient = input.httpClient;
-  const baseUrl = cliReleaseDownloadBaseUrl(input.version, input.releaseBaseUrl);
+  let baseUrl: string;
+  try {
+    const repository = resolveCliReleaseRepository(
+      input.releaseRepository ?? process.env[CLI_RELEASE_REPOSITORY_ENV],
+      BUILT_CLI_RELEASE_REPOSITORY,
+    );
+    baseUrl = cliReleaseDownloadBaseUrl(input.version, input.releaseBaseUrl, repository);
+  } catch (cause) {
+    return yield* new PinnedRuntimeInstallError({
+      step: "selecting the T3 release repository",
+      cause,
+    });
+  }
   const fileName = cliArchiveFileName(input.version, platformKey);
 
   const checksums = parseChecksums(
@@ -229,7 +255,26 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
   input: PinnedRuntimeInstallInput,
 ) {
   const { fs } = input;
-  const paths = pinnedRuntimePaths(input.path, input.baseDir, input.version, input.platform);
+  let repository: string;
+  try {
+    repository = resolveCliReleaseRepository(
+      input.releaseRepository ?? process.env[CLI_RELEASE_REPOSITORY_ENV],
+      BUILT_CLI_RELEASE_REPOSITORY,
+    );
+  } catch (cause) {
+    return yield* new PinnedRuntimeInstallError({
+      step: "selecting the T3 release repository",
+      cause,
+    });
+  }
+  const paths = pinnedRuntimePaths(
+    input.path,
+    input.baseDir,
+    input.version,
+    input.platform,
+    repository,
+    input.releaseBaseUrl,
+  );
   const [versionDirExists, entryExists, sentinel] = yield* Effect.all([
     fs.exists(paths.versionDir),
     fs.exists(paths.entryPath),
@@ -240,10 +285,18 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
     ),
   );
   const alreadyPinned =
-    entryExists && Option.isSome(sentinel) && sentinel.value.trim() === input.version;
+    entryExists && Option.isSome(sentinel) && sentinel.value === paths.sentinelContents;
   if (alreadyPinned) {
     yield* input.validate(paths);
     return paths;
+  }
+  // Never remove an existing executable merely because its mirror/provenance
+  // marker differs. Require the caller to select that origin explicitly (or
+  // a different version) so a failed fetch cannot erase a rollback target.
+  if (versionDirExists && entryExists) {
+    return yield* new PinnedRuntimeInstallError({
+      step: `preserving existing t3@${input.version} runtime with different release feed provenance`,
+    });
   }
   if (versionDirExists) {
     yield* fs.remove(paths.versionDir, { recursive: true, force: true }).pipe(
@@ -285,14 +338,15 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
     versionDir: stagingDir,
     entryPath: input.path.join(stagingDir, input.path.relative(paths.versionDir, paths.entryPath)),
     sentinelPath: input.path.join(stagingDir, ".install-complete"),
+    sentinelContents: paths.sentinelContents,
   };
 
   return yield* Effect.gen(function* () {
-    yield* installFromArchive(input, stagingDir);
+    yield* installFromArchive({ ...input, releaseRepository: repository }, stagingDir);
 
     yield* input.validate(stagingPaths);
     yield* fs
-      .writeFileString(stagingPaths.sentinelPath, `${input.version}\n`)
+      .writeFileString(stagingPaths.sentinelPath, stagingPaths.sentinelContents)
       .pipe(
         Effect.mapError(
           (cause) =>
@@ -316,7 +370,7 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
           Effect.flatMap(([publishedEntryExists, publishedSentinel]) =>
             publishedEntryExists &&
             Option.isSome(publishedSentinel) &&
-            publishedSentinel.value.trim() === input.version
+            publishedSentinel.value === paths.sentinelContents
               ? Effect.succeed(false)
               : Effect.fail(
                   new PinnedRuntimeInstallError({

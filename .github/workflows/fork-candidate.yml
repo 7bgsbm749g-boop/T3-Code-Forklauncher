@@ -1,0 +1,354 @@
+name: Fork candidate artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Full 40-character fork commit to validate and package
+        required: true
+        type: string
+      source_sha:
+        description: Full SHA of the fork source commit being tested
+        required: true
+        type: string
+      target_sha:
+        description: Full SHA of the official stable target commit
+        required: true
+        type: string
+      official_stable_tag:
+        description: Exact official stable tag, for example v0.0.42
+        required: true
+        type: string
+      candidate_version:
+        description: Candidate semver used for package metadata, for example 0.0.43-fork.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Verify candidate identity and ancestry
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      candidate_sha: ${{ steps.verify.outputs.candidate_sha }}
+      candidate_version: ${{ steps.verify.outputs.candidate_version }}
+    steps:
+      # Keep the validator sourced from the workflow revision. Candidate source
+      # is checked out separately only after scalar input validation succeeds.
+      - name: Checkout workflow tools
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Validate explicit inputs
+        id: input
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          OFFICIAL_STABLE_TAG: ${{ inputs.official_stable_tag }}
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+        run: |
+          node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
+          import { validateCandidateMetadata } from './.github/scripts/fork-candidate-metadata.mjs';
+          const result = validateCandidateMetadata({
+            candidateSha: process.env.CANDIDATE_SHA,
+            sourceSha: process.env.SOURCE_SHA,
+            targetSha: process.env.TARGET_SHA,
+            officialStableTag: process.env.OFFICIAL_STABLE_TAG,
+            candidateVersion: process.env.CANDIDATE_VERSION,
+          });
+          for (const [key, value] of Object.entries(result)) console.log(`${key}=${value}`);
+          NODE
+      - name: Checkout exact candidate commit without credentials
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.input.outputs.candidateSha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - name: Verify actual Git identities and ancestry
+        id: verify
+        working-directory: candidate
+        env:
+          CANDIDATE_SHA: ${{ steps.input.outputs.candidateSha }}
+          SOURCE_SHA: ${{ steps.input.outputs.sourceSha }}
+          TARGET_SHA: ${{ steps.input.outputs.targetSha }}
+          STABLE_TAG: ${{ steps.input.outputs.officialStableTag }}
+          CANDIDATE_VERSION: ${{ steps.input.outputs.candidateVersion }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/pingdotgg/t3code.git "refs/tags/${STABLE_TAG}:refs/tags/${STABLE_TAG}"
+          CANDIDATE_SHA="$CANDIDATE_SHA" SOURCE_SHA="$SOURCE_SHA" TARGET_SHA="$TARGET_SHA" \
+            STABLE_TAG="$STABLE_TAG" CANDIDATE_VERSION="$CANDIDATE_VERSION" node --input-type=module <<'NODE'
+          import { writeFile } from 'node:fs/promises';
+          import { fetchOfficialLatestStableRelease, verifyCandidateGit, validateCandidateMetadata } from '../.github/scripts/fork-candidate-metadata.mjs';
+          const input = validateCandidateMetadata({
+            candidateSha: process.env.CANDIDATE_SHA,
+            sourceSha: process.env.SOURCE_SHA,
+            targetSha: process.env.TARGET_SHA,
+            officialStableTag: process.env.STABLE_TAG,
+            candidateVersion: process.env.CANDIDATE_VERSION,
+          });
+          const release = await fetchOfficialLatestStableRelease(input.officialStableTag);
+          const evidence = verifyCandidateGit(process.cwd(), input, release);
+          await writeFile('verified-candidate-identity.json', `${JSON.stringify({ input, release, evidence }, null, 2)}\n`);
+          NODE
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "candidate_version=$CANDIDATE_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Upload verified identity
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-identity
+          path: candidate/verified-candidate-identity.json
+          retention-days: 3
+          if-no-files-found: error
+
+  quality:
+    name: Candidate server tests
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact candidate without credentials
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.candidate_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install server dependencies
+        run: vp install --frozen-lockfile --filter=t3...
+      - name: Test server
+        run: vp run --filter t3 test
+
+  bundle:
+    name: Build fork-configured JS bundle
+    needs: [validate, quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      T3CODE_RELEASE_REPOSITORY: ${{ github.repository }}
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+      T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
+      T3CODE_RELAY_URL: https://relay.t3.codes
+    steps:
+      - name: Checkout exact candidate without credentials
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.candidate_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install bundle dependencies
+        run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Configure Linux build dependencies
+        uses: ./.github/actions/setup-apt-mirrors
+      - name: Install desktop secret store dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Capture, align, and verify package versions
+        env:
+          CANDIDATE_VERSION: ${{ needs.validate.outputs.candidate_version }}
+          CANDIDATE_RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$T3CODE_RELEASE_REPOSITORY" = "$CANDIDATE_RELEASE_REPOSITORY"
+          test "$T3CODE_DESKTOP_UPDATE_REPOSITORY" = "$CANDIDATE_RELEASE_REPOSITORY"
+          node .github/scripts/fork-candidate-versions.mjs capture "$CANDIDATE_VERSION" "$CANDIDATE_RELEASE_REPOSITORY" "$RUNNER_TEMP/version-alignment.json"
+          node scripts/update-release-package-versions.ts "$CANDIDATE_VERSION"
+          node .github/scripts/fork-candidate-versions.mjs verify "$CANDIDATE_VERSION" "$CANDIDATE_RELEASE_REPOSITORY" "$RUNNER_TEMP/version-alignment.json"
+          mkdir -p candidate-metadata
+          cp "$RUNNER_TEMP/version-alignment.json" candidate-metadata/version-alignment.json
+      - name: Build server and desktop JS bundle
+        run: vp run build:desktop
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          retention-days: 3
+          if-no-files-found: error
+      - name: Upload package version provenance
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-version-alignment
+          path: candidate-metadata/version-alignment.json
+          retention-days: 3
+          if-no-files-found: error
+
+  linux:
+    name: Linux server CLI and desktop candidate
+    needs: [validate, quality, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      label: Linux x64 candidate
+      runner: ubuntu-24.04
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+      version: ${{ needs.validate.outputs.candidate_version }}
+      ref: ${{ needs.validate.outputs.candidate_sha }}
+      release_channel: latest
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      update_repository: ${{ github.repository }}
+
+  windows:
+    name: Hosted Windows desktop candidate
+    needs: [validate, bundle, linux]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      label: Windows x64 candidate
+      runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: false
+      version: ${{ needs.validate.outputs.candidate_version }}
+      ref: ${{ needs.validate.outputs.candidate_sha }}
+      release_channel: latest
+      relay_client_tracing: false
+      clerk_publishable_key: pk_live_Y2xlcmsudDMuY29kZXMk
+      clerk_jwt_template: t3-relay
+      clerk_cli_oauth_client_id: hzxSgY2cH10sDU2r
+      relay_url: https://relay.t3.codes
+      update_repository: ${{ github.repository }}
+
+  windows_feed_tests:
+    name: Windows release feed behavior tests
+    needs: validate
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact candidate without credentials
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.candidate_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+      - name: Install desktop helper dependencies
+        run: vp install --frozen-lockfile --filter=@t3tools/scripts...
+      - name: Test Windows desktop update feed resolution
+        run: vp test run scripts/build-desktop-artifact.test.ts
+
+  assemble:
+    name: Assemble checksummed candidate artifact
+    needs: [validate, quality, bundle, linux, windows, windows_feed_tests]
+    if: always() && needs.validate.result == 'success' && needs.quality.result == 'success' && needs.bundle.result == 'success' && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.windows_feed_tests.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download candidate identity
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-identity
+          path: candidate-artifacts
+      - name: Download version alignment evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-version-alignment
+          path: candidate-artifacts/metadata
+      - name: Download Linux outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-linux-x64
+          path: candidate-artifacts/builds/linux-cli
+      - uses: actions/download-artifact@v8
+        with:
+          name: desktop-linux-x64
+          path: candidate-artifacts/builds/linux-desktop
+      - uses: actions/download-artifact@v8
+        with:
+          name: resource-monitor-linux-x64
+          path: candidate-artifacts/builds/linux-resource-monitor
+      - uses: actions/download-artifact@v8
+        with:
+          name: js-bundle
+          path: candidate-artifacts/builds/js-bundle
+      - name: Download Windows outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-win-x64
+          path: candidate-artifacts/builds/windows
+      - uses: actions/download-artifact@v8
+        with:
+          name: resource-monitor-win32-x64
+          path: candidate-artifacts/builds/windows-resource-monitor
+      - name: Checkout trusted manifest helper
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-tools
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Create exact identity manifest and checksums
+        env:
+          CANDIDATE_VERSION: ${{ needs.validate.outputs.candidate_version }}
+          WINDOWS_FEED_TESTS: ${{ needs.windows_feed_tests.result }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from 'node:fs/promises';
+          import { createCandidateManifest } from './workflow-tools/.github/scripts/fork-candidate-metadata.mjs';
+          const identity = JSON.parse(await readFile('candidate-artifacts/verified-candidate-identity.json', 'utf8'));
+          const versions = JSON.parse(await readFile('candidate-artifacts/metadata/version-alignment.json', 'utf8'));
+          if (versions.candidateVersion !== process.env.CANDIDATE_VERSION) throw new Error('version provenance does not match tested candidate');
+          const manifest = createCandidateManifest(identity.input, identity.release, identity.evidence, versions);
+          await writeFile('candidate-artifacts/candidate-manifest.json', `${JSON.stringify(manifest, null, 2)}\n`);
+          await writeFile('candidate-artifacts/checks.json', `${JSON.stringify({ serverTests: 'success', bundleVersionSmoke: 'release CLI archive --expect-version', linuxPackaging: 'success', windowsPackaging: 'success', windowsFeedTests: process.env.WINDOWS_FEED_TESTS }, null, 2)}\n`);
+          NODE
+          cd candidate-artifacts
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-candidate-${{ needs.validate.outputs.candidate_version }}-${{ needs.validate.outputs.candidate_sha }}
+          path: candidate-artifacts/
+          retention-days: 3
+          if-no-files-found: error
