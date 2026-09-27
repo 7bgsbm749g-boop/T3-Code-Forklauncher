@@ -1,6 +1,14 @@
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodeOS from "node:os";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
+import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
@@ -64,12 +72,15 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
+import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -130,6 +141,7 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
+import * as SqlitePersistence from "./persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -149,6 +161,13 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as ForkCompatibilityNativeService from "./forkCompatibility/ForkCompatibilityNativeService.ts";
+import * as ForkCompatibilityCoordinator from "./forkCompatibility/ForkCompatibilityCoordinator.ts";
+import * as ForkCompatibilityRunRepository from "./forkCompatibility/ForkCompatibilityRunRepository.ts";
+import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCompatibilityRequestRepository.ts";
+import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
+import * as ProcessRunner from "./processRunner.ts";
+import { forkCompatibilityError } from "./forkCompatibility/ForkCompatibilityError.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
@@ -511,6 +530,7 @@ const makeBrowserOtlpPayload = (spanName: string) =>
   });
 
 const buildAppUnderTest = (options?: {
+  scope?: Scope.Scope;
   onPairingChangesSubscribed?: Effect.Effect<void>;
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
@@ -523,6 +543,7 @@ const buildAppUnderTest = (options?: {
     providerInstanceRegistry?: Partial<ProviderInstanceRegistry["Service"]>;
     antigravityInstallation?: Partial<AntigravityInstallation["Service"]>;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
+    forkCompatibilityNativeService?: Layer.Layer<ForkCompatibilityNativeService.ForkCompatibilityNativeService>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
     vcsDriverRegistry?: Partial<VcsDriverRegistry.VcsDriverRegistry["Service"]>;
@@ -840,6 +861,17 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provide(
         Layer.mergeAll(
+          options?.layers?.forkCompatibilityNativeService ??
+            Layer.mock(ForkCompatibilityNativeService.ForkCompatibilityNativeService)({
+              accept: () =>
+                Effect.fail(
+                  forkCompatibilityError(
+                    "Compatibility checks are not configured in this router test.",
+                  ),
+                ),
+              get: () => Effect.succeed({ request: null, run: null, usable: false }),
+              awaitCompletion: () => Effect.void,
+            }),
           Layer.mock(ExternalLauncher.ExternalLauncher)({
             resolveAvailableEditors: () => Effect.succeed([]),
             resolveFileManagerRevealKind: () => Effect.sync((): undefined => undefined),
@@ -1214,7 +1246,8 @@ const buildAppUnderTest = (options?: {
       Layer.provide(layerConfig),
     );
 
-    yield* Layer.build(appLayer);
+    if (options?.scope) yield* Layer.buildWithScope(appLayer, options.scope);
+    else yield* Layer.build(appLayer);
     return config;
   });
 
@@ -4933,6 +4966,338 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(response.threadResumeCompletionMarker, true);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
+
+  it.effect("runs authenticated compatibility RPCs through a durable real Git candidate", () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-native-compat-rpc-"));
+    const source = NodePath.join(root, "source");
+    const remote = NodePath.join(root, "upstream.git");
+    NodeFS.mkdirSync(source);
+    const git = (cwd: string, args: ReadonlyArray<string>) =>
+      NodeChildProcess.execFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
+    git(root, ["init", "--bare", remote]);
+    git(source, ["init", "-b", "forklauncher"]);
+    git(source, ["config", "user.name", "Native RPC fixture"]);
+    git(source, ["config", "user.email", "native-rpc@example.invalid"]);
+    NodeFS.writeFileSync(NodePath.join(source, "README.md"), "base\n");
+    git(source, ["add", "README.md"]);
+    git(source, ["commit", "-m", "base"]);
+    const baseSha = git(source, ["rev-parse", "HEAD"]);
+    git(source, ["checkout", "-b", "release-work"]);
+    NodeFS.writeFileSync(NodePath.join(source, "README.md"), "stable update\n");
+    git(source, ["commit", "-am", "stable update"]);
+    const targetSha = git(source, ["rev-parse", "HEAD"]);
+    git(source, ["tag", "v0.0.43", targetSha]);
+    git(source, ["remote", "add", "upstream", remote]);
+    git(source, ["push", "upstream", "release-work", "refs/tags/v0.0.43"]);
+    git(source, ["checkout", "forklauncher"]);
+    git(source, ["reset", "--hard", baseSha]);
+    NodeFS.writeFileSync(NodePath.join(source, "fork-only.txt"), "fork behavior\n");
+    git(source, ["add", "fork-only.txt"]);
+    git(source, ["commit", "-m", "fork behavior"]);
+    const sourceSha = git(source, ["rev-parse", "HEAD"]);
+    const candidateRoot = NodePath.join(root, "candidates");
+    const dbPath = NodePath.join(root, "native-compatibility.sqlite");
+    return Effect.gen(function* () {
+      const capturedService = yield* Ref.make<
+        Option.Option<ForkCompatibilityNativeService.ForkCompatibilityNativeService["Service"]>
+      >(Option.none());
+      const validationEntered = yield* Deferred.make<void>();
+      const allowValidation = yield* Deferred.make<void>();
+      const interruptedValidationEntered = yield* Deferred.make<void>();
+      const holdInterruptedValidation = yield* Deferred.make<void>();
+      const validationNumber = yield* Ref.make(0);
+      const configuredSource = yield* Ref.make<string | null>(null);
+      const profile = {
+        id: "rpc-git-fixture",
+        revision: "1",
+        commands: [
+          {
+            command: process.execPath,
+            args: ["-e", "if (process.argv[1] !== 'candidate-ok') process.exit(1)", "candidate-ok"],
+            timeoutMs: 20_000,
+          },
+        ],
+      } as const;
+      const node = NodeServices.layer;
+      const persistence = SqlitePersistence.makeSqlitePersistenceLive(dbPath).pipe(
+        Layer.provide(node),
+      );
+      const repositories = Layer.mergeAll(
+        ForkCompatibilityRunRepository.ForkCompatibilityRunRepositoryLive,
+        ForkCompatibilityRequestRepository.ForkCompatibilityRequestRepositoryLive,
+      ).pipe(Layer.provideMerge(persistence));
+      const vcsProcess = VcsProcess.layer.pipe(Layer.provide(node));
+      const gitLayer = Layer.mergeAll(GitVcsDriver.vcsLayer, GitVcsDriver.layer).pipe(
+        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-native-compat-test-" })),
+        Layer.provideMerge(vcsProcess),
+        Layer.provideMerge(node),
+      );
+      const realProcessLayer = ProcessRunner.layer.pipe(Layer.provideMerge(node));
+      const processLayer = Layer.effect(
+        ProcessRunner.ProcessRunner,
+        Effect.gen(function* () {
+          const real = yield* ProcessRunner.ProcessRunner;
+          return ProcessRunner.ProcessRunner.of({
+            run: (input) =>
+              Ref.updateAndGet(validationNumber, (count) => count + 1).pipe(
+                Effect.flatMap((count) =>
+                  count === 1
+                    ? Deferred.succeed(validationEntered, undefined).pipe(
+                        Effect.andThen(Deferred.await(allowValidation)),
+                        Effect.andThen(real.run(input)),
+                      )
+                    : count === 2
+                      ? Deferred.succeed(interruptedValidationEntered, undefined).pipe(
+                          Effect.andThen(Deferred.await(holdInterruptedValidation)),
+                          Effect.andThen(real.run(input)),
+                        )
+                      : real.run(input),
+                ),
+              ),
+          });
+        }),
+      ).pipe(Layer.provideMerge(realProcessLayer));
+      const stableSource = Layer.succeed(
+        ForkCompatibilityStableSource.ForkCompatibilityStableSource,
+        {
+          latestStableTag: () => Effect.succeed("v0.0.43"),
+          resolveStableTagCommit: () => Effect.succeed(targetSha),
+        },
+      );
+      const dependencies = Layer.mergeAll(repositories, gitLayer, processLayer, stableSource, node);
+      const coordinator = ForkCompatibilityCoordinator.ForkCompatibilityCoordinatorLive({
+        candidateRoot,
+      }).pipe(Layer.provideMerge(dependencies));
+      const nativeLayer = Layer.effect(
+        ForkCompatibilityNativeService.ForkCompatibilityNativeService,
+        Effect.gen(function* () {
+          const service = yield* ForkCompatibilityNativeService.makeForkCompatibilityNativeService({
+            upstreamRemote: remote,
+            profile,
+          });
+          yield* Ref.set(capturedService, Option.some(service));
+          return ForkCompatibilityNativeService.ForkCompatibilityNativeService.of(service);
+        }),
+      ).pipe(Layer.provide(Layer.mergeAll(repositories, coordinator)), Layer.orDie);
+      const nativeScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(nativeScope, Exit.void));
+      const buildNativeService = (scope: Scope.Scope) =>
+        Layer.buildWithScope(nativeLayer, scope).pipe(
+          Effect.map((context) =>
+            Context.get(context, ForkCompatibilityNativeService.ForkCompatibilityNativeService),
+          ),
+        );
+      yield* buildNativeService(nativeScope).pipe(
+        Effect.flatMap((service) =>
+          Ref.set(capturedService, Option.some(service)).pipe(Effect.asVoid),
+        ),
+      );
+      const proxyService = ForkCompatibilityNativeService.ForkCompatibilityNativeService.of({
+        accept: (input) =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).accept(input)),
+          ),
+        get: (requestId) =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).get(requestId)),
+          ),
+        awaitCompletion: (requestId) =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).awaitCompletion(requestId)),
+          ),
+      });
+      const proxyLayer = Layer.succeed(
+        ForkCompatibilityNativeService.ForkCompatibilityNativeService,
+        proxyService,
+      );
+      const getSettings = Ref.get(configuredSource).pipe(
+        Effect.map((sourceDirectory) => ({
+          ...DEFAULT_SERVER_SETTINGS,
+          forkCompatibility: {
+            ...DEFAULT_SERVER_SETTINGS.forkCompatibility,
+            sourceDirectory,
+          },
+        })),
+      );
+      const updateSettings: ServerSettings.ServerSettingsService["Service"]["updateSettings"] = (
+        patch,
+      ) =>
+        Effect.gen(function* () {
+          if (patch.forkCompatibility)
+            yield* Ref.set(configuredSource, patch.forkCompatibility.sourceDirectory);
+          return yield* getSettings;
+        });
+      const makeAppScope = Effect.gen(function* () {
+        const scope = yield* Scope.make();
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        return scope;
+      });
+      const makeTestServer = (scope: Scope.Scope) =>
+        buildAppUnderTest({
+          scope,
+          config: { baseDir: NodePath.join(root, "server-home") },
+          layers: {
+            forkCompatibilityNativeService: proxyLayer,
+            serverSettings: {
+              getSettings,
+              updateSettings,
+            },
+          },
+        });
+      const firstAppScope = yield* makeAppScope;
+      yield* makeTestServer(firstAppScope);
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookie,
+      );
+      const accepted = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            yield* client[WS_METHODS.forkCompatibilityConfigure]({ sourceDirectory: source });
+            const first = yield* client[WS_METHODS.forkCompatibilityCheck]({
+              idempotencyKey: "native-rpc-request",
+            });
+            const duplicate = yield* client[WS_METHODS.forkCompatibilityCheck]({
+              idempotencyKey: "native-rpc-request",
+            });
+            assert.equal(duplicate.requestId, first.requestId);
+            assert.oneOf(first.status, ["queued", "running", "completed"]);
+            yield* client[WS_METHODS.forkCompatibilityConfigure]({
+              sourceDirectory: NodePath.join(root, "different-checkout"),
+            });
+            return first;
+          }),
+        ),
+      );
+      // The acceptance RPC's client scope is closed before this wait; the
+      // scoped server worker continues independently of that connection.
+      const service = Option.getOrThrow(yield* Ref.get(capturedService));
+      const firstWorkerState = yield* Effect.race(
+        Deferred.await(validationEntered).pipe(Effect.as("validation" as const)),
+        service.awaitCompletion(accepted.requestId).pipe(Effect.as("terminal" as const)),
+      );
+      assert.equal(firstWorkerState, "validation");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.forkCompatibilityStatus]({ requestId: accepted.requestId }),
+        ),
+      ).pipe(
+        Effect.tap((status) =>
+          Effect.sync(() => {
+            assert.equal(status.summary?.requestStatus, "running");
+            assert.equal(status.summary?.runStatus, "validating");
+          }),
+        ),
+      );
+      yield* Deferred.succeed(allowValidation, undefined);
+      yield* service.awaitCompletion(accepted.requestId);
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const status = yield* client[WS_METHODS.forkCompatibilityStatus]({
+              requestId: accepted.requestId,
+              includeEvidence: true,
+            });
+            assert.equal(status.summary?.requestStatus, "completed");
+            assert.equal(status.summary?.runStatus, "ready");
+            assert.equal(status.summary?.sourceSha, sourceSha);
+            assert.equal(status.summary?.targetSha, targetSha);
+            assert.equal(status.summary?.usable, true);
+            assert.equal(status.evidence?.candidateSha, status.summary?.candidateSha);
+            assert.equal(
+              NodeFS.readFileSync(
+                NodePath.join(candidateRoot, status.summary!.runId!, "fork-only.txt"),
+                "utf8",
+              ),
+              "fork behavior\n",
+            );
+          }),
+        ),
+      );
+      assert.equal(git(source, ["rev-parse", "HEAD"]), sourceSha);
+      assert.equal(git(source, ["branch", "--show-current"]), "forklauncher");
+
+      NodeFS.writeFileSync(NodePath.join(source, "restart-fixture.txt"), "new source identity\n");
+      git(source, ["add", "restart-fixture.txt"]);
+      git(source, ["commit", "-m", "restart fixture identity"]);
+      const sourceShaAtRestart = git(source, ["rev-parse", "HEAD"]);
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.forkCompatibilityConfigure]({ sourceDirectory: source }),
+        ),
+      );
+      const interruptedRequest = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.forkCompatibilityCheck]({ idempotencyKey: "restart-interrupted" }),
+        ),
+      );
+      const interruptedWorkerState = yield* Effect.race(
+        Deferred.await(interruptedValidationEntered).pipe(Effect.as("validation" as const)),
+        service.awaitCompletion(interruptedRequest.requestId).pipe(Effect.as("terminal" as const)),
+      );
+      if (interruptedWorkerState !== "validation") {
+        const failedState = yield* service.get(interruptedRequest.requestId);
+        assert.equal(
+          interruptedWorkerState,
+          "validation",
+          `Native request failed early: ${failedState.request?.error ?? "no stored error"}`,
+        );
+      }
+      const beforeRestart = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.forkCompatibilityStatus]({
+            requestId: interruptedRequest.requestId,
+            includeEvidence: true,
+          }),
+        ),
+      );
+      assert.equal(beforeRestart.summary?.requestStatus, "running");
+      assert.equal(beforeRestart.summary?.runStatus, "validating");
+      const interruptedRunId = beforeRestart.summary!.runId!;
+      const interruptedCandidateSha = beforeRestart.summary!.candidateSha!;
+      const candidateDirectoriesBeforeRestart = NodeFS.readdirSync(candidateRoot).sort();
+
+      // The native server-side service owns this disk database independently
+      // of the test HTTP listener. Close its SQLite and worker scope before
+      // reconstructing both it and the disposable native server instance.
+      yield* Scope.close(nativeScope, Exit.void);
+      const restartedNativeScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(restartedNativeScope, Exit.void));
+      const restartedService = yield* buildNativeService(restartedNativeScope);
+      yield* Ref.set(capturedService, Option.some(restartedService));
+      yield* restartedService.awaitCompletion(interruptedRequest.requestId);
+      yield* Scope.close(firstAppScope, Exit.void);
+      const afterRestart = yield* Effect.gen(function* () {
+        const secondAppScope = yield* makeAppScope;
+        yield* makeTestServer(secondAppScope);
+        const restartedCookie = yield* getAuthenticatedSessionCookieHeader();
+        const restartedWsUrl = appendSessionCookieToWsUrl(
+          yield* getWsServerUrl("/ws", { authenticated: false }),
+          restartedCookie,
+        );
+        return yield* Effect.scoped(
+          withWsRpcClient(restartedWsUrl, (client) =>
+            client[WS_METHODS.forkCompatibilityStatus]({
+              requestId: interruptedRequest.requestId,
+              includeEvidence: true,
+            }),
+          ),
+        );
+      }).pipe(Effect.provide(Layer.fresh(NodeHttpServer.layerTest)));
+      assert.equal(afterRestart.summary?.requestStatus, "failed");
+      assert.equal(afterRestart.summary?.runStatus, "failed");
+      assert.equal(afterRestart.summary?.runId, interruptedRunId);
+      assert.equal(afterRestart.summary?.candidateSha, interruptedCandidateSha);
+      assert.equal(yield* Ref.get(validationNumber), 2);
+      assert.deepEqual(NodeFS.readdirSync(candidateRoot).sort(), candidateDirectoriesBeforeRestart);
+      assert.equal(git(source, ["rev-parse", "HEAD"]), sourceShaAtRestart);
+      assert.equal(git(source, ["branch", "--show-current"]), "forklauncher");
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true }))),
+      Effect.provide(NodeHttpServer.layerTest),
+    );
+  });
 
   it.effect("advertises the usable file manager and its reveal label", () =>
     Effect.gen(function* () {

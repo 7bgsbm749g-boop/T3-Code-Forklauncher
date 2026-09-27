@@ -1008,6 +1008,14 @@ export const ProjectSettingsOverrides = Schema.Struct({
 export type ProjectSettingsOverrides = typeof ProjectSettingsOverrides.Type;
 
 export const ServerSettings = Schema.Struct({
+  forkCompatibility: Schema.Struct({
+    sourceDirectory: Schema.NullOr(TrimmedString).pipe(
+      Schema.withDecodingDefault(Effect.succeed(null)),
+    ),
+    validationProfileId: Schema.Literal("t3-server-default").pipe(
+      Schema.withDecodingDefault(Effect.succeed("t3-server-default" as const)),
+    ),
+  }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // How assistant text reaches clients during a turn. Deliberately a fresh
   // key (was `enableLegacyTokenStreaming`, before that
   // `enableAssistantStreaming`): decoding drops the old key, so everyone,
@@ -1347,6 +1355,12 @@ const OpenCodeSettingsPatch = Schema.Struct({
 });
 
 export const ServerSettingsPatch = Schema.Struct({
+  forkCompatibility: Schema.optionalKey(
+    Schema.Struct({
+      sourceDirectory: Schema.NullOr(TrimmedString),
+      validationProfileId: Schema.Literal("t3-server-default"),
+    }),
+  ),
   // Server settings
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   enableProviderUpdateChecks: Schema.optionalKey(Schema.Boolean),

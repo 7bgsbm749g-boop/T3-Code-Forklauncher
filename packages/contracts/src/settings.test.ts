@@ -21,6 +21,25 @@ const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
 describe("ServerSettings default permissions", () => {
+  it("keeps compatibility checks inert until a source directory is explicitly configured", () => {
+    expect(decodeServerSettings({}).forkCompatibility).toEqual({
+      sourceDirectory: null,
+      validationProfileId: "t3-server-default",
+    });
+    expect(
+      decodeServerSettingsPatch({
+        forkCompatibility: {
+          sourceDirectory: "/srv/t3-fork",
+          validationProfileId: "t3-server-default",
+        },
+      }),
+    ).toEqual({
+      forkCompatibility: {
+        sourceDirectory: "/srv/t3-fork",
+        validationProfileId: "t3-server-default",
+      },
+    });
+  });
   it("keeps full access for settings saved before a default was configured", () => {
     expect(decodeServerSettings({}).defaultRuntimeMode).toBe("full-access");
     expect(DEFAULT_SERVER_SETTINGS.defaultRuntimeMode).toBe("full-access");

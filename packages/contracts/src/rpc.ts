@@ -1,6 +1,11 @@
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+import {
+  ForkCompatibilityEvidence,
+  ForkCompatibilityRequestStatus,
+  ForkCompatibilityRunStatus,
+} from "./forkCompatibility.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   ProviderAuthCancelInput,
@@ -249,6 +254,11 @@ import {
 } from "./providerUsageLimits.ts";
 import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
+
+export class ForkCompatibilityRpcError extends Schema.TaggedError<ForkCompatibilityRpcError>()(
+  "ForkCompatibilityRpcError",
+  { message: Schema.String },
+) {}
 import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
@@ -366,6 +376,9 @@ export const WS_METHODS = {
   serverRemoveKeybinding: "server.removeKeybinding",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
+  forkCompatibilityConfigure: "forkCompatibility.configure",
+  forkCompatibilityCheck: "forkCompatibility.check",
+  forkCompatibilityStatus: "forkCompatibility.status",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
@@ -576,6 +589,48 @@ const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSettings, {
   payload: Schema.Struct({ patch: ServerSettingsPatch }),
   success: ServerSettings,
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+const ForkCompatibilitySummary = Schema.Struct({
+  requestId: Schema.String,
+  requestStatus: ForkCompatibilityRequestStatus,
+  runId: Schema.NullOr(Schema.String),
+  runStatus: Schema.NullOr(ForkCompatibilityRunStatus),
+  sourceSha: Schema.NullOr(Schema.String),
+  targetTag: Schema.NullOr(Schema.String),
+  targetSha: Schema.NullOr(Schema.String),
+  candidateSha: Schema.NullOr(Schema.String),
+  usable: Schema.Boolean,
+  error: Schema.NullOr(Schema.String),
+});
+const WsForkCompatibilityConfigureRpc = Rpc.make(WS_METHODS.forkCompatibilityConfigure, {
+  payload: Schema.Struct({ sourceDirectory: Schema.NullOr(Schema.String) }),
+  success: Schema.Struct({ configured: Schema.Boolean }),
+  error: Schema.Union([
+    ServerSettingsError,
+    ForkCompatibilityRpcError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+const WsForkCompatibilityCheckRpc = Rpc.make(WS_METHODS.forkCompatibilityCheck, {
+  payload: Schema.Struct({ idempotencyKey: Schema.String }),
+  success: Schema.Struct({
+    requestId: Schema.String,
+    runId: Schema.NullOr(Schema.String),
+    status: ForkCompatibilityRequestStatus,
+  }),
+  error: Schema.Union([ForkCompatibilityRpcError, EnvironmentAuthorizationError]),
+});
+const WsForkCompatibilityStatusRpc = Rpc.make(WS_METHODS.forkCompatibilityStatus, {
+  payload: Schema.Struct({
+    requestId: Schema.String,
+    includeEvidence: Schema.optional(Schema.Boolean),
+  }),
+  success: Schema.Struct({
+    summary: Schema.NullOr(ForkCompatibilitySummary),
+    evidence: Schema.optional(ForkCompatibilityEvidence),
+  }),
+  error: Schema.Union([ForkCompatibilityRpcError, EnvironmentAuthorizationError]),
 });
 
 const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
@@ -1379,6 +1434,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRemoveKeybindingRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
+  WsForkCompatibilityConfigureRpc,
+  WsForkCompatibilityCheckRpc,
+  WsForkCompatibilityStatusRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,

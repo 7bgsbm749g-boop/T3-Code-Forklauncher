@@ -7,8 +7,13 @@ import {
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 
-import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "./RpcAuthorization.ts";
+import {
+  authorizeRpcEffect,
+  RPC_REQUIRED_SCOPES,
+  requiredScopeForRpcMethod,
+} from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
   it("declares exactly one scope for every RPC in the server group", () => {
@@ -29,6 +34,37 @@ describe("RPC authorization scopes", () => {
       AuthOrchestrationReadScope,
     );
   });
+
+  it("uses operate scope for compatibility configuration/check and read scope for status", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.forkCompatibilityConfigure)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(requiredScopeForRpcMethod(WS_METHODS.forkCompatibilityCheck)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(requiredScopeForRpcMethod(WS_METHODS.forkCompatibilityStatus)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
+
+  it.effect(
+    "rejects compatibility writes and reads when the authenticated session lacks their scope",
+    () =>
+      Effect.gen(function* () {
+        for (const method of [
+          WS_METHODS.forkCompatibilityConfigure,
+          WS_METHODS.forkCompatibilityCheck,
+          WS_METHODS.forkCompatibilityStatus,
+        ]) {
+          const requiredScope = requiredScopeForRpcMethod(method);
+          const error = yield* Effect.flip(
+            authorizeRpcEffect([], requiredScope, Effect.succeed("must not run")),
+          );
+          expect(error._tag).toBe("EnvironmentAuthorizationError");
+          expect(error.requiredScope).toBe(requiredScope);
+        }
+      }),
+  );
 
   it("allows relay status reads without granting relay installation access", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.cloudGetRelayClientStatus)).toBe(

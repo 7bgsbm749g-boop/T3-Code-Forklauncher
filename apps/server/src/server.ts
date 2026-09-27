@@ -90,6 +90,12 @@ import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as ForkCompatibilityCoordinator from "./forkCompatibility/ForkCompatibilityCoordinator.ts";
+import * as ForkCompatibilityNativeService from "./forkCompatibility/ForkCompatibilityNativeService.ts";
+import * as ForkCompatibilityRunRepository from "./forkCompatibility/ForkCompatibilityRunRepository.ts";
+import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCompatibilityRequestRepository.ts";
+import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
+import * as Path from "effect/Path";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
@@ -766,6 +772,32 @@ const makeServerLayer = Layer.unwrap(
       }),
     );
 
+    const compatibilityLayer = Layer.unwrap(
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const persistence = Layer.mergeAll(
+          ForkCompatibilityRunRepository.ForkCompatibilityRunRepositoryLive,
+          ForkCompatibilityRequestRepository.ForkCompatibilityRequestRepositoryLive,
+        ).pipe(Layer.provideMerge(PersistenceLayerLive));
+        const stableSource = ForkCompatibilityStableSource.ForkCompatibilityStableSourceLive.pipe(
+          Layer.provideMerge(GitVcsDriver.layer),
+          Layer.provide(FetchHttpClient.layer),
+        );
+        const coordinator = ForkCompatibilityCoordinator.ForkCompatibilityCoordinatorLive({
+          candidateRoot: path.join(config.baseDir, "fork-compatibility-candidates"),
+        }).pipe(
+          Layer.provideMerge(persistence),
+          Layer.provideMerge(stableSource),
+          Layer.provideMerge(GitVcsDriver.layer),
+          Layer.provide(ProcessRunner.layer),
+        );
+        return ForkCompatibilityNativeService.ForkCompatibilityNativeServiceLive.pipe(
+          Layer.provideMerge(persistence),
+          Layer.provideMerge(coordinator),
+        );
+      }),
+    );
+
     const runtimeServicesLive = ServerRuntimeStartup.layerWithOptions({
       activate: Deferred.succeed(activation, undefined).pipe(Effect.asVoid),
       abort: (error) => Deferred.die(activation, error).pipe(Effect.asVoid),
@@ -778,7 +810,11 @@ const makeServerLayer = Layer.unwrap(
         ],
         { concurrency: "unbounded" },
       ).pipe(Effect.asVoid),
-    }).pipe(Layer.provideMerge(RuntimeDependenciesLive), Layer.provide(launcherLayer));
+    }).pipe(
+      Layer.provideMerge(RuntimeDependenciesLive),
+      Layer.provideMerge(compatibilityLayer),
+      Layer.provide(launcherLayer),
+    );
 
     const routesLayer = HttpRouter.serve(makeRoutesLayer.pipe(Layer.provide(launcherLayer)), {
       disableLogger: !config.logWebSocketEvents,

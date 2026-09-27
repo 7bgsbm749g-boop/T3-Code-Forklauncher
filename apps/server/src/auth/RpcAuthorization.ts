@@ -6,12 +6,14 @@ import {
   AuthRelayWriteScope,
   AuthReviewWriteScope,
   AuthTerminalOperateScope,
+  EnvironmentAuthorizationError,
   ORCHESTRATION_WS_METHODS,
   type AuthEnvironmentScope,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+import * as Effect from "effect/Effect";
 
 type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
 
@@ -50,6 +52,9 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverRemoveKeybinding]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverGetSettings]: AuthOrchestrationReadScope,
   [WS_METHODS.serverUpdateSettings]: AuthOrchestrationOperateScope,
+  [WS_METHODS.forkCompatibilityConfigure]: AuthOrchestrationOperateScope,
+  [WS_METHODS.forkCompatibilityCheck]: AuthOrchestrationOperateScope,
+  [WS_METHODS.forkCompatibilityStatus]: AuthOrchestrationReadScope,
   [WS_METHODS.serverDiscoverSourceControl]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetTraceDiagnostics]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetProcessDiagnostics]: AuthOrchestrationReadScope,
@@ -177,3 +182,17 @@ export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope 
   }
   return requiredScope;
 }
+
+export const authorizeRpcEffect = <A, E, R>(
+  scopes: ReadonlyArray<AuthEnvironmentScope>,
+  requiredScope: AuthEnvironmentScope,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
+  scopes.includes(requiredScope)
+    ? effect
+    : Effect.fail(
+        new EnvironmentAuthorizationError({
+          message: `The authenticated token is missing required scope: ${requiredScope}.`,
+          requiredScope,
+        }),
+      );

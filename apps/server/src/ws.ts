@@ -68,6 +68,7 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  ForkCompatibilityRpcError,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -118,6 +119,7 @@ import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as ForkCompatibilityNative from "./forkCompatibility/ForkCompatibilityNativeService.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -146,7 +148,7 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
-import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
+import { authorizeRpcEffect, requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -570,6 +572,7 @@ const makeWsRpcLayer = (
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const forkCompatibility = yield* ForkCompatibilityNative.ForkCompatibilityNativeService;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -674,9 +677,7 @@ const makeWsRpcLayer = (
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
       ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope)
-          ? effect
-          : Effect.fail(authorizationError(requiredScope));
+        authorizeRpcEffect(currentSession.scopes, requiredScope, effect);
       const authorizeStream = <A, E, R>(
         requiredScope: AuthEnvironmentScope,
         stream: Stream.Stream<A, E, R>,
@@ -2534,6 +2535,84 @@ const makeWsRpcLayer = (
             {
               "rpc.aggregate": "server",
             },
+          ),
+        [WS_METHODS.forkCompatibilityConfigure]: ({ sourceDirectory }) =>
+          observeRpcEffect(
+            WS_METHODS.forkCompatibilityConfigure,
+            Effect.gen(function* () {
+              const path = yield* Path.Path;
+              const normalizedSource = sourceDirectory?.trim() || null;
+              if (normalizedSource !== null && !path.isAbsolute(normalizedSource)) {
+                return yield* Effect.fail(
+                  new ForkCompatibilityRpcError({
+                    message: "Source directory must be an absolute path.",
+                  }),
+                );
+              }
+              const settings = yield* serverSettings.updateSettings({
+                forkCompatibility: {
+                  sourceDirectory: normalizedSource,
+                  validationProfileId: "t3-server-default",
+                },
+              });
+              return { configured: settings.forkCompatibility.sourceDirectory !== null };
+            }),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkCompatibilityCheck]: ({ idempotencyKey }) =>
+          observeRpcEffect(
+            WS_METHODS.forkCompatibilityCheck,
+            Effect.gen(function* () {
+              const settings = yield* serverSettings.getSettings;
+              const sourceDirectory = settings.forkCompatibility.sourceDirectory;
+              if (!sourceDirectory) {
+                return yield* Effect.fail(
+                  new ForkCompatibilityRpcError({
+                    message: "Configure a source checkout before requesting validation.",
+                  }),
+                );
+              }
+              const accepted = yield* forkCompatibility
+                .accept({ idempotencyKey, repositoryRoot: sourceDirectory })
+                .pipe(
+                  Effect.mapError(
+                    (error) => new ForkCompatibilityRpcError({ message: error.message }),
+                  ),
+                );
+              return {
+                requestId: accepted.requestId,
+                runId: accepted.runId,
+                status: accepted.status,
+              };
+            }).pipe(
+              Effect.mapError((error) => new ForkCompatibilityRpcError({ message: error.message })),
+            ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkCompatibilityStatus]: ({ requestId, includeEvidence }) =>
+          observeRpcEffect(
+            WS_METHODS.forkCompatibilityStatus,
+            forkCompatibility.get(requestId).pipe(
+              Effect.mapError((error) => new ForkCompatibilityRpcError({ message: error.message })),
+              Effect.map(({ request, run, usable }) => ({
+                summary: request
+                  ? {
+                      requestId: request.requestId,
+                      requestStatus: request.status,
+                      runId: request.runId,
+                      runStatus: run?.status ?? null,
+                      sourceSha: run?.sourceSha ?? null,
+                      targetTag: run?.targetTag ?? null,
+                      targetSha: run?.targetSha ?? null,
+                      candidateSha: run?.candidateSha ?? null,
+                      usable,
+                      error: run?.error ?? request.error,
+                    }
+                  : null,
+                ...(includeEvidence && run?.evidence ? { evidence: run.evidence } : {}),
+              })),
+            ),
+            { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>
           observeRpcEffect(
