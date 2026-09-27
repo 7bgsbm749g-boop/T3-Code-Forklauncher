@@ -126,6 +126,7 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
           options.desktopAppUpdate ?? {
             available: false,
             run: () => Effect.die("unexpected desktop app update run"),
+            commit: () => Effect.die("unexpected desktop app update commit"),
           },
         ),
         Layer.succeed(HttpClient.HttpClient, releaseHttpClient(order)),
