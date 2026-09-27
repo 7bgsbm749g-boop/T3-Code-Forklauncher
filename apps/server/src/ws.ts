@@ -2543,11 +2543,9 @@ const makeWsRpcLayer = (
               const path = yield* Path.Path;
               const normalizedSource = sourceDirectory?.trim() || null;
               if (normalizedSource !== null && !path.isAbsolute(normalizedSource)) {
-                return yield* Effect.fail(
-                  new ForkCompatibilityRpcError({
-                    message: "Source directory must be an absolute path.",
-                  }),
-                );
+                return yield* new ForkCompatibilityRpcError({
+                  message: "Source directory must be an absolute path.",
+                });
               }
               const settings = yield* serverSettings.updateSettings({
                 forkCompatibility: {
@@ -2566,11 +2564,9 @@ const makeWsRpcLayer = (
               const settings = yield* serverSettings.getSettings;
               const sourceDirectory = settings.forkCompatibility.sourceDirectory;
               if (!sourceDirectory) {
-                return yield* Effect.fail(
-                  new ForkCompatibilityRpcError({
-                    message: "Configure a source checkout before requesting validation.",
-                  }),
-                );
+                return yield* new ForkCompatibilityRpcError({
+                  message: "Configure a source checkout before requesting validation.",
+                });
               }
               const accepted = yield* forkCompatibility
                 .accept({ idempotencyKey, repositoryRoot: sourceDirectory })
