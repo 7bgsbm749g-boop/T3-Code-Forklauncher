@@ -1125,7 +1125,13 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
                 Effect.gen(function* () {
                   assert.equal(command._tag, "StandardCommand");
                   if (command._tag !== "StandardCommand") return mockProcess(1);
-                  assert.equal(command.command, "cargo");
+                  assert.equal(
+                    path
+                      .basename(command.command)
+                      .replace(/\.exe$/i, "")
+                      .toLowerCase(),
+                    "cargo",
+                  );
                   assert.deepEqual(command.args, [
                     "build",
                     "--locked",
