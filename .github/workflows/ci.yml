@@ -20,14 +20,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          fetch_ref="$CHECKOUT_REF"
+          if [[ -n "$PULL_REQUEST_NUMBER" ]]; then fetch_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"; fi
+          git fetch --no-tags --depth=1 origin "$fetch_ref"
+          test "$(git rev-parse FETCH_HEAD)" = "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Reject repository-owned PR assets
         run: |
@@ -80,14 +87,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          fetch_ref="$CHECKOUT_REF"
+          if [[ -n "$PULL_REQUEST_NUMBER" ]]; then fetch_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"; fi
+          git fetch --no-tags --depth=1 origin "$fetch_ref"
+          test "$(git rev-parse FETCH_HEAD)" = "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -128,14 +142,21 @@ jobs:
       matrix:
         shard: [1, 2, 3]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          fetch_ref="$CHECKOUT_REF"
+          if [[ -n "$PULL_REQUEST_NUMBER" ]]; then fetch_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"; fi
+          git fetch --no-tags --depth=1 origin "$fetch_ref"
+          test "$(git rev-parse FETCH_HEAD)" = "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -192,14 +213,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          fetch_ref="$CHECKOUT_REF"
+          if [[ -n "$PULL_REQUEST_NUMBER" ]]; then fetch_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"; fi
+          git fetch --no-tags --depth=1 origin "$fetch_ref"
+          test "$(git rev-parse FETCH_HEAD)" = "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -306,14 +334,21 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          fetch_ref="$CHECKOUT_REF"
+          if [[ -n "$PULL_REQUEST_NUMBER" ]]; then fetch_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"; fi
+          git fetch --no-tags --depth=1 origin "$fetch_ref"
+          test "$(git rev-parse FETCH_HEAD)" = "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -335,14 +370,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          fetch_ref="$CHECKOUT_REF"
+          if [[ -n "$PULL_REQUEST_NUMBER" ]]; then fetch_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"; fi
+          git fetch --no-tags --depth=1 origin "$fetch_ref"
+          test "$(git rev-parse FETCH_HEAD)" = "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1

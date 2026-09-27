@@ -39,12 +39,17 @@ jobs:
     steps:
       # Keep the validator sourced from the workflow revision. Candidate source
       # is checked out separately only after scalar input validation succeeds.
-      - name: Checkout workflow tools
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          sparse-checkout: .github/scripts
+      - name: Checkout trusted workflow tools without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
       - name: Validate explicit inputs
         id: input
         env:
@@ -66,16 +71,18 @@ jobs:
           for (const [key, value] of Object.entries(result)) console.log(`${key}=${value}`);
           NODE
       - name: Checkout exact candidate commit without credentials
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.input.outputs.candidateSha }}
-          path: candidate
-          fetch-depth: 0
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ steps.input.outputs.candidateSha }}
+        run: |
+          set -euo pipefail
+          mkdir candidate
+          cd candidate
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
       - name: Verify actual Git identities and ancestry
         id: verify
         working-directory: candidate
@@ -120,15 +127,16 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout exact candidate without credentials
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.validate.outputs.candidate_sha }}
-          fetch-depth: 1
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.validate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
         with:
@@ -154,15 +162,16 @@ jobs:
       T3CODE_RELAY_URL: https://relay.t3.codes
     steps:
       - name: Checkout exact candidate without credentials
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.validate.outputs.candidate_sha }}
-          fetch-depth: 1
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.validate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
         with:
@@ -259,14 +268,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout exact candidate without credentials
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.validate.outputs.candidate_sha }}
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ needs.validate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
         with:
@@ -320,13 +331,19 @@ jobs:
         with:
           name: resource-monitor-win32-x64
           path: candidate-artifacts/builds/windows-resource-monitor
-      - name: Checkout trusted manifest helper
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          path: workflow-tools
-          persist-credentials: false
-          sparse-checkout: .github/scripts
+      - name: Checkout trusted manifest helper without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir workflow-tools
+          cd workflow-tools
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
       - name: Create exact identity manifest and checksums
         env:
           CANDIDATE_VERSION: ${{ needs.validate.outputs.candidate_version }}

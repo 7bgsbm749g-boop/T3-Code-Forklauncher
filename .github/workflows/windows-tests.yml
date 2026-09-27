@@ -29,14 +29,17 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Checkout source without credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       # setup-vp's own cache restores a Linux-shaped store on Windows, which is
       # slower than no cache (see #7975). Cache pnpm's Windows store directly.
