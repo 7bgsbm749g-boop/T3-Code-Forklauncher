@@ -5,7 +5,7 @@ import {
   ForkCompatibilityRunStatus,
 } from "@t3tools/contracts";
 
-export const OFFICIAL_UPSTREAM_REPOSITORY = "pingdotgg/t3code";
+const OFFICIAL_UPSTREAM_REPOSITORY = "pingdotgg/t3code";
 export const OFFICIAL_UPSTREAM_REMOTE = "https://github.com/pingdotgg/t3code.git";
 export const STABLE_RELEASES_URL = `https://api.github.com/repos/${OFFICIAL_UPSTREAM_REPOSITORY}/releases`;
 
@@ -55,7 +55,7 @@ export interface ForkCompatibilityRun {
   readonly updatedAt: string;
 }
 
-export const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
+const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
 export const isExactStableTag = (tag: string): boolean =>
   /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(tag);

@@ -89,6 +89,7 @@ const decode = (row: Row): ForkCompatibilityRequest => ({
   profile: decodeProfile(row.profileJson),
 });
 const columns = `request_id AS "requestId", idempotency_key AS "idempotencyKey", payload_sha256 AS "payloadSha256", repository_root AS "repositoryRoot", upstream_remote AS "upstreamRemote", profile_json AS "profileJson", profile_revision AS "profileRevision", status, run_id AS "runId", owner_pid AS "ownerPid", owner_token AS "ownerToken", error, created_at AS "createdAt", updated_at AS "updatedAt"`;
+/** @public Service construction is part of the canonical Effect module API. */
 export const makeForkCompatibilityRequestRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const queryBy = (field: "request_id" | "idempotency_key", value: string) =>

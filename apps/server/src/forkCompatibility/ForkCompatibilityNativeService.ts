@@ -403,6 +403,7 @@ export const makeForkCompatibilityNativeService = (options?: {
     });
     return { accept, get, awaitCompletion } satisfies ForkCompatibilityNativeServiceShape;
   });
+/** @public Service construction is part of the canonical Effect module API. */
 export const ForkCompatibilityNativeServiceLiveWith = (options?: {
   readonly upstreamRemote?: string;
   readonly profile?: ValidationProfile;

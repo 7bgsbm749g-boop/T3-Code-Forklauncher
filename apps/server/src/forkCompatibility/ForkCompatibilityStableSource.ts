@@ -83,6 +83,7 @@ export class ForkCompatibilityStableSource extends Context.Service<
   ForkCompatibilityStableSourceShape
 >()("t3/forkCompatibility/ForkCompatibilityStableSource") {}
 
+/** @public Service construction is part of the canonical Effect module API. */
 export const makeForkCompatibilityStableSource = Effect.gen(function* () {
   const http = yield* HttpClient.HttpClient;
   const git = yield* GitVcsDriver.GitVcsDriver;

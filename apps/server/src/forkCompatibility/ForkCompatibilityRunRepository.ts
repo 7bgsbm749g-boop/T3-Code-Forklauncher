@@ -156,6 +156,7 @@ const SELECT_COLUMNS = `
   status, evidence_json AS "evidenceJson", error, created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
+/** @public Service construction is part of the canonical Effect module API. */
 export const makeForkCompatibilityRunRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
