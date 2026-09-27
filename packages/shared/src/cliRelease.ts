@@ -5,9 +5,9 @@
  * platform key, so a rename here is a release-breaking change.
  */
 
-export const DEFAULT_CLI_RELEASE_REPOSITORY = "7bgsbm749g-boop/T3-Code-Forklauncher";
+const DEFAULT_CLI_RELEASE_REPOSITORY = "7bgsbm749g-boop/T3-Code-Forklauncher";
 export const CLI_RELEASE_REPOSITORY_ENV = "T3CODE_RELEASE_REPOSITORY";
-export const GITHUB_REPOSITORY_ENV = "GITHUB_REPOSITORY";
+const GITHUB_REPOSITORY_ENV = "GITHUB_REPOSITORY";
 export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 /** Overrides the download origin for mirrors and air-gapped installs. */
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
@@ -101,7 +101,7 @@ export function cliReleaseDownloadBaseUrl(
 }
 
 /** The selected release origin, excluding the version directory. */
-export function cliReleaseDownloadOrigin(
+function cliReleaseDownloadOrigin(
   baseUrl?: string,
   repository = BUILT_CLI_RELEASE_REPOSITORY,
 ): string {

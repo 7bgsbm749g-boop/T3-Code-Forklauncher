@@ -64,7 +64,7 @@ it("embeds the selected release feed in a built bundle when runtime env is absen
   try {
     const entry = NodePath.join(scratch, "feed-entry.ts");
     const sourceModule = NodeURL.pathToFileURL(
-      NodePath.join(process.cwd(), "packages/shared/src/cliRelease.ts"),
+      NodePath.resolve(import.meta.dirname, "../../../packages/shared/src/cliRelease.ts"),
     );
     await NodeFSP.writeFile(
       entry,
