@@ -144,7 +144,11 @@ it.layer(NodeServices.layer)("server self update", (it) => {
   it.effect("returns invalid feed configuration as a typed update error", () =>
     Effect.gen(function* () {
       const error = yield* makeHarness({ releaseRepository: "../invalid" }).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(ServerSelfUpdateError);
+      if (!(error instanceof ServerSelfUpdateError)) {
+        throw new Error(
+          "Expected invalid release feed selection to produce a server self-update error.",
+        );
+      }
       expect(error.reason).toBe("Invalid T3 release repository.");
     }),
   );

@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off -- The bundle test executes a real Vite-built module in a disposable Node process.
 import * as NodeAssert from "node:assert/strict";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
