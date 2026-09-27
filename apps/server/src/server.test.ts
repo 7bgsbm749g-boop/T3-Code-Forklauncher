@@ -5,7 +5,6 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeChildProcess from "node:child_process";
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
-// @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodeOS from "node:os";
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodePath from "node:path";

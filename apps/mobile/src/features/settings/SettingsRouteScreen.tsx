@@ -59,6 +59,13 @@ import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
 import { uuidv4 } from "../../lib/uuid";
+import {
+  IdentityEpoch,
+  type IdentityToken,
+  forgetPendingForkCheck,
+  pendingForkCheckForSource,
+  rememberPendingForkCheck,
+} from "@t3tools/client-runtime/state/fork-compatibility-ui";
 import { resolveAgentAwarenessPlatformPresentation } from "./SettingsRouteScreen.logic";
 import { planAutoSettleSettingsSync, type AutoSettleSettings } from "./autoSettleSettingsSync";
 
@@ -612,9 +619,7 @@ function GeneralSettingsSection() {
 function ForkCompatibilitySettingsRows() {
   const { environments } = useEnvironments();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
-  const savePreferences = useAtomCommand(updateMobilePreferencesAtom, {
-    reportFailure: false,
-  });
+  const savePreferences = useAtomSet(updateMobilePreferencesAtom, { mode: "promise" });
   const configure = useAtomCommand(serverEnvironment.forkCompatibilityConfigure, {
     reportFailure: false,
   });
@@ -635,6 +640,12 @@ function ForkCompatibilitySettingsRows() {
   const requestId = environmentId
     ? (preferences.forkCompatibilityRequestIds?.[environmentId] ?? null)
     : null;
+  const connectionPhase = environment?.connection.phase ?? "disconnected";
+  const statusIdentity = JSON.stringify([environmentId, requestId, connectionPhase]);
+  const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
+  const statusToken = statusEpoch.update(statusIdentity);
+  const preferencesRef = useRef(preferences);
+  preferencesRef.current = preferences;
   const [directoryDraft, setDirectoryDraft] = useState<{
     readonly environmentId: string;
     readonly value: string;
@@ -645,39 +656,81 @@ function ForkCompatibilitySettingsRows() {
     directoryDraft?.environmentId === environmentId
       ? directoryDraft.value
       : (configuredDirectory ?? "");
-  const [statusText, setStatusText] = useState(
-    "No check request has been recorded on this device.",
-  );
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [evidence, setEvidence] = useState<string | null>(null);
-  const [usable, setUsable] = useState(false);
+  const operationIdentity = JSON.stringify([environmentId, directory, connectionPhase]);
+  const operationEpoch = useRef(new IdentityEpoch(operationIdentity)).current;
+  const operationToken = operationEpoch.update(operationIdentity);
+  type StatusSummary = Extract<
+    Awaited<ReturnType<typeof readStatus>>,
+    { _tag: "Success" }
+  >["value"]["summary"];
+  const [statusEntry, setStatusEntry] = useState<{
+    readonly token: IdentityToken;
+    readonly summary: StatusSummary | null;
+    readonly error: string | null;
+    readonly evidence: string | null;
+  } | null>(null);
+  const [operationError, setOperationError] = useState<{
+    readonly token: IdentityToken;
+    readonly message: string;
+  } | null>(null);
+  const [busyEntry, setBusyEntry] = useState<IdentityToken | null>(null);
+  const [evidenceToken, setEvidenceToken] = useState<IdentityToken | null>(null);
+  const visibleStatus = statusEntry?.token === statusToken ? statusEntry : null;
+  const error = operationError?.token === operationToken ? operationError.message : null;
+  const busy = busyEntry === operationToken || busyEntry === statusToken;
+  const evidenceVisible = evidenceToken === statusToken;
 
-  const refresh = async (includeEvidence = false) => {
-    if (!environmentId || !requestId) return;
-    const result = await readStatus({
-      environmentId,
-      input: { requestId, includeEvidence },
-    });
-    if (result._tag === "Success") {
-      const summary = result.value.summary;
-      setStatusText(
-        summary
-          ? `${summary.requestStatus}${summary.runStatus ? ` · ${summary.runStatus}` : ""}${summary.usable ? " · current evidence" : summary.candidateSha ? " · stale evidence" : ""}`
-          : "Request not found on this server.",
-      );
-      setError(summary?.error ?? null);
-      setUsable(summary?.usable ?? false);
-      setEvidence(result.value.evidence ? JSON.stringify(result.value.evidence, null, 2) : null);
-    } else {
-      setError("Status unavailable. Reconnect and refresh to retry.");
-    }
-  };
+  const finishBusy = useCallback((token: IdentityToken) => {
+    setBusyEntry((current) => (current === token ? null : current));
+  }, []);
+  const refresh = useCallback(
+    async (includeEvidence = false) => {
+      const token = statusToken;
+      const targetEnvironmentId = environmentId;
+      const targetRequestId = requestId;
+      if (!targetEnvironmentId || !targetRequestId) return;
+      setBusyEntry(token);
+      try {
+        const result = await readStatus({
+          environmentId: targetEnvironmentId,
+          input: { requestId: targetRequestId, includeEvidence },
+        });
+        if (!statusEpoch.isCurrent(token)) return;
+        if (result._tag === "Success") {
+          setStatusEntry({
+            token,
+            summary: result.value.summary,
+            error: null,
+            evidence: result.value.evidence ? JSON.stringify(result.value.evidence, null, 2) : null,
+          });
+        } else {
+          setStatusEntry({
+            token,
+            summary: null,
+            error: "Status unavailable. Reconnect and refresh to retry.",
+            evidence: null,
+          });
+        }
+      } catch {
+        if (statusEpoch.isCurrent(token)) {
+          setStatusEntry({
+            token,
+            summary: null,
+            error: "Status unavailable. Reconnect and refresh to retry.",
+            evidence: null,
+          });
+        }
+      } finally {
+        finishBusy(token);
+      }
+    },
+    [environmentId, finishBusy, readStatus, requestId, statusEpoch, statusToken],
+  );
 
   useEffect(() => {
-    if (requestId) void refresh();
-    // Refresh when the selected server reconnects or its durable request key changes.
-  }, [environmentId, requestId, environment?.connection.phase]);
+    if (requestId && environment?.connection.phase === "connected") void refresh();
+    // Refresh only this selected server/request identity after reconnect.
+  }, [environment?.connection.phase, refresh, requestId]);
 
   if (!environmentId || !environment?.serverConfig) {
     return (
@@ -692,32 +745,97 @@ function ForkCompatibilitySettingsRows() {
   const configured = configuredDirectory;
 
   const saveDirectory = async (sourceDirectory: string | null) => {
-    setBusy(true);
-    const result = await configure({ environmentId, input: { sourceDirectory } });
-    setBusy(false);
-    setError(result._tag === "Failure" ? "Could not save the source checkout." : null);
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId) return;
+    const token = operationToken;
+    setBusyEntry(token);
+    try {
+      const result = await configure({
+        environmentId: targetEnvironmentId,
+        input: { sourceDirectory },
+      });
+      if (operationEpoch.isCurrent(token) && result._tag === "Failure") {
+        setOperationError({ token, message: "Could not save the source checkout." });
+      }
+    } catch {
+      if (operationEpoch.isCurrent(token)) {
+        setOperationError({ token, message: "Could not save the source checkout." });
+      }
+    } finally {
+      finishBusy(token);
+    }
   };
 
   const requestCheck = async () => {
-    if (!configured) return;
-    setBusy(true);
-    const result = await check({ environmentId, input: { idempotencyKey: uuidv4() } });
-    setBusy(false);
-    if (result._tag === "Failure") {
-      setError("Check was not accepted. Reconnect and try again.");
+    const targetEnvironmentId = environmentId;
+    const sourceDirectory = configured?.trim();
+    if (!targetEnvironmentId || !sourceDirectory) return;
+    const token = operationToken;
+    const oldPending = preferencesRef.current.forkCompatibilityPendingChecks ?? {};
+    const previousForServer = oldPending[targetEnvironmentId];
+    const existing = pendingForkCheckForSource(previousForServer, sourceDirectory);
+    const idempotencyKey = existing?.idempotencyKey ?? uuidv4();
+    const nextForServer = existing
+      ? (previousForServer ?? [])
+      : rememberPendingForkCheck(previousForServer, { sourceDirectory, idempotencyKey });
+    const nextPending = { ...oldPending, [targetEnvironmentId]: nextForServer };
+    preferencesRef.current = {
+      ...preferencesRef.current,
+      forkCompatibilityPendingChecks: nextPending,
+    };
+    setBusyEntry(token);
+    setOperationError(null);
+    try {
+      await savePreferences({ forkCompatibilityPendingChecks: nextPending });
+    } catch {
+      if (operationEpoch.isCurrent(token)) {
+        setOperationError({ token, message: "Could not save retry identity; check was not sent." });
+      }
+      finishBusy(token);
       return;
     }
-    const next = {
-      ...preferences.forkCompatibilityRequestIds,
-      [environmentId]: result.value.requestId,
-    };
-    const saved = await savePreferences({ forkCompatibilityRequestIds: next });
-    setStatusText(`${result.value.status} · request ${result.value.requestId}`);
-    setError(
-      saved._tag === "Failure"
-        ? "Request accepted, but this device could not save its request link."
-        : null,
-    );
+    try {
+      const result = await check({ environmentId: targetEnvironmentId, input: { idempotencyKey } });
+      if (result._tag === "Failure") {
+        if (operationEpoch.isCurrent(token)) {
+          setOperationError({
+            token,
+            message: "Check outcome is uncertain; retry to reuse its request key.",
+          });
+        }
+        return;
+      }
+      const current = preferencesRef.current;
+      const requestIds = {
+        ...current.forkCompatibilityRequestIds,
+        [targetEnvironmentId]: result.value.requestId,
+      };
+      const remaining = forgetPendingForkCheck(
+        current.forkCompatibilityPendingChecks?.[targetEnvironmentId],
+        idempotencyKey,
+      );
+      const pendingMap = { ...current.forkCompatibilityPendingChecks };
+      if (remaining.length > 0) pendingMap[targetEnvironmentId] = remaining;
+      else delete pendingMap[targetEnvironmentId];
+      preferencesRef.current = {
+        ...current,
+        forkCompatibilityRequestIds: requestIds,
+        forkCompatibilityPendingChecks: pendingMap,
+      };
+      await savePreferences({
+        forkCompatibilityRequestIds: requestIds,
+        forkCompatibilityPendingChecks: pendingMap,
+      });
+    } catch {
+      if (operationEpoch.isCurrent(token)) {
+        setOperationError({
+          token,
+          message: "Request was accepted, but its status link could not be saved.",
+        });
+      }
+    } finally {
+      finishBusy(token);
+    }
   };
 
   return (
@@ -769,26 +887,37 @@ function ForkCompatibilitySettingsRows() {
         </Pressable>
       </View>
       <View className="mt-3 flex-row items-center gap-3">
-        <Text className="flex-1 text-sm text-foreground-muted">{statusText}</Text>
+        <Text className="flex-1 text-sm text-foreground-muted">
+          {visibleStatus?.summary
+            ? `${visibleStatus.summary.requestStatus}${visibleStatus.summary.runStatus ? ` · ${visibleStatus.summary.runStatus}` : ""}${visibleStatus.summary.usable ? " · current evidence" : visibleStatus.summary.runStatus === "ready" && visibleStatus.summary.candidateSha ? " · stale evidence" : ""}`
+            : !requestId
+              ? "No check request has been recorded on this device."
+              : (visibleStatus?.error ?? "Request accepted; status has not been refreshed yet.")}
+        </Text>
         {requestId ? (
           <Pressable accessibilityRole="button" disabled={busy} onPress={() => void refresh()}>
             <Text className="text-sm text-foreground">Refresh</Text>
           </Pressable>
         ) : null}
       </View>
-      {requestId && usable ? (
+      {requestId && visibleStatus?.summary?.usable ? (
         <Pressable
           accessibilityRole="button"
           disabled={busy}
           className="mt-2 self-start rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
-          onPress={() => void refresh(true)}
+          onPress={() => {
+            setEvidenceToken(evidenceVisible ? null : statusToken);
+            if (!evidenceVisible) void refresh(true);
+          }}
         >
-          <Text className="text-sm text-foreground">Show validation evidence</Text>
+          <Text className="text-sm text-foreground">
+            {evidenceVisible ? "Hide validation evidence" : "Show validation evidence"}
+          </Text>
         </Pressable>
       ) : null}
-      {evidence ? (
+      {evidenceVisible && visibleStatus?.evidence ? (
         <Text selectable className="mt-2 text-xs text-foreground-muted">
-          {evidence}
+          {visibleStatus.evidence}
         </Text>
       ) : null}
       {error ? <Text className="mt-2 text-sm text-destructive">{error}</Text> : null}

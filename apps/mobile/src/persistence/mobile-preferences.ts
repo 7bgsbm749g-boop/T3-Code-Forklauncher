@@ -6,6 +6,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import type { SidebarProjectGroupingMode } from "@t3tools/contracts";
+import type { PendingForkCheck } from "@t3tools/client-runtime/state/fork-compatibility-ui";
 import type { ComposerEnterBehavior } from "../lib/composerEnterBehavior";
 import { MOBILE_THEME_IDS, type MobileThemeId, type MobileThemeMode } from "../lib/mobileTheme";
 
@@ -50,6 +51,10 @@ export interface Preferences {
   readonly threadListSnoozedShelfExpanded?: boolean;
   /** Last native compatibility request per server, so Settings survives reconnects. */
   readonly forkCompatibilityRequestIds?: Readonly<Record<string, string>>;
+  /** Unacknowledged idempotency keys, kept per server and configured source snapshot. */
+  readonly forkCompatibilityPendingChecks?: Readonly<
+    Record<string, ReadonlyArray<PendingForkCheck>>
+  >;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -112,6 +117,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     threadListSettledShelfExpanded?: boolean;
     threadListSnoozedShelfExpanded?: boolean;
     forkCompatibilityRequestIds?: Readonly<Record<string, string>>;
+    forkCompatibilityPendingChecks?: Readonly<Record<string, ReadonlyArray<PendingForkCheck>>>;
   } = {};
 
   if (typeof parsed.liveActivitiesEnabled === "boolean") {
@@ -122,6 +128,28 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     (MOBILE_THEME_IDS as readonly string[]).includes(parsed.themeId)
   ) {
     preferences.themeId = parsed.themeId as MobileThemeId;
+  }
+  if (
+    parsed.forkCompatibilityPendingChecks !== undefined &&
+    typeof parsed.forkCompatibilityPendingChecks === "object" &&
+    parsed.forkCompatibilityPendingChecks !== null &&
+    !Array.isArray(parsed.forkCompatibilityPendingChecks)
+  ) {
+    preferences.forkCompatibilityPendingChecks = Object.fromEntries(
+      Object.entries(parsed.forkCompatibilityPendingChecks).flatMap(([environmentId, value]) => {
+        if (!Array.isArray(value)) return [];
+        const pending = value.filter(
+          (entry): entry is PendingForkCheck =>
+            typeof entry === "object" &&
+            entry !== null &&
+            "sourceDirectory" in entry &&
+            typeof entry.sourceDirectory === "string" &&
+            "idempotencyKey" in entry &&
+            typeof entry.idempotencyKey === "string",
+        );
+        return pending.length > 0 ? [[environmentId, pending]] : [];
+      }),
+    );
   }
   if (
     typeof parsed.lightThemeId === "string" &&

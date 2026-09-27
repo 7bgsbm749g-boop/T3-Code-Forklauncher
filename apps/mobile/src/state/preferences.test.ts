@@ -68,6 +68,9 @@ describe("mobile preferences state", () => {
       Effect.gen(function* () {
         let saved: Preferences = {
           forkCompatibilityRequestIds: { "server-1": "request-old" },
+          forkCompatibilityPendingChecks: {
+            "server-1": [{ sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" }],
+          },
         };
         const state = makePreferencesState({
           load: Effect.succeed(saved),
@@ -93,10 +96,16 @@ describe("mobile preferences state", () => {
                 "server-1": "request-new",
                 "server-2": "request-two",
               },
+              forkCompatibilityPendingChecks: {
+                "server-1": [{ sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" }],
+              },
             });
           }),
         );
         expect(saved.forkCompatibilityRequestIds?.["server-1"]).toBe("request-new");
+        expect(saved.forkCompatibilityPendingChecks?.["server-1"]).toEqual([
+          { sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" },
+        ]);
 
         unmountUpdate();
         unmountPreferences();

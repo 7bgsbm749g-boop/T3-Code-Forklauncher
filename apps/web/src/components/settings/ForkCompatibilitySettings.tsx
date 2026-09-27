@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as Schema from "effect/Schema";
 import { CheckIcon, RefreshCwIcon, SaveIcon, Trash2Icon } from "lucide-react";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
@@ -9,8 +9,23 @@ import { useSettingsScope } from "./SettingsScopeContext";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import {
+  IdentityEpoch,
+  type IdentityToken,
+  forgetPendingForkCheck,
+  pendingForkCheckForSource,
+  rememberPendingForkCheck,
+} from "@t3tools/client-runtime/state/fork-compatibility-ui";
 
 const REQUEST_ID_SCHEMA = Schema.NullOr(Schema.String);
+const PENDING_CHECKS_SCHEMA = Schema.NullOr(
+  Schema.Array(
+    Schema.Struct({
+      sourceDirectory: Schema.String,
+      idempotencyKey: Schema.String,
+    }),
+  ),
+);
 
 export function ForkCompatibilitySettings() {
   const { environment, connectedEnvironments } = useSettingsScope();
@@ -38,33 +53,93 @@ export function ForkCompatibilitySettings() {
     null,
     REQUEST_ID_SCHEMA,
   );
-  const [status, setStatus] = useState<Awaited<ReturnType<typeof readStatus>> | null>(null);
-  const [evidenceVisible, setEvidenceVisible] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [pendingChecks, setPendingChecks] = useLocalStorage(
+    `fork-compatibility:pending-checks:${environmentId ?? "none"}`,
+    null,
+    PENDING_CHECKS_SCHEMA,
+  );
   const connected = connectedEnvironments.some(
     (candidate) => candidate.environmentId === environmentId,
   );
+  const statusIdentity = JSON.stringify([environmentId, lastRequestId, connected]);
+  const operationIdentity = JSON.stringify([environmentId, directory, connected]);
+  const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
+  const statusToken = statusEpoch.update(statusIdentity);
+  const operationEpoch = useRef(new IdentityEpoch(operationIdentity)).current;
+  const operationToken = operationEpoch.update(operationIdentity);
+  const [statusEntry, setStatusEntry] = useState<{
+    readonly token: IdentityToken;
+    readonly result: Awaited<ReturnType<typeof readStatus>> | null;
+    readonly error: string | null;
+  } | null>(null);
+  const [operationError, setOperationError] = useState<{
+    readonly token: IdentityToken;
+    readonly message: string;
+  } | null>(null);
+  const [busyEntry, setBusyEntry] = useState<{
+    readonly token: IdentityToken;
+    readonly identity: string;
+  } | null>(null);
+  const [evidenceToken, setEvidenceToken] = useState<IdentityToken | null>(null);
+  const status = statusEntry?.token === statusToken ? statusEntry.result : null;
+  const statusError = statusEntry?.token === statusToken ? statusEntry.error : null;
+  const operationErrorMessage =
+    operationError?.token === operationToken ? operationError.message : null;
+  const evidenceVisible = evidenceToken === statusToken;
+  const busy = busyEntry?.token === operationToken || busyEntry?.token === statusToken;
+
+  const setOperationBusy = useCallback(
+    (token: IdentityToken, identity: string) => setBusyEntry({ token, identity }),
+    [],
+  );
+  const finishBusy = useCallback((token: IdentityToken) => {
+    setBusyEntry((current) => (current?.token === token ? null : current));
+  }, []);
 
   const refresh = useCallback(
     async (includeEvidence: boolean, background = false) => {
-      if (!environmentId || !lastRequestId || !connected) return;
-      if (!background) setBusy(true);
-      const result = await readStatus({
-        environmentId,
-        input: { requestId: lastRequestId, includeEvidence },
-      });
-      if (!background) setBusy(false);
-      if (result._tag === "Success") {
-        setStatus(result);
-        setError(null);
-      } else {
-        setError(
-          connected ? "Status unavailable. Reconnect and refresh to retry." : "Disconnected.",
-        );
+      const token = statusToken;
+      const targetEnvironmentId = environmentId;
+      const targetRequestId = lastRequestId;
+      if (!targetEnvironmentId || !targetRequestId || !connected) return;
+      if (!background) setOperationBusy(token, statusIdentity);
+      try {
+        const result = await readStatus({
+          environmentId: targetEnvironmentId,
+          input: { requestId: targetRequestId, includeEvidence },
+        });
+        if (!statusEpoch.isCurrent(token)) return;
+        setStatusEntry({
+          token,
+          result: result._tag === "Success" ? result : null,
+          error:
+            result._tag === "Success"
+              ? null
+              : "Status unavailable. Reconnect and refresh to retry.",
+        });
+      } catch {
+        if (statusEpoch.isCurrent(token)) {
+          setStatusEntry({
+            token,
+            result: null,
+            error: "Status unavailable. Reconnect and refresh to retry.",
+          });
+        }
+      } finally {
+        if (!background) finishBusy(token);
       }
     },
-    [connected, environmentId, lastRequestId, readStatus],
+    [
+      connected,
+      environmentId,
+      lastRequestId,
+      readStatus,
+      setOperationBusy,
+      finishBusy,
+      statusEpoch,
+      statusToken,
+      statusIdentity,
+    ],
   );
 
   useEffect(() => {
@@ -83,31 +158,87 @@ export function ForkCompatibilitySettings() {
   }
 
   const saveDirectory = async (sourceDirectory: string | null) => {
-    setBusy(true);
-    const result = await configure({ environmentId, input: { sourceDirectory } });
-    setBusy(false);
-    if (result._tag === "Failure")
-      setError("Could not save source checkout. Check connection and permissions.");
-    else setError(null);
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId) return;
+    const token = operationToken;
+    setOperationBusy(token, operationIdentity);
+    try {
+      const result = await configure({
+        environmentId: targetEnvironmentId,
+        input: { sourceDirectory },
+      });
+      if (operationEpoch.isCurrent(token) && result._tag === "Failure") {
+        setOperationError({
+          token,
+          message: "Could not save source checkout. Check connection and permissions.",
+        });
+      }
+    } catch {
+      if (operationEpoch.isCurrent(token)) {
+        setOperationError({
+          token,
+          message: "Could not save source checkout. Check connection and permissions.",
+        });
+      }
+    } finally {
+      finishBusy(token);
+    }
   };
 
   const requestCheck = async () => {
-    if (!connected || !configuredDirectory) return;
-    setBusy(true);
-    setError(null);
-    const idempotencyKey = randomUUID();
-    const result = await check({ environmentId, input: { idempotencyKey } });
-    setBusy(false);
-    if (result._tag === "Success") {
+    const targetEnvironmentId = environmentId;
+    const sourceDirectory = configuredDirectory?.trim();
+    if (!connected || !targetEnvironmentId || !sourceDirectory) return;
+    const token = operationToken;
+    const identity = operationIdentity;
+    const pending = pendingChecks ?? [];
+    const existing = pendingForkCheckForSource(pending, sourceDirectory);
+    const idempotencyKey = existing?.idempotencyKey ?? randomUUID();
+    if (!existing) {
+      setPendingChecks(rememberPendingForkCheck(pending, { sourceDirectory, idempotencyKey }));
+    }
+    setOperationError(null);
+    setOperationBusy(token, identity);
+    try {
+      const result = await check({
+        environmentId: targetEnvironmentId,
+        input: { idempotencyKey },
+      });
+      if (result._tag === "Failure") {
+        if (operationEpoch.isCurrent(token)) {
+          setOperationError({ token, message: "Check was not accepted. Reconnect and retry." });
+        }
+        return;
+      }
       setLastRequestId(result.value.requestId);
-      setStatus(null);
-      setEvidenceVisible(false);
-    } else setError("Check was not accepted. Reconnect and try again.");
+      setPendingChecks((current) => {
+        const remaining = forgetPendingForkCheck(current, idempotencyKey);
+        return remaining.length > 0 ? remaining : null;
+      });
+    } catch {
+      if (operationEpoch.isCurrent(token)) {
+        setOperationError({
+          token,
+          message: "Check outcome is uncertain. Retry to reuse its request key.",
+        });
+      }
+    } finally {
+      finishBusy(token);
+    }
   };
 
   const summary = status?._tag === "Success" ? status.value.summary : null;
   const evidence = status?._tag === "Success" ? status.value.evidence : undefined;
-  const requestState = !connected ? "disconnected" : (summary?.requestStatus ?? "not loaded");
+  const requestState = !connected
+    ? "disconnected"
+    : (summary?.requestStatus ??
+      (statusError
+        ? "status unavailable"
+        : lastRequestId
+          ? "accepted; waiting for status"
+          : "no request"));
+  const staleEvidence =
+    summary?.runStatus === "ready" && summary.usable === false && !!summary.candidateSha;
 
   return (
     <SettingsSection id="fork-compatibility" title="Fork compatibility">
@@ -175,7 +306,7 @@ export function ForkCompatibilitySettings() {
           {summary?.runStatus ? <span>· {summary.runStatus}</span> : null}
           {summary && !connected ? (
             <span className="text-warning">· reconnect to check freshness</span>
-          ) : summary?.usable === false && summary.candidateSha ? (
+          ) : staleEvidence ? (
             <span className="text-warning">· stale evidence</span>
           ) : null}
           {lastRequestId ? (
@@ -204,8 +335,10 @@ export function ForkCompatibilitySettings() {
             {summary.candidateSha ? ` · candidate ${summary.candidateSha}` : ""}
           </p>
         ) : null}
-        {summary?.error || error ? (
-          <p className="text-xs text-destructive">{summary?.error ?? error}</p>
+        {summary?.error || statusError || operationErrorMessage ? (
+          <p className="text-xs text-destructive">
+            {summary?.error ?? statusError ?? operationErrorMessage}
+          </p>
         ) : null}
         {lastRequestId && summary?.usable ? (
           <Button
@@ -213,7 +346,7 @@ export function ForkCompatibilitySettings() {
             variant="ghost"
             disabled={!connected || busy}
             onClick={() => {
-              setEvidenceVisible((visible) => !visible);
+              setEvidenceToken(evidenceVisible ? null : statusToken);
               void refresh(!evidenceVisible);
             }}
           >
