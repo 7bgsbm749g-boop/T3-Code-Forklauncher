@@ -8,6 +8,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
@@ -116,27 +117,29 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
     Effect.provide(ServerConfig.layerTest(process.cwd(), baseDir)),
   );
   const selfUpdate = yield* ServerSelfUpdate.make().pipe(
-    Effect.provideService(ProcessRunner.ProcessRunner, runner),
-    Effect.provideService(ServiceLauncherClient.ServiceLauncherClient, launcher),
-    Effect.provideService(
-      DesktopAppUpdate.DesktopAppUpdate,
-      options.desktopAppUpdate ?? {
-        available: false,
-        run: () => Effect.die("unexpected desktop app update run"),
-      },
-    ),
-    Effect.provideService(HttpClient.HttpClient, releaseHttpClient(order)),
-    Effect.provideService(HostProcessPlatform, "linux"),
-    Effect.provideService(HostProcessArchitecture, "x64"),
-    Effect.provide(ServerConfig.layer({ ...config, mode: options.mode ?? "web" })),
     Effect.provide(
-      ConfigProvider.layer(
-        ConfigProvider.fromEnv({
-          env:
-            options.releaseRepository === undefined
-              ? {}
-              : { T3CODE_RELEASE_REPOSITORY: options.releaseRepository },
-        }),
+      Layer.mergeAll(
+        Layer.succeed(ProcessRunner.ProcessRunner, runner),
+        Layer.succeed(ServiceLauncherClient.ServiceLauncherClient, launcher),
+        Layer.succeed(
+          DesktopAppUpdate.DesktopAppUpdate,
+          options.desktopAppUpdate ?? {
+            available: false,
+            run: () => Effect.die("unexpected desktop app update run"),
+          },
+        ),
+        Layer.succeed(HttpClient.HttpClient, releaseHttpClient(order)),
+        Layer.succeed(HostProcessPlatform, "linux"),
+        Layer.succeed(HostProcessArchitecture, "x64"),
+        ServerConfig.layer({ ...config, mode: options.mode ?? "web" }),
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({
+            env:
+              options.releaseRepository === undefined
+                ? {}
+                : { T3CODE_RELEASE_REPOSITORY: options.releaseRepository },
+          }),
+        ),
       ),
     ),
   );
