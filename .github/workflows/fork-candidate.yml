@@ -144,7 +144,7 @@ jobs:
           cache: true
           run-install: false
       - name: Install server dependencies
-        run: vp install --frozen-lockfile --filter=t3...
+        run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/mobile...
       - name: Test server
         run: vp run --filter t3 test
 
