@@ -62,6 +62,48 @@ function makePreferencesState(
 }
 
 describe("mobile preferences state", () => {
+  it.effect(
+    "retains compatibility request identity per server in the device preference store",
+    () =>
+      Effect.gen(function* () {
+        let saved: Preferences = {
+          forkCompatibilityRequestIds: { "server-1": "request-old" },
+        };
+        const state = makePreferencesState({
+          load: Effect.succeed(saved),
+          savePatch: (patch) => {
+            saved = { ...saved, ...patch };
+            return Effect.succeed(saved);
+          },
+        });
+        const registry = AtomRegistry.make();
+        const unmountPreferences = registry.mount(state.preferencesAtom);
+        const unmountUpdate = registry.mount(state.updatePreferencesAtom);
+
+        yield* AtomRegistry.getResult(registry, state.preferencesAtom, { suspendOnWaiting: true });
+        registry.set(state.updatePreferencesAtom, {
+          forkCompatibilityRequestIds: { "server-1": "request-new", "server-2": "request-two" },
+        });
+        yield* Effect.promise(() =>
+          vi.waitFor(() => {
+            expect(
+              Option.getOrThrow(AsyncResult.value(registry.get(state.preferencesAtom))),
+            ).toEqual({
+              forkCompatibilityRequestIds: {
+                "server-1": "request-new",
+                "server-2": "request-two",
+              },
+            });
+          }),
+        );
+        expect(saved.forkCompatibilityRequestIds?.["server-1"]).toBe("request-new");
+
+        unmountUpdate();
+        unmountPreferences();
+        registry.dispose();
+      }),
+  );
+
   it.effect("shares one preference load across consumers", () =>
     Effect.gen(function* () {
       const load = vi.fn(() => Promise.resolve<Preferences>({ baseFontSize: 17 }));

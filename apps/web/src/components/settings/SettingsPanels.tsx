@@ -170,6 +170,7 @@ import {
 import { searchableSetting } from "./settingsSearch";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { PanelAnimationsPreview } from "./PanelAnimationsPreview";
+import { ForkCompatibilitySettings } from "./ForkCompatibilitySettings";
 
 const ENVIRONMENT_IDENTIFICATION_LABELS: Record<EnvironmentIdentificationMode, string> = {
   artwork: "Artwork",
@@ -2169,6 +2170,7 @@ export function GeneralSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      {isEnvironmentScope ? <ForkCompatibilitySettings /> : null}
       <ProjectDefaultsSettings category="general" />
       <SettingsSection id="organization" title="Organization">
         <SettingsRow

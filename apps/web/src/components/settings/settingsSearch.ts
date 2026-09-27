@@ -98,6 +98,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["model workspace environments projects inheritance checkout"],
   },
   {
+    id: "fork-compatibility",
+    title: "Fork compatibility",
+    to: "/settings/general",
+    scope: "environment",
+    searchTerms: ["stable upstream release validation source checkout candidate"],
+    environmentOnly: true,
+  },
+  {
     id: "project-overview",
     title: "Project overview",
     to: "/settings/projects",

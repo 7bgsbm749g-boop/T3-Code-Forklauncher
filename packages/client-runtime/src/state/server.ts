@@ -1098,6 +1098,27 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: configScheduler,
       concurrency: configConcurrency,
     }),
+    forkCompatibilityConfigure: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-compatibility-configure",
+      tag: WS_METHODS.forkCompatibilityConfigure,
+    }),
+    forkCompatibilityCheck: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-compatibility-check",
+      tag: WS_METHODS.forkCompatibilityCheck,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.idempotencyKey]),
+      },
+    }),
+    forkCompatibilityStatus: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-compatibility-status",
+      tag: WS_METHODS.forkCompatibilityStatus,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          JSON.stringify([environmentId, input.requestId, input.includeEvidence ?? false]),
+      },
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

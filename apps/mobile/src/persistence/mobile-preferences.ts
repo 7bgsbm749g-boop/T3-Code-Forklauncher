@@ -48,6 +48,8 @@ export interface Preferences {
   /** Fresh keys reset both shelves to collapsed when users update. */
   readonly threadListSettledShelfExpanded?: boolean;
   readonly threadListSnoozedShelfExpanded?: boolean;
+  /** Last native compatibility request per server, so Settings survives reconnects. */
+  readonly forkCompatibilityRequestIds?: Readonly<Record<string, string>>;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -109,6 +111,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     planModeEnabled?: boolean;
     threadListSettledShelfExpanded?: boolean;
     threadListSnoozedShelfExpanded?: boolean;
+    forkCompatibilityRequestIds?: Readonly<Record<string, string>>;
   } = {};
 
   if (typeof parsed.liveActivitiesEnabled === "boolean") {
@@ -187,6 +190,18 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (typeof parsed.threadListSnoozedShelfExpanded === "boolean") {
     preferences.threadListSnoozedShelfExpanded = parsed.threadListSnoozedShelfExpanded;
+  }
+  if (
+    parsed.forkCompatibilityRequestIds !== undefined &&
+    typeof parsed.forkCompatibilityRequestIds === "object" &&
+    parsed.forkCompatibilityRequestIds !== null &&
+    !Array.isArray(parsed.forkCompatibilityRequestIds)
+  ) {
+    preferences.forkCompatibilityRequestIds = Object.fromEntries(
+      Object.entries(parsed.forkCompatibilityRequestIds).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
   }
   return preferences;
 }

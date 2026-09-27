@@ -58,6 +58,7 @@ import { useSavedRemoteConnections } from "../../state/use-remote-environment-re
 import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
+import { uuidv4 } from "../../lib/uuid";
 import { resolveAgentAwarenessPlatformPresentation } from "./SettingsRouteScreen.logic";
 import { planAutoSettleSettingsSync, type AutoSettleSettings } from "./autoSettleSettingsSync";
 
@@ -598,12 +599,200 @@ function GeneralSettingsSection() {
   return (
     <SettingsSection title="General">
       <SettingsRow icon="folder" label="Project Grouping" target="SettingsProjectGrouping" />
+      <ForkCompatibilitySettingsRows />
       {Platform.OS === "ios" ? (
         <SettingsRow icon="keyboard" label="Keyboard" target="SettingsKeyboard" />
       ) : null}
       <AutoSettleSettingsRows />
       <SettingsRow icon="chart.bar.xaxis" label="Usage" target="SettingsUsage" />
     </SettingsSection>
+  );
+}
+
+function ForkCompatibilitySettingsRows() {
+  const { environments } = useEnvironments();
+  const preferencesResult = useAtomValue(mobilePreferencesAtom);
+  const savePreferences = useAtomCommand(updateMobilePreferencesAtom, {
+    reportFailure: false,
+  });
+  const configure = useAtomCommand(serverEnvironment.forkCompatibilityConfigure, {
+    reportFailure: false,
+  });
+  const check = useAtomCommand(serverEnvironment.forkCompatibilityCheck, {
+    reportFailure: false,
+  });
+  const readStatus = useAtomCommand(serverEnvironment.forkCompatibilityStatus, {
+    reportFailure: false,
+  });
+  const environment = environments.find(
+    (candidate) => candidate.connection.phase === "connected" && candidate.serverConfig,
+  );
+  const environmentId = environment?.environmentId ?? null;
+  const preferences =
+    preferencesResult._tag === "Success"
+      ? preferencesResult.value
+      : { forkCompatibilityRequestIds: undefined };
+  const requestId = environmentId
+    ? (preferences.forkCompatibilityRequestIds?.[environmentId] ?? null)
+    : null;
+  const [directoryDraft, setDirectoryDraft] = useState<{
+    readonly environmentId: string;
+    readonly value: string;
+  } | null>(null);
+  const configuredDirectory =
+    environment?.serverConfig?.settings.forkCompatibility.sourceDirectory ?? null;
+  const directory =
+    directoryDraft?.environmentId === environmentId
+      ? directoryDraft.value
+      : (configuredDirectory ?? "");
+  const [statusText, setStatusText] = useState(
+    "No check request has been recorded on this device.",
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [evidence, setEvidence] = useState<string | null>(null);
+  const [usable, setUsable] = useState(false);
+
+  const refresh = async (includeEvidence = false) => {
+    if (!environmentId || !requestId) return;
+    const result = await readStatus({
+      environmentId,
+      input: { requestId, includeEvidence },
+    });
+    if (result._tag === "Success") {
+      const summary = result.value.summary;
+      setStatusText(
+        summary
+          ? `${summary.requestStatus}${summary.runStatus ? ` · ${summary.runStatus}` : ""}${summary.usable ? " · current evidence" : summary.candidateSha ? " · stale evidence" : ""}`
+          : "Request not found on this server.",
+      );
+      setError(summary?.error ?? null);
+      setUsable(summary?.usable ?? false);
+      setEvidence(result.value.evidence ? JSON.stringify(result.value.evidence, null, 2) : null);
+    } else {
+      setError("Status unavailable. Reconnect and refresh to retry.");
+    }
+  };
+
+  useEffect(() => {
+    if (requestId) void refresh();
+    // Refresh when the selected server reconnects or its durable request key changes.
+  }, [environmentId, requestId, environment?.connection.phase]);
+
+  if (!environmentId || !environment?.serverConfig) {
+    return (
+      <View className="border-t border-border-subtle px-4 py-4">
+        <Text className="text-lg font-medium text-foreground">Fork compatibility</Text>
+        <Text className="mt-1 text-sm text-foreground-muted">
+          Connect a server to configure a source checkout and view compatibility checks.
+        </Text>
+      </View>
+    );
+  }
+  const configured = configuredDirectory;
+
+  const saveDirectory = async (sourceDirectory: string | null) => {
+    setBusy(true);
+    const result = await configure({ environmentId, input: { sourceDirectory } });
+    setBusy(false);
+    setError(result._tag === "Failure" ? "Could not save the source checkout." : null);
+  };
+
+  const requestCheck = async () => {
+    if (!configured) return;
+    setBusy(true);
+    const result = await check({ environmentId, input: { idempotencyKey: uuidv4() } });
+    setBusy(false);
+    if (result._tag === "Failure") {
+      setError("Check was not accepted. Reconnect and try again.");
+      return;
+    }
+    const next = {
+      ...preferences.forkCompatibilityRequestIds,
+      [environmentId]: result.value.requestId,
+    };
+    const saved = await savePreferences({ forkCompatibilityRequestIds: next });
+    setStatusText(`${result.value.status} · request ${result.value.requestId}`);
+    setError(
+      saved._tag === "Failure"
+        ? "Request accepted, but this device could not save its request link."
+        : null,
+    );
+  };
+
+  return (
+    <View className="border-t border-border-subtle px-4 py-4">
+      <Text className="text-lg font-medium text-foreground">Fork compatibility</Text>
+      <Text className="mt-1 text-sm text-foreground-muted">
+        Validate a configured server checkout in an isolated candidate. This does not install or
+        replace the server.
+      </Text>
+      <TextInput
+        accessibilityLabel="Fork source checkout directory"
+        className="mt-3 min-h-11 rounded-xl border border-border-subtle px-3 text-base text-foreground"
+        placeholder="Absolute server path"
+        value={directory}
+        onChangeText={(value) => setDirectoryDraft({ environmentId, value })}
+        editable={!busy}
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
+      <View className="mt-2 flex-row gap-2">
+        <Pressable
+          accessibilityRole="button"
+          disabled={busy || directory.trim() === (configured ?? "")}
+          className="rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+          onPress={() => void saveDirectory(directory.trim() || null)}
+        >
+          <Text className="text-sm text-foreground">Save source</Text>
+        </Pressable>
+        {configured ? (
+          <Pressable
+            accessibilityRole="button"
+            disabled={busy}
+            className="rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+            onPress={() => {
+              setDirectoryDraft({ environmentId, value: "" });
+              void saveDirectory(null);
+            }}
+          >
+            <Text className="text-sm text-foreground">Clear</Text>
+          </Pressable>
+        ) : null}
+        <Pressable
+          accessibilityRole="button"
+          disabled={busy || !configured}
+          className="rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+          onPress={() => void requestCheck()}
+        >
+          <Text className="text-sm text-foreground">Check</Text>
+        </Pressable>
+      </View>
+      <View className="mt-3 flex-row items-center gap-3">
+        <Text className="flex-1 text-sm text-foreground-muted">{statusText}</Text>
+        {requestId ? (
+          <Pressable accessibilityRole="button" disabled={busy} onPress={() => void refresh()}>
+            <Text className="text-sm text-foreground">Refresh</Text>
+          </Pressable>
+        ) : null}
+      </View>
+      {requestId && usable ? (
+        <Pressable
+          accessibilityRole="button"
+          disabled={busy}
+          className="mt-2 self-start rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+          onPress={() => void refresh(true)}
+        >
+          <Text className="text-sm text-foreground">Show validation evidence</Text>
+        </Pressable>
+      ) : null}
+      {evidence ? (
+        <Text selectable className="mt-2 text-xs text-foreground-muted">
+          {evidence}
+        </Text>
+      ) : null}
+      {error ? <Text className="mt-2 text-sm text-destructive">{error}</Text> : null}
+    </View>
   );
 }
 
