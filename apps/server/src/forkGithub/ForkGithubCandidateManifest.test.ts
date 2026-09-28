@@ -1,5 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
 import {
   verifyCandidateArtifact,
@@ -14,7 +18,7 @@ const profile = "d".repeat(64);
 const workflowCommit = "e".repeat(40);
 const workflowDefinition = "f".repeat(64);
 
-const fixture = (): CandidateArtifactSnapshot => {
+const fixture = () => {
   const linux = new TextEncoder().encode("linux");
   const server = new TextEncoder().encode("server tarball");
   const windows = new TextEncoder().encode("windows");
@@ -115,7 +119,7 @@ const fixture = (): CandidateArtifactSnapshot => {
       },
     ]),
   );
-  return {
+  const snapshot: CandidateArtifactSnapshot = {
     repository: "7bgsbm749g-boop/T3-Code-Forklauncher",
     repositoryId: 1,
     workflowId: 2,
@@ -136,6 +140,7 @@ const fixture = (): CandidateArtifactSnapshot => {
     sha256Sums: sums,
     files,
   };
+  return { snapshot, bytesByPath };
 };
 const identity = {
   repository: "7bgsbm749g-boop/T3-Code-Forklauncher",
@@ -150,7 +155,7 @@ const identity = {
 };
 
 it("verifies exact workflow/artifact identity, profile, version record and all file hashes", () => {
-  const artifact = fixture();
+  const { snapshot: artifact } = fixture();
   assert.equal(verifyCandidateArtifact(artifact, identity).candidateVersion, "0.0.43-fork.1");
   for (const bad of [
     { ...artifact, expired: true },
@@ -191,4 +196,56 @@ it("verifies exact workflow/artifact identity, profile, version record and all f
     })(),
   ])
     assert.throws(() => verifyCandidateArtifact(bad, identity));
+});
+
+it("accepts the assembled checksum output using canonical paths and filenames with spaces", async () => {
+  const { snapshot, bytesByPath } = fixture();
+  const artifactRoot = await NodeFSP.mkdtemp(
+    NodePath.join(NodeOS.tmpdir(), "candidate-checksums-"),
+  );
+  try {
+    for (const [path, bytes] of Object.entries(bytesByPath)) {
+      const filePath = NodePath.join(artifactRoot, path);
+      await NodeFSP.mkdir(NodePath.dirname(filePath), { recursive: true });
+      await NodeFSP.writeFile(filePath, bytes);
+    }
+    const helper = NodePath.resolve(
+      NodePath.dirname(new URL(import.meta.url).pathname),
+      "../../../../.github/scripts/create-candidate-checksums.sh",
+    );
+    const result = NodeChildProcess.spawnSync("bash", [helper], {
+      cwd: artifactRoot,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const sha256Sums = await NodeFSP.readFile(NodePath.join(artifactRoot, "SHA256SUMS"), "utf8");
+    assert.isFalse(sha256Sums.includes("  ./"));
+    const checksums = new TextEncoder().encode(sha256Sums);
+    snapshot.sha256Sums = sha256Sums;
+    snapshot.files.SHA256SUMS = {
+      path: NodePath.join(artifactRoot, "SHA256SUMS"),
+      size: checksums.byteLength,
+      sha256: hash(checksums),
+    };
+    assert.equal(verifyCandidateArtifact(snapshot, identity).candidateVersion, "0.0.43-fork.1");
+
+    const spacedRoot = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "candidate-checksum-spaces-"),
+    );
+    try {
+      const spacedPath = NodePath.join(spacedRoot, "asset name with spaces.bin");
+      await NodeFSP.writeFile(spacedPath, "space-safe");
+      const spacedResult = NodeChildProcess.spawnSync("bash", [helper], {
+        cwd: spacedRoot,
+        encoding: "utf8",
+      });
+      assert.equal(spacedResult.status, 0, spacedResult.stderr);
+      const spacedSums = await NodeFSP.readFile(NodePath.join(spacedRoot, "SHA256SUMS"), "utf8");
+      assert.include(spacedSums, `  asset name with spaces.bin\n`);
+    } finally {
+      await NodeFSP.rm(spacedRoot, { recursive: true, force: true });
+    }
+  } finally {
+    await NodeFSP.rm(artifactRoot, { recursive: true, force: true });
+  }
 });

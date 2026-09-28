@@ -399,7 +399,7 @@ jobs:
           await writeFile('candidate-artifacts/checks.json', `${JSON.stringify({ serverTests: 'success', bundleVersionSmoke: 'release CLI archive --expect-version', linuxPackaging: 'success', windowsPackaging: 'success', windowsFeedTests: process.env.WINDOWS_FEED_TESTS }, null, 2)}\n`);
           NODE
           cd candidate-artifacts
-          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          bash ../workflow-tools/.github/scripts/create-candidate-checksums.sh
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@v7
         with:
