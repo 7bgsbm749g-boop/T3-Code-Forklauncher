@@ -42,6 +42,9 @@ export function ForkCompatibilitySettings() {
   const readStatus = useAtomCommand(serverEnvironment.forkCompatibilityStatus, {
     reportFailure: false,
   });
+  const readScheduleStatus = useAtomCommand(serverEnvironment.forkCompatibilityScheduleStatus, {
+    reportFailure: false,
+  });
   const [directoryDraft, setDirectoryDraft] = useState<{
     readonly environmentId: string | null;
     readonly value: string;
@@ -83,9 +86,19 @@ export function ForkCompatibilitySettings() {
     null,
     PENDING_CHECKS_SCHEMA,
   );
+  const automaticStableChecks =
+    environment?.serverConfig?.settings.forkCompatibility.automaticStableChecks ?? false;
+  const [scheduleStatusEntry, setScheduleStatusEntry] = useState<{
+    readonly environmentId: string;
+    readonly result: Awaited<ReturnType<typeof readScheduleStatus>>;
+  } | null>(null);
   const connected = connectedEnvironments.some(
     (candidate) => candidate.environmentId === environmentId,
   );
+  const scheduleStatus =
+    connected && scheduleStatusEntry?.environmentId === environmentId
+      ? scheduleStatusEntry.result
+      : null;
   const statusIdentity = JSON.stringify([environmentId, lastRequestId, connected]);
   const operationIdentity = JSON.stringify([environmentId, directory, connected]);
   const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
@@ -171,6 +184,18 @@ export function ForkCompatibilitySettings() {
     if (connected && lastRequestId) void refresh(false, true);
     // Refresh when the selected environment reconnects or a new request is accepted.
   }, [connected, environmentId, lastRequestId, refresh]);
+
+  useEffect(() => {
+    let current = true;
+    if (connected && environmentId) {
+      void readScheduleStatus({ environmentId, input: {} }).then((result) => {
+        if (current) setScheduleStatusEntry({ environmentId, result });
+      });
+    }
+    return () => {
+      current = false;
+    };
+  }, [connected, environmentId, readScheduleStatus]);
 
   if (!environmentId || !environment?.serverConfig) {
     return (
@@ -339,6 +364,53 @@ export function ForkCompatibilitySettings() {
           </div>
         }
       />
+      <SettingsRow
+        title="Automatic stable checks"
+        description="Check official stable releases at startup and about every six hours. Checks validate an isolated candidate and never install it."
+        control={
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              aria-label="Enable automatic stable compatibility checks"
+              type="checkbox"
+              checked={automaticStableChecks}
+              disabled={!connected || busy || !configuredDirectory}
+              onChange={(event) => {
+                const targetEnvironmentId = environmentId;
+                if (!targetEnvironmentId) return;
+                void configure({
+                  environmentId: targetEnvironmentId,
+                  input: {
+                    sourceDirectory: configuredDirectory ?? null,
+                    automaticStableChecks: event.target.checked,
+                  },
+                }).then((result) => {
+                  if (result._tag === "Success")
+                    void readScheduleStatus({ environmentId: targetEnvironmentId, input: {} }).then(
+                      (scheduleResult) =>
+                        setScheduleStatusEntry({
+                          environmentId: targetEnvironmentId,
+                          result: scheduleResult,
+                        }),
+                    );
+                  else
+                    setOperationError({
+                      token: operationToken,
+                      message: "Could not update automatic checks.",
+                    });
+                });
+              }}
+            />
+            {automaticStableChecks ? "On" : "Off"}
+          </label>
+        }
+      />
+      <p className="px-4 py-2 text-xs text-muted-foreground">
+        {scheduleStatus?._tag === "Success"
+          ? `${scheduleStatus.value.lastStatus}${scheduleStatus.value.lastDiscoveredTag ? ` · ${scheduleStatus.value.lastDiscoveredTag}` : ""}${scheduleStatus.value.lastError ? ` · ${scheduleStatus.value.lastError}` : ""}${scheduleStatus.value.nextDueAt ? ` · next ${scheduleStatus.value.nextDueAt}` : ""}`
+          : connected
+            ? "Automatic discovery status unavailable."
+            : "Reconnect to view automatic discovery status."}
+      </p>
       <SettingsRow
         title="Compatibility check"
         description={

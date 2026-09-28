@@ -2537,7 +2537,11 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "server",
             },
           ),
-        [WS_METHODS.forkCompatibilityConfigure]: ({ sourceDirectory, repair }) =>
+        [WS_METHODS.forkCompatibilityConfigure]: ({
+          sourceDirectory,
+          repair,
+          automaticStableChecks,
+        }) =>
           observeRpcEffect(
             WS_METHODS.forkCompatibilityConfigure,
             Effect.gen(function* () {
@@ -2586,9 +2590,38 @@ const makeWsRpcLayer = (
                 forkCompatibility: {
                   sourceDirectory: normalizedSource,
                   validationProfileId: "t3-server-default",
+                  automaticStableChecks: normalizedSource
+                    ? (automaticStableChecks ?? existing.forkCompatibility.automaticStableChecks)
+                    : false,
                   repair: nextRepair,
                 },
               });
+              const projectOption = normalizedSource
+                ? yield* projectionSnapshotQuery
+                    .getActiveProjectByWorkspaceRoot(normalizedSource)
+                    .pipe(
+                      Effect.mapError(
+                        (error) => new ForkCompatibilityRpcError({ message: error.message }),
+                      ),
+                    )
+                : Option.none();
+              const project = Option.getOrNull(projectOption);
+              yield* forkCompatibility
+                .configureAutomaticChecks({
+                  enabled: settings.forkCompatibility.automaticStableChecks,
+                  sourceDirectory: settings.forkCompatibility.sourceDirectory,
+                  repairPolicy: {
+                    ...nextRepair,
+                    projectId: project?.id ?? null,
+                    modelSelection:
+                      project?.defaultModelSelection ?? settings.defaultModelSelection,
+                  },
+                })
+                .pipe(
+                  Effect.mapError(
+                    (error) => new ForkCompatibilityRpcError({ message: error.message }),
+                  ),
+                );
               return { configured: settings.forkCompatibility.sourceDirectory !== null };
             }),
             { "rpc.aggregate": "server" },
@@ -2658,6 +2691,37 @@ const makeWsRpcLayer = (
                   : null,
                 ...(includeEvidence && run?.evidence ? { evidence: run.evidence } : {}),
               })),
+            ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkCompatibilityScheduleStatus]: () =>
+          observeRpcEffect(
+            WS_METHODS.forkCompatibilityScheduleStatus,
+            forkCompatibility.getAutomaticCheckStatus().pipe(
+              Effect.mapError((error) => new ForkCompatibilityRpcError({ message: error.message })),
+              Effect.map((status) =>
+                status
+                  ? {
+                      enabled: status.enabled,
+                      sourceDirectory: status.sourceDirectory,
+                      lastStatus: status.lastStatus,
+                      lastDiscoveredTag: status.lastDiscoveredTag,
+                      lastDiscoveredSha: status.lastDiscoveredSha,
+                      lastRequestId: status.lastRequestId,
+                      lastError: status.lastError,
+                      nextDueAt: status.nextDueAt,
+                    }
+                  : {
+                      enabled: false,
+                      sourceDirectory: null,
+                      lastStatus: "inert",
+                      lastDiscoveredTag: null,
+                      lastDiscoveredSha: null,
+                      lastRequestId: null,
+                      lastError: null,
+                      nextDueAt: null,
+                    },
+              ),
             ),
             { "rpc.aggregate": "server" },
           ),

@@ -5093,6 +5093,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       const proxyService = ForkCompatibilityNativeService.ForkCompatibilityNativeService.of({
+        configureAutomaticChecks: (input) =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).configureAutomaticChecks(input)),
+          ),
+        getAutomaticCheckStatus: () =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).getAutomaticCheckStatus()),
+          ),
+        awaitAutomaticDiscovery: () =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).awaitAutomaticDiscovery()),
+          ),
         accept: (input) =>
           Ref.get(capturedService).pipe(
             Effect.flatMap((service) => Option.getOrThrow(service).accept(input)),

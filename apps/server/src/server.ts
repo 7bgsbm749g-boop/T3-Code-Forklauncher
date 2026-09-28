@@ -97,6 +97,7 @@ import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCom
 import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
 import * as ForkCompatibilityRepairRepository from "./forkCompatibility/ForkCompatibilityRepairRepository.ts";
 import * as ForkCompatibilityRepair from "./forkCompatibility/ForkCompatibilityRepair.ts";
+import * as ForkCompatibilityScheduleRepository from "./forkCompatibility/ForkCompatibilityScheduleRepository.ts";
 import * as Path from "effect/Path";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
@@ -781,6 +782,7 @@ const makeServerLayer = Layer.unwrap(
           ForkCompatibilityRunRepository.ForkCompatibilityRunRepositoryLive,
           ForkCompatibilityRequestRepository.ForkCompatibilityRequestRepositoryLive,
           ForkCompatibilityRepairRepository.ForkCompatibilityRepairRepositoryLive,
+          ForkCompatibilityScheduleRepository.ForkCompatibilityScheduleRepositoryLive,
         ).pipe(Layer.provideMerge(PersistenceLayerLive));
         const stableSource = ForkCompatibilityStableSource.ForkCompatibilityStableSourceLive.pipe(
           Layer.provideMerge(GitVcsDriver.layer),
@@ -798,6 +800,7 @@ const makeServerLayer = Layer.unwrap(
           Layer.provideMerge(persistence),
         );
         const native = ForkCompatibilityNativeService.ForkCompatibilityNativeServiceLive.pipe(
+          Layer.provideMerge(stableSource),
           Layer.provideMerge(repair),
           Layer.provideMerge(persistence),
           Layer.provideMerge(coordinator),

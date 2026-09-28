@@ -55,6 +55,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.forkCompatibilityConfigure]: AuthOrchestrationOperateScope,
   [WS_METHODS.forkCompatibilityCheck]: AuthOrchestrationOperateScope,
   [WS_METHODS.forkCompatibilityStatus]: AuthOrchestrationReadScope,
+  [WS_METHODS.forkCompatibilityScheduleStatus]: AuthOrchestrationReadScope,
   [WS_METHODS.serverDiscoverSourceControl]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetTraceDiagnostics]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetProcessDiagnostics]: AuthOrchestrationReadScope,

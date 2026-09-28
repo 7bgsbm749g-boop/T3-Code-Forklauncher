@@ -43,6 +43,7 @@ import * as RepairRepository from "./ForkCompatibilityRepairRepository.ts";
 import * as RequestRepository from "./ForkCompatibilityRequestRepository.ts";
 import * as RunRepository from "./ForkCompatibilityRunRepository.ts";
 import * as StableSource from "./ForkCompatibilityStableSource.ts";
+import * as ScheduleRepository from "./ForkCompatibilityScheduleRepository.ts";
 import { forkCompatibilityRepairPolicyDigest } from "./ForkCompatibilityRepairEligibility.ts";
 import type { ValidationProfile } from "./model.ts";
 
@@ -105,6 +106,7 @@ const makeIntegratedLayer = (input: {
   readonly repositoryRoot: string;
   readonly upstreamRemote: string;
   readonly targetSha: string;
+  readonly profile?: ValidationProfile;
   readonly onDispatch?: (attempt: RepairRepository.RepairAttempt) => Effect.Effect<void>;
   readonly beforeValidation?: () => Effect.Effect<void>;
 }) => {
@@ -131,6 +133,7 @@ const makeIntegratedLayer = (input: {
     RequestRepository.ForkCompatibilityRequestRepositoryLive,
     RepairRepository.ForkCompatibilityRepairRepositoryLive,
     RunRepository.ForkCompatibilityRunRepositoryLive,
+    ScheduleRepository.ForkCompatibilityScheduleRepositoryLive,
   ).pipe(Layer.provideMerge(persistence));
   const vcsProcess = VcsProcess.layer.pipe(Layer.provide(NodeServices.layer));
   const gitLayer = Layer.mergeAll(GitVcsDriver.vcsLayer, GitVcsDriver.layer).pipe(
@@ -186,7 +189,7 @@ const makeIntegratedLayer = (input: {
   ).pipe(Layer.provideMerge(coordinator));
   return Native.ForkCompatibilityNativeServiceLiveWith({
     upstreamRemote: input.upstreamRemote,
-    profile: validationProfile,
+    profile: input.profile ?? validationProfile,
   }).pipe(
     Layer.provideMerge(observedRepair),
     Layer.provideMerge(observedCoordinator),
@@ -352,6 +355,91 @@ it.effect(
         }).pipe(Effect.provide(appLayer));
       }),
     ),
+);
+
+it.effect(
+  "discovers an exact stable release, accepts one durable scheduled run, and leaves source checkout unchanged",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = makeGitFixture();
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+        );
+        const scheduledProfile: ValidationProfile = {
+          id: "scheduled-fixture",
+          revision: "1",
+          commands: [
+            {
+              command: NodeProcess.execPath,
+              args: [
+                "-e",
+                "if (!require('fs').readFileSync('README.md', 'utf8').includes('upstream stable')) process.exit(18)",
+              ],
+              timeoutMs: 10_000,
+            },
+          ],
+        };
+        const layer = makeIntegratedLayer({
+          dbPath: NodePath.join(fixture.root, "scheduled.sqlite"),
+          candidateRoot: NodePath.join(fixture.root, "scheduled-candidates"),
+          repositoryRoot: fixture.repositoryRoot,
+          upstreamRemote: fixture.upstreamRemote,
+          targetSha: fixture.targetSha,
+          profile: scheduledProfile,
+        });
+        const before = git(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+        yield* Effect.gen(function* () {
+          const service = yield* Native.ForkCompatibilityNativeService;
+          const requests = yield* RequestRepository.ForkCompatibilityRequestRepository;
+          const sql = yield* SqlClient.SqlClient;
+          const acceptedState = yield* service.configureAutomaticChecks({
+            enabled: true,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          void acceptedState;
+          const scheduled = yield* service.awaitAutomaticDiscovery();
+          assert.equal(scheduled?.enabled, true);
+          assert.equal(scheduled?.lastDiscoveredTag, "v0.0.43");
+          assert.equal(scheduled?.lastDiscoveredSha, fixture.targetSha);
+          assert.ok(scheduled?.lastRequestId);
+          yield* service.awaitCompletion(scheduled!.lastRequestId!);
+          const result = yield* service.get(scheduled!.lastRequestId!);
+          const accepted = yield* requests.get(scheduled!.lastRequestId!);
+          assert.equal(accepted?.expectedTargetTag, "v0.0.43");
+          assert.equal(accepted?.expectedTargetSha, fixture.targetSha);
+          assert.equal(accepted?.expectedSourceSha, fixture.sourceSha);
+          assert.equal(accepted?.expectedSourceBranch, "forklauncher");
+          assert.equal(result.request?.status, "completed");
+          assert.equal(result.run?.targetTag, "v0.0.43");
+          assert.equal(result.run?.targetSha, fixture.targetSha);
+          assert.equal(result.usable, true);
+          assert.equal(git(fixture.repositoryRoot, ["rev-parse", "HEAD"]), before);
+          assert.equal(git(fixture.repositoryRoot, ["status", "--porcelain"]), "");
+          yield* service.configureAutomaticChecks({
+            enabled: true,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          const unchanged = yield* service.awaitAutomaticDiscovery();
+          assert.equal(unchanged?.lastRequestId, scheduled?.lastRequestId);
+          yield* service.configureAutomaticChecks({
+            enabled: false,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          assert.equal((yield* service.getAutomaticCheckStatus())?.lastStatus, "disabled");
+          yield* service.configureAutomaticChecks({
+            enabled: true,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          const reenabled = yield* service.awaitAutomaticDiscovery();
+          assert.equal(reenabled?.lastRequestId, scheduled?.lastRequestId);
+          const runCount = yield* sql<{
+            readonly count: number;
+          }>`SELECT COUNT(*) AS count FROM fork_compatibility_runs WHERE target_sha=${fixture.targetSha}`;
+          assert.equal(Number(runCount[0]?.count), 1);
+        }).pipe(Effect.provide(layer));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect(

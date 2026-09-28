@@ -145,6 +145,44 @@ const testRuntimeLayer = (input: {
   );
 };
 
+it.effect(
+  "refuses to validate a source commit or branch different from automatic discovery identity",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = makeGitFixture(false);
+        yield* Effect.addFinalizer(() => Effect.sync(() => cleanUpFixture(fixture)));
+        const before = runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]);
+        yield* Effect.gen(function* () {
+          const coordinator = yield* ForkCompatibilityCoordinator;
+          const failure = yield* Effect.flip(
+            coordinator.start({
+              repositoryRoot: fixture.repositoryRoot,
+              profile: successProfile,
+              expectedSource: {
+                sha: "f".repeat(40),
+                branch: fixture.sourceBranch,
+              },
+            }),
+          );
+          assert.include(failure.message, "changed between stable discovery");
+          assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), before);
+          assert.equal(
+            runGit(fixture.repositoryRoot, ["branch", "--show-current"]),
+            fixture.sourceBranch,
+          );
+        }).pipe(
+          Effect.provide(
+            testRuntimeLayer({
+              fixture,
+              candidateRoot: NodePath.join(fixture.root, "candidates"),
+            }),
+          ),
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 const runCoordinator = (
   fixture: GitFixture,
   candidateRoot: string,

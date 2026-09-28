@@ -74,6 +74,8 @@ export interface StartForkCompatibilityRunInput {
   readonly repositoryRoot: string;
   readonly upstreamRemote?: string;
   readonly profile: ValidationProfile;
+  readonly expectedTarget?: { readonly tag: string; readonly sha: string };
+  readonly expectedSource?: { readonly sha: string; readonly branch: string };
   /** Durable correlation must be committed before candidate execution starts. */
   readonly onRunLinked?: (run: ForkCompatibilityRun) => Effect.Effect<void, CoordinatorError>;
 }
@@ -761,6 +763,14 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
         return yield* forkCompatibilityError("Repository HEAD is not a commit SHA.");
       if (!sourceIdentity.branch)
         return yield* forkCompatibilityError("Compatibility checks require a named source branch.");
+      if (
+        input.expectedSource &&
+        (sourceIdentity.head !== input.expectedSource.sha ||
+          sourceIdentity.branch !== input.expectedSource.branch)
+      )
+        return yield* forkCompatibilityError(
+          "Configured source checkout changed between stable discovery and compatibility acceptance.",
+        );
       if (sourceIdentity.dirty)
         return yield* forkCompatibilityError(
           "The source working tree must be clean before compatibility validation.",
@@ -775,6 +785,13 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
         remote,
         tag: targetTag,
       });
+      if (
+        input.expectedTarget &&
+        (targetTag !== input.expectedTarget.tag || targetSha !== input.expectedTarget.sha)
+      )
+        return yield* forkCompatibilityError(
+          "Official stable release changed between discovery and compatibility acceptance; rediscover before retrying.",
+        );
       if (!isGitSha(targetSha))
         return yield* forkCompatibilityError("Stable target is not a commit SHA.");
       const profileJson = validationProfileJson(input.profile);

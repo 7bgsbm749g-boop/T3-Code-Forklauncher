@@ -1016,6 +1016,7 @@ export const ServerSettings = Schema.Struct({
     validationProfileId: Schema.Literal("t3-server-default").pipe(
       Schema.withDecodingDefault(Effect.succeed("t3-server-default" as const)),
     ),
+    automaticStableChecks: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
     repair: ForkCompatibilityRepairSettings.pipe(
       Schema.withDecodingDefault(
         Effect.succeed({
@@ -1370,6 +1371,7 @@ export const ServerSettingsPatch = Schema.Struct({
     Schema.Struct({
       sourceDirectory: Schema.NullOr(TrimmedString),
       validationProfileId: Schema.Literal("t3-server-default"),
+      automaticStableChecks: Schema.optionalKey(Schema.Boolean),
       repair: Schema.optionalKey(ForkCompatibilityRepairSettings),
     }),
   ),

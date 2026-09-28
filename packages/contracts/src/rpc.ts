@@ -381,6 +381,7 @@ export const WS_METHODS = {
   forkCompatibilityConfigure: "forkCompatibility.configure",
   forkCompatibilityCheck: "forkCompatibility.check",
   forkCompatibilityStatus: "forkCompatibility.status",
+  forkCompatibilityScheduleStatus: "forkCompatibility.scheduleStatus",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
@@ -610,6 +611,7 @@ const WsForkCompatibilityConfigureRpc = Rpc.make(WS_METHODS.forkCompatibilityCon
   payload: Schema.Struct({
     sourceDirectory: Schema.NullOr(Schema.String),
     repair: Schema.optional(ForkCompatibilityRepairSettings),
+    automaticStableChecks: Schema.optional(Schema.Boolean),
   }),
   success: Schema.Struct({ configured: Schema.Boolean }),
   error: Schema.Union([
@@ -617,6 +619,20 @@ const WsForkCompatibilityConfigureRpc = Rpc.make(WS_METHODS.forkCompatibilityCon
     ForkCompatibilityRpcError,
     EnvironmentAuthorizationError,
   ]),
+});
+const WsForkCompatibilityScheduleStatusRpc = Rpc.make(WS_METHODS.forkCompatibilityScheduleStatus, {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({
+    enabled: Schema.Boolean,
+    sourceDirectory: Schema.NullOr(Schema.String),
+    lastStatus: Schema.String,
+    lastDiscoveredTag: Schema.NullOr(Schema.String),
+    lastDiscoveredSha: Schema.NullOr(Schema.String),
+    lastRequestId: Schema.NullOr(Schema.String),
+    lastError: Schema.NullOr(Schema.String),
+    nextDueAt: Schema.NullOr(Schema.String),
+  }),
+  error: Schema.Union([ForkCompatibilityRpcError, EnvironmentAuthorizationError]),
 });
 const WsForkCompatibilityCheckRpc = Rpc.make(WS_METHODS.forkCompatibilityCheck, {
   payload: Schema.Struct({ idempotencyKey: Schema.String }),
@@ -1443,6 +1459,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsForkCompatibilityConfigureRpc,
   WsForkCompatibilityCheckRpc,
   WsForkCompatibilityStatusRpc,
+  WsForkCompatibilityScheduleStatusRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,

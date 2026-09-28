@@ -629,6 +629,9 @@ function ForkCompatibilitySettingsRows() {
   const readStatus = useAtomCommand(serverEnvironment.forkCompatibilityStatus, {
     reportFailure: false,
   });
+  const readScheduleStatus = useAtomCommand(serverEnvironment.forkCompatibilityScheduleStatus, {
+    reportFailure: false,
+  });
   const environment = environments.find(
     (candidate) => candidate.connection.phase === "connected" && candidate.serverConfig,
   );
@@ -652,6 +655,16 @@ function ForkCompatibilitySettingsRows() {
   } | null>(null);
   const configuredDirectory =
     environment?.serverConfig?.settings.forkCompatibility.sourceDirectory ?? null;
+  const automaticStableChecks =
+    environment?.serverConfig?.settings.forkCompatibility.automaticStableChecks ?? false;
+  const [scheduleStatusEntry, setScheduleStatusEntry] = useState<{
+    readonly environmentId: string;
+    readonly result: Awaited<ReturnType<typeof readScheduleStatus>>;
+  } | null>(null);
+  const scheduleStatus =
+    connectionPhase === "connected" && scheduleStatusEntry?.environmentId === environmentId
+      ? scheduleStatusEntry.result
+      : null;
   const configuredRepair = environment?.serverConfig?.settings.forkCompatibility.repair;
   const configuredModel = environment?.serverConfig?.settings.defaultModelSelection ?? null;
   const directory =
@@ -756,6 +769,18 @@ function ForkCompatibilitySettingsRows() {
     if (requestId && environment?.connection.phase === "connected") void refresh();
     // Refresh only this selected server/request identity after reconnect.
   }, [environment?.connection.phase, refresh, requestId]);
+
+  useEffect(() => {
+    let current = true;
+    if (environmentId && environment?.connection.phase === "connected") {
+      void readScheduleStatus({ environmentId, input: {} }).then((result) => {
+        if (current) setScheduleStatusEntry({ environmentId, result });
+      });
+    }
+    return () => {
+      current = false;
+    };
+  }, [environmentId, environment?.connection.phase, readScheduleStatus]);
 
   if (!environmentId || !environment?.serverConfig) {
     return (
@@ -945,6 +970,40 @@ function ForkCompatibilitySettingsRows() {
           <Text className="text-sm text-foreground">Check</Text>
         </Pressable>
       </View>
+      <SettingsSwitchRow
+        icon="clock"
+        label="Automatic stable checks"
+        subtitle="Discover official stable releases at startup and about every six hours. This only validates an isolated candidate; it never installs."
+        value={automaticStableChecks}
+        disabled={busy || !configured}
+        onValueChange={(enabled) => {
+          const targetEnvironmentId = environmentId;
+          if (!targetEnvironmentId) return;
+          void configure({
+            environmentId: targetEnvironmentId,
+            input: { sourceDirectory: configuredDirectory, automaticStableChecks: enabled },
+          }).then((result) => {
+            if (result._tag === "Success")
+              void readScheduleStatus({ environmentId: targetEnvironmentId, input: {} }).then(
+                (scheduleResult) =>
+                  setScheduleStatusEntry({
+                    environmentId: targetEnvironmentId,
+                    result: scheduleResult,
+                  }),
+              );
+            else
+              setOperationError({
+                token: operationToken,
+                message: "Could not update automatic checks.",
+              });
+          });
+        }}
+      />
+      <Text className="px-4 py-2 text-xs text-foreground-muted">
+        {scheduleStatus?._tag === "Success"
+          ? `${scheduleStatus.value.lastStatus}${scheduleStatus.value.lastDiscoveredTag ? ` · ${scheduleStatus.value.lastDiscoveredTag}` : ""}${scheduleStatus.value.lastError ? ` · ${scheduleStatus.value.lastError}` : ""}${scheduleStatus.value.nextDueAt ? ` · next ${scheduleStatus.value.nextDueAt}` : ""}`
+          : "Automatic discovery status unavailable while disconnected."}
+      </Text>
       <SettingsSwitchRow
         icon="wrench.and.screwdriver"
         label="Optional compatibility repair"

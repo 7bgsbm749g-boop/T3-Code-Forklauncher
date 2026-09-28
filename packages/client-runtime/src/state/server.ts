@@ -1119,6 +1119,10 @@ export function createServerEnvironmentAtoms<R, E>(
           JSON.stringify([environmentId, input.requestId, input.includeEvidence ?? false]),
       },
     }),
+    forkCompatibilityScheduleStatus: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-compatibility-schedule-status",
+      tag: WS_METHODS.forkCompatibilityScheduleStatus,
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,
