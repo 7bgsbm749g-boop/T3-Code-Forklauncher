@@ -68,6 +68,7 @@ import Migration0053 from "./Migrations/053_ForkCompatibilityRuns.ts";
 import Migration0054 from "./Migrations/054_ForkCompatibilityRequests.ts";
 import Migration0055 from "./Migrations/055_ForkCompatibilityRepair.ts";
 import Migration0057 from "./Migrations/057_ForkCompatibilitySchedule.ts";
+import Migration0058 from "./Migrations/058_ForkCompatibilityScheduleGeneration.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -136,6 +137,7 @@ const migrationEntries = [
   [54, "ForkCompatibilityRequests", Migration0054],
   [55, "ForkCompatibilityRepair", Migration0055],
   [57, "ForkCompatibilitySchedule", Migration0057],
+  [58, "ForkCompatibilityScheduleGeneration", Migration0058],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

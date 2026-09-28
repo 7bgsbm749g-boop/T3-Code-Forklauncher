@@ -12,7 +12,7 @@ it.effect(
       const columns = yield* sql<{
         readonly name: string;
       }>`PRAGMA table_info(fork_compatibility_schedule)`;
-      assert.deepEqual(migrationManifest.at(-1), [57, "ForkCompatibilitySchedule"]);
+      assert.deepEqual(migrationManifest.at(-1), [58, "ForkCompatibilityScheduleGeneration"]);
       assert.include(
         columns.map(({ name }) => name),
         "last_identity_sha256",
@@ -20,6 +20,10 @@ it.effect(
       assert.include(
         columns.map(({ name }) => name),
         "repair_policy_json",
+      );
+      assert.include(
+        columns.map(({ name }) => name),
+        "config_revision",
       );
       const requestColumns = yield* sql<{
         readonly name: string;

@@ -1,4 +1,5 @@
 import * as NodeCrypto from "node:crypto";
+import * as Cause from "effect/Cause";
 import * as NodeProcess from "node:process";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -70,6 +71,8 @@ type NativeError =
   | Coordinator.CoordinatorError
   | Effect.Error<ReturnType<Repair.ForkCompatibilityRepairServiceShape["dispatch"]>>
   | SqlError.SqlError
+  | ForkCompatibilityAutomaticDiscoveryError
+  | ScheduleRepository.ForkCompatibilityScheduleWriteError
   | Schema.SchemaError;
 export interface ForkCompatibilityNativeServiceShape {
   readonly configureAutomaticChecks: (input: {
@@ -120,6 +123,10 @@ export class ForkCompatibilityNativeService extends Context.Service<
 >()("t3/forkCompatibility/ForkCompatibilityNativeService") {}
 const now = Effect.map(DateTime.now, DateTime.formatIso);
 const errorMessage = (error: NativeError) => error.message.slice(0, 4_000);
+class ForkCompatibilityAutomaticDiscoveryError extends Schema.TaggedError<ForkCompatibilityAutomaticDiscoveryError>()(
+  "ForkCompatibilityAutomaticDiscoveryError",
+  { message: Schema.String },
+) {}
 const activeRequestOwners = new Map<string, string>();
 const processIsAlive = (pid: number): boolean => {
   // Same-process owners are live only while their token is registered above.
@@ -171,12 +178,6 @@ export const makeForkCompatibilityNativeService = (options?: {
       ScheduleRepository.ForkCompatibilityScheduleRepository,
     );
     const scheduleQueue = yield* Queue.dropping<void>(1);
-    const automaticConfig = yield* Ref.make<{
-      readonly enabled: boolean;
-      readonly sourceDirectory: string | null;
-      readonly repairPolicy?: ForkCompatibilityRepairPolicy;
-    }>({ enabled: false, sourceDirectory: null });
-    const automaticDiscoveryReceipt = yield* Ref.make<Deferred.Deferred<void> | null>(null);
     // This queue is only a coalesced wakeup. Accepted requests live in SQLite,
     // so dropping a redundant wake cannot drop work.
     const queue = yield* Queue.dropping<void>(1);
@@ -637,7 +638,7 @@ export const makeForkCompatibilityNativeService = (options?: {
       });
     }
     yield* loop.pipe(Effect.forkScoped);
-    const accept: ForkCompatibilityNativeServiceShape["accept"] = (input) =>
+    const acceptRequest = (input: AcceptCompatibilityInput, scheduleConfigRevision?: number) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
           if (!input.idempotencyKey.trim() || input.idempotencyKey.length > 200)
@@ -694,6 +695,7 @@ export const makeForkCompatibilityNativeService = (options?: {
               repairPolicy: capturedRepairPolicy,
               expectedTarget: input.expectedTarget ?? null,
               expectedSource: input.expectedSource ?? null,
+              ...(scheduleConfigRevision === undefined ? {} : { scheduleConfigRevision }),
               now: yield* now,
             })
             .pipe(
@@ -714,13 +716,33 @@ export const makeForkCompatibilityNativeService = (options?: {
           };
         }),
       );
+    const accept: ForkCompatibilityNativeServiceShape["accept"] = (input) => acceptRequest(input);
+    const automaticDiscoveryReceipt = yield* Ref.make<{
+      readonly configRevision: number;
+      readonly deferred: Deferred.Deferred<void, ForkCompatibilityAutomaticDiscoveryError>;
+    } | null>(null);
+    const automaticRetryNotBefore = yield* Ref.make<number | null>(null);
+    const inFlightAutomaticRevision = yield* Ref.make<number | null>(null);
+    const completeAutomaticReceipt = (
+      configRevision: number,
+      error?: ForkCompatibilityAutomaticDiscoveryError,
+    ) =>
+      Effect.gen(function* () {
+        const receipt = yield* Ref.modify(automaticDiscoveryReceipt, (current) =>
+          current && current.configRevision === configRevision ? [current, null] : [null, current],
+        );
+        if (receipt) {
+          if (error) yield* Deferred.fail(receipt.deferred, error);
+          else yield* Deferred.succeed(receipt.deferred, undefined);
+        }
+      });
+
     const configureAutomaticChecks: ForkCompatibilityNativeServiceShape["configureAutomaticChecks"] =
       Effect.fn("ForkCompatibilityNativeService.configureAutomaticChecks")(function* (input) {
         if (input.enabled && !input.sourceDirectory)
           return yield* forkCompatibilityError(
             "Automatic checks require a configured source checkout.",
           );
-        yield* Ref.set(automaticConfig, input);
         if (Option.isNone(scheduleRepository))
           return yield* forkCompatibilityError("Schedule persistence is unavailable.");
         const previous = yield* scheduleRepository.value.get();
@@ -733,27 +755,25 @@ export const makeForkCompatibilityNativeService = (options?: {
             projectId: null,
             modelSelection: null,
           };
-        yield* Ref.set(automaticConfig, { ...input, repairPolicy });
         const nowIso = yield* now;
         const dueIsFuture = Boolean(previous?.nextDueAt && previous.nextDueAt > nowIso);
         const policyChanged =
           previous !== null &&
           encodeRepairPolicySnapshot(previous.repairPolicy) !==
             encodeRepairPolicySnapshot(repairPolicy);
-        const shouldTrigger =
-          input.enabled &&
-          (!previous?.enabled ||
-            previous.sourceDirectory !== input.sourceDirectory ||
-            policyChanged ||
-            !dueIsFuture);
-        if (shouldTrigger) yield* Ref.set(automaticDiscoveryReceipt, yield* Deferred.make<void>());
-        else if (!input.enabled) yield* Ref.set(automaticDiscoveryReceipt, null);
+        const configChanged =
+          previous === null ||
+          previous.enabled !== input.enabled ||
+          previous.sourceDirectory !== input.sourceDirectory ||
+          policyChanged;
+        const shouldTrigger = input.enabled && (configChanged || !dueIsFuture);
         const nextDueAt = input.enabled
-          ? previous?.nextDueAt && dueIsFuture
-            ? previous.nextDueAt
-            : DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 6 }))
+          ? shouldTrigger
+            ? DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 6 }))
+            : (previous?.nextDueAt ??
+              DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 6 })))
           : null;
-        yield* scheduleRepository.value.save({
+        const configured = yield* scheduleRepository.value.configure({
           enabled: input.enabled,
           sourceDirectory: input.sourceDirectory,
           repairPolicy,
@@ -766,11 +786,25 @@ export const makeForkCompatibilityNativeService = (options?: {
           lastDiscoveredSha: previous?.lastDiscoveredSha ?? null,
           lastRequestId: previous?.lastRequestId ?? null,
           lastIdentitySha256: previous?.lastIdentitySha256 ?? null,
-          lastError: null,
+          lastError: configChanged ? null : (previous?.lastError ?? null),
           nextDueAt,
           updatedAt: nowIso,
         });
-        if (shouldTrigger) yield* Queue.offer(scheduleQueue, undefined);
+        if (previous && previous.configRevision !== configured.configRevision)
+          yield* completeAutomaticReceipt(previous.configRevision);
+        if (shouldTrigger) {
+          const receipt = yield* Deferred.make<void, ForkCompatibilityAutomaticDiscoveryError>();
+          yield* Ref.set(automaticDiscoveryReceipt, {
+            configRevision: configured.configRevision,
+            deferred: receipt,
+          });
+          yield* Queue.offer(scheduleQueue, undefined);
+        } else if (configChanged) {
+          yield* completeAutomaticReceipt(configured.configRevision);
+          // Wake a disabled worker so it switches to a queue-only wait even
+          // when its previous durable due time has already passed.
+          yield* Queue.offer(scheduleQueue, undefined);
+        }
       });
 
     const getAutomaticCheckStatus: ForkCompatibilityNativeServiceShape["getAutomaticCheckStatus"] =
@@ -800,24 +834,27 @@ export const makeForkCompatibilityNativeService = (options?: {
       () =>
         Effect.gen(function* () {
           const receipt = yield* Ref.get(automaticDiscoveryReceipt);
-          if (receipt) yield* Deferred.await(receipt);
+          if (receipt) yield* Deferred.await(receipt.deferred);
           return yield* getAutomaticCheckStatus();
         });
 
     const runAutomaticDiscovery = Effect.gen(function* () {
-      const config = yield* Ref.get(automaticConfig);
-      if (!config.enabled || !config.sourceDirectory) return;
-      if (Option.isNone(stableSource) || Option.isNone(scheduleRepository)) {
+      if (Option.isNone(scheduleRepository)) {
         yield* Effect.logWarning("Automatic stable discovery is unavailable in this server layer.");
         return;
       }
+      const captured = yield* scheduleRepository.value.get();
+      if (!captured?.enabled || !captured.sourceDirectory) return;
+      const configRevision = captured.configRevision;
+      yield* Ref.set(inFlightAutomaticRevision, configRevision);
       const fs = yield* FileSystem.FileSystem;
-      const timestamp = yield* now;
-      const previous = yield* scheduleRepository.value.get();
-      const nextDueAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 6 }));
       const discovery = yield* Effect.result(
         Effect.gen(function* () {
-          const sourceDirectory = yield* fs.realPath(config.sourceDirectory!);
+          if (Option.isNone(stableSource))
+            return yield* forkCompatibilityError(
+              "Official stable release discovery is unavailable in this server layer.",
+            );
+          const sourceDirectory = yield* fs.realPath(captured.sourceDirectory!);
           if (Option.isNone(git))
             return yield* forkCompatibilityError(
               "Git is unavailable for automatic source identity.",
@@ -865,43 +902,26 @@ export const makeForkCompatibilityNativeService = (options?: {
           };
         }),
       );
+      const completedAt = yield* now;
+      const nextDueAt = DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 6 }));
       if (discovery._tag === "Failure") {
-        yield* scheduleRepository.value.save({
-          enabled: true,
-          sourceDirectory: config.sourceDirectory,
-          repairPolicy: config.repairPolicy ??
-            previous?.repairPolicy ?? {
-              enabled: false,
-              preservedIntent: "",
-              maxAttempts: 1,
-              allowedPaths: [],
-              projectId: null,
-              modelSelection: null,
-            },
+        yield* scheduleRepository.value.recordResult(configRevision, {
           lastStatus: "discovery-failed",
-          lastDiscoveredTag: previous?.lastDiscoveredTag ?? null,
-          lastDiscoveredSha: previous?.lastDiscoveredSha ?? null,
-          lastRequestId: previous?.lastRequestId ?? null,
-          lastIdentitySha256: previous?.lastIdentitySha256 ?? null,
+          lastDiscoveredTag: captured.lastDiscoveredTag,
+          lastDiscoveredSha: captured.lastDiscoveredSha,
+          lastRequestId: captured.lastRequestId,
+          lastIdentitySha256: captured.lastIdentitySha256,
           lastError: errorMessage(discovery.failure as NativeError),
           nextDueAt,
-          updatedAt: timestamp,
+          updatedAt: completedAt,
         });
+        yield* completeAutomaticReceipt(configRevision);
         return;
       }
       const { sourceDirectory, sourceSha, sourceBranch, tag, sha } = discovery.success;
-      const latestConfig = yield* Ref.get(automaticConfig);
-      if (!latestConfig.enabled || latestConfig.sourceDirectory !== config.sourceDirectory) return;
+      if (!(yield* scheduleRepository.value.isCurrent(configRevision))) return;
       const profile = options?.profile ?? SERVER_VALIDATION_PROFILE;
-      const repairPolicy = latestConfig.repairPolicy ??
-        config.repairPolicy ?? {
-          enabled: false,
-          preservedIntent: "",
-          maxAttempts: 1,
-          allowedPaths: [],
-          projectId: null,
-          modelSelection: null,
-        };
+      const repairPolicy = captured.repairPolicy;
       const identity = NodeCrypto.createHash("sha256")
         .update(
           encodeSnapshot({
@@ -914,78 +934,112 @@ export const makeForkCompatibilityNativeService = (options?: {
           }),
         )
         .digest("hex");
-      const alreadySeen = previous?.lastIdentitySha256 === identity;
-      let requestId = previous?.lastRequestId ?? null;
+      const alreadyAccepted =
+        captured.lastIdentitySha256 === identity && captured.lastRequestId !== null;
+      let requestId = alreadyAccepted ? captured.lastRequestId : null;
       let lastStatus = "unchanged";
-      if (!alreadySeen) {
+      let lastError: string | null = null;
+      if (!alreadyAccepted) {
         const accepted = yield* Effect.result(
-          accept({
-            idempotencyKey: `automatic-stable:${identity}`,
-            repositoryRoot: sourceDirectory,
-            repairPolicy,
-            expectedTarget: { tag, sha },
-            expectedSource: { sha: sourceSha, branch: sourceBranch },
-          }),
+          acceptRequest(
+            {
+              idempotencyKey: `automatic-stable:${identity}`,
+              repositoryRoot: sourceDirectory,
+              repairPolicy,
+              expectedTarget: { tag, sha },
+              expectedSource: { sha: sourceSha, branch: sourceBranch },
+            },
+            configRevision,
+          ),
         );
         if (accepted._tag === "Failure") {
-          yield* scheduleRepository.value.save({
-            enabled: true,
-            sourceDirectory: config.sourceDirectory,
-            repairPolicy,
-            lastStatus: "request-failed",
-            lastDiscoveredTag: tag,
-            lastDiscoveredSha: sha,
-            lastRequestId: null,
-            lastIdentitySha256: identity,
-            lastError: errorMessage(accepted.failure as NativeError),
-            nextDueAt,
-            updatedAt: timestamp,
-          });
-          return;
+          lastStatus = "request-failed";
+          lastError = errorMessage(accepted.failure as NativeError);
+        } else {
+          requestId = accepted.success.requestId;
+          lastStatus = `request-${accepted.success.status}`;
         }
-        requestId = accepted.success.requestId;
-        lastStatus = `request-${accepted.success.status}`;
       }
-      yield* scheduleRepository.value.save({
-        enabled: true,
-        sourceDirectory: config.sourceDirectory,
-        repairPolicy,
+      const retryAt =
+        lastStatus === "request-failed"
+          ? DateTime.formatIso(DateTime.add(yield* DateTime.now, { minutes: 5 }))
+          : nextDueAt;
+      yield* scheduleRepository.value.recordResult(configRevision, {
         lastStatus,
         lastDiscoveredTag: tag,
         lastDiscoveredSha: sha,
         lastRequestId: requestId,
         lastIdentitySha256: identity,
-        lastError: null,
-        nextDueAt,
-        updatedAt: timestamp,
+        lastError,
+        nextDueAt: retryAt,
+        updatedAt: completedAt,
       });
+      yield* completeAutomaticReceipt(configRevision);
     });
-    const waitUntilNextAutomaticCheck = Effect.gen(function* () {
-      if (Option.isNone(scheduleRepository)) return Duration.hours(6);
-      const state = yield* scheduleRepository.value.get();
-      if (!state?.nextDueAt) return Duration.hours(6);
-      const due = Date.parse(state.nextDueAt);
-      if (!Number.isFinite(due)) return Duration.hours(6);
+
+    const waitForAutomaticSignalOrDue = Effect.gen(function* () {
       const current = yield* Clock.currentTimeMillis;
-      return Duration.millis(Math.max(0, due - current));
+      if (Option.isNone(scheduleRepository)) return yield* Queue.take(scheduleQueue);
+      const state = yield* scheduleRepository.value.get();
+      if (!state?.enabled) return yield* Queue.take(scheduleQueue);
+      const retryAt = yield* Ref.get(automaticRetryNotBefore);
+      if (retryAt !== null && retryAt > current)
+        return yield* Effect.raceFirst(
+          Queue.take(scheduleQueue),
+          Effect.sleep(Duration.millis(retryAt - current)),
+        );
+      const due = state.nextDueAt ? Date.parse(state.nextDueAt) : current;
+      const delay = Number.isFinite(due) ? Math.max(0, due - current) : 0;
+      return yield* Effect.raceFirst(
+        Queue.take(scheduleQueue),
+        Effect.sleep(Duration.millis(delay)),
+      );
     });
-    const automaticLoop = Effect.forever(
-      waitUntilNextAutomaticCheck.pipe(
-        Effect.flatMap((delay) => Effect.raceFirst(Queue.take(scheduleQueue), Effect.sleep(delay))),
-        Effect.andThen(runAutomaticDiscovery),
-        Effect.andThen(
-          Effect.gen(function* () {
-            const receipt = yield* Ref.get(automaticDiscoveryReceipt);
-            if (receipt) yield* Deferred.succeed(receipt, undefined);
-          }),
-        ),
-        Effect.catch((error) =>
-          Effect.logError("Automatic stable discovery failed", {
-            error: errorMessage(error as NativeError),
-          }),
-        ),
+    const automaticCycle = Effect.gen(function* () {
+      const startingReceipt = yield* Ref.get(automaticDiscoveryReceipt);
+      if (startingReceipt)
+        yield* Ref.set(inFlightAutomaticRevision, startingReceipt.configRevision);
+      yield* waitForAutomaticSignalOrDue;
+      yield* runAutomaticDiscovery;
+    }).pipe(
+      Effect.tap(() => Ref.set(automaticRetryNotBefore, null)),
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.failCause(cause)
+          : Clock.currentTimeMillis.pipe(
+              Effect.flatMap((current) =>
+                Ref.set(automaticRetryNotBefore, current + Duration.toMillis(Duration.minutes(5))),
+              ),
+              Effect.andThen(
+                Effect.gen(function* () {
+                  // A failure before runAutomaticDiscovery captures the durable
+                  // generation (for example, a failed schedule read) still has
+                  // to release the matching waiter. Never consume a receipt
+                  // created for a later configuration generation.
+                  const inFlightRevision = yield* Ref.get(inFlightAutomaticRevision);
+                  const failure = new ForkCompatibilityAutomaticDiscoveryError({
+                    message: Cause.pretty(cause).slice(0, 4_000),
+                  });
+                  if (inFlightRevision !== null)
+                    yield* completeAutomaticReceipt(inFlightRevision, failure);
+                  else {
+                    const receipt = yield* Ref.get(automaticDiscoveryReceipt);
+                    if (receipt) yield* completeAutomaticReceipt(receipt.configRevision, failure);
+                  }
+                  yield* Effect.logError("Automatic stable discovery failed; retry is bounded", {
+                    cause: Cause.pretty(cause),
+                  });
+                }),
+              ),
+            ),
+      ),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          yield* Ref.set(inFlightAutomaticRevision, null);
+        }),
       ),
     );
+    const automaticLoop = Effect.forever(automaticCycle);
     if (Option.isSome(scheduleRepository)) {
       const recovered = yield* Effect.result(scheduleRepository.value.get());
       if (
@@ -994,18 +1048,16 @@ export const makeForkCompatibilityNativeService = (options?: {
         recovered.success.sourceDirectory
       ) {
         const state = recovered.success;
-        yield* Ref.set(automaticConfig, {
-          enabled: true,
-          sourceDirectory: state.sourceDirectory,
-          repairPolicy: state.repairPolicy,
-        });
         const due = state.nextDueAt ? Date.parse(state.nextDueAt) : 0;
         const current = yield* Clock.currentTimeMillis;
         const shouldStart =
           state.lastStatus === "scheduled" || !Number.isFinite(due) || due <= current;
         if (shouldStart) {
-          const receipt = yield* Deferred.make<void>();
-          yield* Ref.set(automaticDiscoveryReceipt, receipt);
+          const receipt = yield* Deferred.make<void, ForkCompatibilityAutomaticDiscoveryError>();
+          yield* Ref.set(automaticDiscoveryReceipt, {
+            configRevision: state.configRevision,
+            deferred: receipt,
+          });
           yield* Queue.offer(scheduleQueue, undefined);
         }
       } else if (recovered._tag === "Failure") {
@@ -1016,7 +1068,6 @@ export const makeForkCompatibilityNativeService = (options?: {
     }
     yield* Effect.addFinalizer(() => Queue.shutdown(scheduleQueue));
     yield* automaticLoop.pipe(Effect.forkScoped);
-
     const get: ForkCompatibilityNativeServiceShape["get"] = Effect.fn(
       "ForkCompatibilityNativeService.get",
     )(function* (requestId) {

@@ -9,11 +9,14 @@ import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Ref from "effect/Ref";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
+import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   CommandId,
@@ -44,6 +47,7 @@ import * as RequestRepository from "./ForkCompatibilityRequestRepository.ts";
 import * as RunRepository from "./ForkCompatibilityRunRepository.ts";
 import * as StableSource from "./ForkCompatibilityStableSource.ts";
 import * as ScheduleRepository from "./ForkCompatibilityScheduleRepository.ts";
+import { forkCompatibilityError } from "./ForkCompatibilityError.ts";
 import { forkCompatibilityRepairPolicyDigest } from "./ForkCompatibilityRepairEligibility.ts";
 import type { ValidationProfile } from "./model.ts";
 
@@ -107,6 +111,13 @@ const makeIntegratedLayer = (input: {
   readonly upstreamRemote: string;
   readonly targetSha: string;
   readonly profile?: ValidationProfile;
+  readonly stableSource?: StableSource.ForkCompatibilityStableSource["Service"];
+  readonly wrapRequestRepository?: (
+    repository: RequestRepository.ForkCompatibilityRequestRepository["Service"],
+  ) => RequestRepository.ForkCompatibilityRequestRepository["Service"];
+  readonly wrapScheduleRepository?: (
+    repository: ScheduleRepository.ForkCompatibilityScheduleRepository["Service"],
+  ) => ScheduleRepository.ForkCompatibilityScheduleRepository["Service"];
   readonly onDispatch?: (attempt: RepairRepository.RepairAttempt) => Effect.Effect<void>;
   readonly beforeValidation?: () => Effect.Effect<void>;
 }) => {
@@ -129,11 +140,39 @@ const makeIntegratedLayer = (input: {
     ),
     Layer.provide(NodeServices.layer),
   );
+  const requestStore = RequestRepository.ForkCompatibilityRequestRepositoryLive.pipe(
+    Layer.provide(persistence),
+  );
+  const requestRepository = input.wrapRequestRepository
+    ? Layer.effect(
+        RequestRepository.ForkCompatibilityRequestRepository,
+        Effect.gen(function* () {
+          const actual = yield* RequestRepository.ForkCompatibilityRequestRepository;
+          return RequestRepository.ForkCompatibilityRequestRepository.of(
+            input.wrapRequestRepository!(actual),
+          );
+        }),
+      ).pipe(Layer.provide(requestStore))
+    : requestStore;
+  const scheduleStore = ScheduleRepository.ForkCompatibilityScheduleRepositoryLive.pipe(
+    Layer.provide(persistence),
+  );
+  const scheduleRepository = input.wrapScheduleRepository
+    ? Layer.effect(
+        ScheduleRepository.ForkCompatibilityScheduleRepository,
+        Effect.gen(function* () {
+          const actual = yield* ScheduleRepository.ForkCompatibilityScheduleRepository;
+          return ScheduleRepository.ForkCompatibilityScheduleRepository.of(
+            input.wrapScheduleRepository!(actual),
+          );
+        }),
+      ).pipe(Layer.provide(scheduleStore))
+    : scheduleStore;
   const stores = Layer.mergeAll(
-    RequestRepository.ForkCompatibilityRequestRepositoryLive,
+    requestRepository,
     RepairRepository.ForkCompatibilityRepairRepositoryLive,
     RunRepository.ForkCompatibilityRunRepositoryLive,
-    ScheduleRepository.ForkCompatibilityScheduleRepositoryLive,
+    scheduleRepository,
   ).pipe(Layer.provideMerge(persistence));
   const vcsProcess = VcsProcess.layer.pipe(Layer.provide(NodeServices.layer));
   const gitLayer = Layer.mergeAll(GitVcsDriver.vcsLayer, GitVcsDriver.layer).pipe(
@@ -144,10 +183,11 @@ const makeIntegratedLayer = (input: {
   const processLayer = ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer));
   const stableSource = Layer.succeed(
     StableSource.ForkCompatibilityStableSource,
-    StableSource.ForkCompatibilityStableSource.of({
-      latestStableTag: () => Effect.succeed("v0.0.43"),
-      resolveStableTagCommit: () => Effect.succeed(input.targetSha),
-    }),
+    input.stableSource ??
+      StableSource.ForkCompatibilityStableSource.of({
+        latestStableTag: () => Effect.succeed("v0.0.43"),
+        resolveStableTagCommit: () => Effect.succeed(input.targetSha),
+      }),
   );
   const dependencies = Layer.mergeAll(
     persistence,
@@ -946,4 +986,434 @@ it.effect("marks completed repair stale when the source advances before restart 
 
 it.effect("marks fresh passing repair with an out-of-scope test edit review-required", () =>
   repairCompletionRestartScenario(false, true),
+);
+
+const automaticProfile: ValidationProfile = {
+  id: "automatic-generation-fixture",
+  revision: "1",
+  commands: [
+    {
+      command: NodeProcess.execPath,
+      args: ["-e", "process.exit(0)"],
+      timeoutMs: 10_000,
+    },
+  ],
+};
+
+it.effect("rejects late stable discovery from an earlier A-B-A source and policy generation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fixture = makeGitFixture();
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+      );
+      const lookupEntered = yield* Deferred.make<void>();
+      const releaseLookup = yield* Deferred.make<void>();
+      const acceptGenerations = yield* Ref.make<Array<number | undefined>>([]);
+      const lookupCount = yield* Ref.make(0);
+      const disabledPolicy = {
+        enabled: false,
+        preservedIntent: "",
+        maxAttempts: 1,
+        allowedPaths: [],
+        projectId: null,
+        modelSelection: null,
+      };
+      const basePolicy = { ...disabledPolicy, preservedIntent: "base intent" };
+      const alternatePolicy = { ...disabledPolicy, preservedIntent: "changed intent" };
+      const stableSource = StableSource.ForkCompatibilityStableSource.of({
+        latestStableTag: () =>
+          Ref.updateAndGet(lookupCount, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1
+                ? Deferred.succeed(lookupEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseLookup)),
+                    Effect.as("v0.0.43"),
+                  )
+                : Effect.succeed("v0.0.43"),
+            ),
+          ),
+        resolveStableTagCommit: () => Effect.succeed(fixture.targetSha),
+      });
+      const layer = makeIntegratedLayer({
+        dbPath: NodePath.join(fixture.root, "generation.sqlite"),
+        candidateRoot: NodePath.join(fixture.root, "generation-candidates"),
+        repositoryRoot: fixture.repositoryRoot,
+        upstreamRemote: fixture.upstreamRemote,
+        targetSha: fixture.targetSha,
+        profile: automaticProfile,
+        stableSource,
+        wrapRequestRepository: (actual) => ({
+          ...actual,
+          accept: (input) =>
+            Ref.update(acceptGenerations, (values) => [
+              ...values,
+              input.scheduleConfigRevision,
+            ]).pipe(Effect.andThen(actual.accept(input))),
+        }),
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* Native.ForkCompatibilityNativeService;
+        const schedules = yield* ScheduleRepository.ForkCompatibilityScheduleRepository;
+        const requests = yield* RequestRepository.ForkCompatibilityRequestRepository;
+        yield* service.configureAutomaticChecks({
+          enabled: true,
+          sourceDirectory: fixture.repositoryRoot,
+          repairPolicy: basePolicy,
+        });
+        yield* Deferred.await(lookupEntered);
+        yield* service.configureAutomaticChecks({
+          enabled: true,
+          sourceDirectory: `${fixture.repositoryRoot}-other`,
+          repairPolicy: alternatePolicy,
+        });
+        yield* service.configureAutomaticChecks({
+          enabled: true,
+          sourceDirectory: fixture.repositoryRoot,
+          repairPolicy: basePolicy,
+        });
+        const current = yield* schedules.get();
+        assert.ok(current);
+        yield* Deferred.succeed(releaseLookup, undefined);
+        const discovered = yield* service.awaitAutomaticDiscovery();
+        assert.equal(discovered?.configRevision, current!.configRevision);
+        assert.equal(discovered?.lastDiscoveredTag, "v0.0.43");
+        assert.ok(discovered?.lastRequestId);
+        yield* service.awaitCompletion(discovered!.lastRequestId!);
+        const accepted = yield* requests.get(discovered!.lastRequestId!);
+        assert.equal(accepted?.expectedSourceSha, fixture.sourceSha);
+        assert.deepEqual(yield* Ref.get(acceptGenerations), [current!.configRevision]);
+        assert.equal(git(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.sourceSha);
+      }).pipe(Effect.provide(layer));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "does not resurrect a disabled schedule after a late discovery failure and SQLite reopen",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = makeGitFixture();
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+        );
+        const lookupEntered = yield* Deferred.make<void>();
+        const releaseLookup = yield* Deferred.make<void>();
+        const failureRecorded = yield* Deferred.make<boolean>();
+        const lookupCount = yield* Ref.make(0);
+        const stableSource = StableSource.ForkCompatibilityStableSource.of({
+          latestStableTag: () =>
+            Ref.update(lookupCount, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(lookupEntered, undefined)),
+              Effect.andThen(Deferred.await(releaseLookup)),
+              Effect.andThen(Effect.fail(forkCompatibilityError("fixture offline"))),
+            ),
+          resolveStableTagCommit: () => Effect.succeed(fixture.targetSha),
+        });
+        const dbPath = NodePath.join(fixture.root, "disabled-generation.sqlite");
+        const build = (scope: Scope.Scope) =>
+          Layer.buildWithScope(
+            makeIntegratedLayer({
+              dbPath,
+              candidateRoot: NodePath.join(fixture.root, "disabled-generation-candidates"),
+              repositoryRoot: fixture.repositoryRoot,
+              upstreamRemote: fixture.upstreamRemote,
+              targetSha: fixture.targetSha,
+              profile: automaticProfile,
+              stableSource,
+              wrapScheduleRepository: (actual) => ({
+                ...actual,
+                recordResult: (revision, result) =>
+                  actual
+                    .recordResult(revision, result)
+                    .pipe(
+                      Effect.tap((written) =>
+                        result.lastStatus === "discovery-failed"
+                          ? Deferred.succeed(failureRecorded, written)
+                          : Effect.void,
+                      ),
+                    ),
+              }),
+            }).pipe(Layer.provide(NodeServices.layer)),
+            scope,
+          ).pipe(
+            Effect.map((context) => Context.get(context, Native.ForkCompatibilityNativeService)),
+          );
+        const firstScope = yield* Scope.make();
+        const firstService = yield* build(firstScope);
+        const scheduleResult = yield* Effect.gen(function* () {
+          const service = firstService;
+          yield* service.configureAutomaticChecks({
+            enabled: true,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          yield* Deferred.await(lookupEntered);
+          yield* service.configureAutomaticChecks({
+            enabled: false,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          yield* Deferred.succeed(releaseLookup, undefined);
+          return yield* Deferred.await(failureRecorded);
+        });
+        assert.equal(scheduleResult, false);
+        yield* Scope.close(firstScope, Exit.void);
+        const secondScope = yield* Scope.make();
+        yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void));
+        const restarted = yield* build(secondScope);
+        const recovered = yield* restarted.getAutomaticCheckStatus();
+        assert.equal(recovered?.enabled, false);
+        assert.equal(recovered?.lastStatus, "disabled");
+        assert.equal(yield* Ref.get(lookupCount), 1);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("does not accept an automatic request when disable wins the acceptance boundary", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fixture = makeGitFixture();
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+      );
+      const acceptanceEntered = yield* Deferred.make<void>();
+      const releaseAcceptance = yield* Deferred.make<void>();
+      const acceptanceRejected = yield* Deferred.make<string>();
+      const requestResultRecorded = yield* Deferred.make<boolean>();
+      const stableSource = StableSource.ForkCompatibilityStableSource.of({
+        latestStableTag: () => Effect.succeed("v0.0.43"),
+        resolveStableTagCommit: () => Effect.succeed(fixture.targetSha),
+      });
+      const layer = makeIntegratedLayer({
+        dbPath: NodePath.join(fixture.root, "disable-acceptance.sqlite"),
+        candidateRoot: NodePath.join(fixture.root, "disable-acceptance-candidates"),
+        repositoryRoot: fixture.repositoryRoot,
+        upstreamRemote: fixture.upstreamRemote,
+        targetSha: fixture.targetSha,
+        profile: automaticProfile,
+        stableSource,
+        wrapRequestRepository: (actual) => ({
+          ...actual,
+          accept: (input) =>
+            Deferred.succeed(acceptanceEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseAcceptance)),
+              Effect.andThen(actual.accept(input)),
+              Effect.tapError((error) => Deferred.succeed(acceptanceRejected, error.message)),
+            ),
+        }),
+        wrapScheduleRepository: (actual) => ({
+          ...actual,
+          recordResult: (revision, result) =>
+            actual
+              .recordResult(revision, result)
+              .pipe(
+                Effect.tap((written) =>
+                  result.lastStatus === "request-failed"
+                    ? Deferred.succeed(requestResultRecorded, written)
+                    : Effect.void,
+                ),
+              ),
+        }),
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* Native.ForkCompatibilityNativeService;
+        const sql = yield* SqlClient.SqlClient;
+        const schedules = yield* ScheduleRepository.ForkCompatibilityScheduleRepository;
+        yield* service.configureAutomaticChecks({
+          enabled: true,
+          sourceDirectory: fixture.repositoryRoot,
+        });
+        yield* Deferred.await(acceptanceEntered);
+        const enabled = yield* schedules.get();
+        assert.equal(enabled?.enabled, true);
+        yield* service.configureAutomaticChecks({
+          enabled: false,
+          sourceDirectory: fixture.repositoryRoot,
+        });
+        yield* Deferred.succeed(releaseAcceptance, undefined);
+        const rejection = yield* Deferred.await(acceptanceRejected);
+        assert.match(rejection, /configuration changed/i);
+        assert.equal(yield* Deferred.await(requestResultRecorded), false);
+        const schedule = yield* schedules.get();
+        assert.equal(schedule?.enabled, false);
+        assert.equal(schedule?.lastStatus, "disabled");
+        const acceptedCount = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM fork_compatibility_requests
+          WHERE idempotency_key LIKE 'automatic-stable:%'
+        `;
+        assert.equal(Number(acceptedCount[0]?.count), 0);
+        assert.equal(git(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.sourceSha);
+      }).pipe(Effect.provide(layer));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "records a transient discovery failure and does not spin before its persisted retry due time",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = makeGitFixture();
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+        );
+        const lookupCount = yield* Ref.make(0);
+        const entered = yield* Deferred.make<void>();
+        const failurePersisted = yield* Deferred.make<void>();
+        const stableSource = StableSource.ForkCompatibilityStableSource.of({
+          latestStableTag: () =>
+            Ref.updateAndGet(lookupCount, (count) => count + 1).pipe(
+              Effect.tap(() => Deferred.succeed(entered, undefined)),
+              Effect.andThen(Effect.fail(forkCompatibilityError("fixture offline"))),
+            ),
+          resolveStableTagCommit: () => Effect.succeed(fixture.targetSha),
+        });
+        const layer = makeIntegratedLayer({
+          dbPath: NodePath.join(fixture.root, "discovery-backoff.sqlite"),
+          candidateRoot: NodePath.join(fixture.root, "discovery-backoff-candidates"),
+          repositoryRoot: fixture.repositoryRoot,
+          upstreamRemote: fixture.upstreamRemote,
+          targetSha: fixture.targetSha,
+          profile: automaticProfile,
+          stableSource,
+          wrapScheduleRepository: (actual) => ({
+            ...actual,
+            recordResult: (revision, result) =>
+              actual
+                .recordResult(revision, result)
+                .pipe(
+                  Effect.tap((written) =>
+                    result.lastStatus === "discovery-failed" && written
+                      ? Deferred.succeed(failurePersisted, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+        });
+        yield* Effect.gen(function* () {
+          const service = yield* Native.ForkCompatibilityNativeService;
+          yield* service.configureAutomaticChecks({
+            enabled: true,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          const failed = yield* service.awaitAutomaticDiscovery();
+          yield* Deferred.await(entered);
+          yield* Deferred.await(failurePersisted);
+          assert.equal(failed?.lastStatus, "discovery-failed");
+          assert.match(failed?.lastError ?? "", /fixture offline/);
+          assert.ok(failed?.nextDueAt);
+          yield* Effect.yieldNow;
+          assert.equal(yield* Ref.get(lookupCount), 1);
+          assert.equal(failed?.lastStatus, "discovery-failed");
+          yield* service.configureAutomaticChecks({
+            enabled: false,
+            sourceDirectory: fixture.repositoryRoot,
+          });
+          assert.equal((yield* service.getAutomaticCheckStatus())?.enabled, false);
+        }).pipe(Effect.provide(layer));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "retries failed stable acceptance with the same key and reuses an ambiguously committed row",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const mode of ["before-commit", "after-commit"] as const) {
+          const fixture = makeGitFixture();
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+          );
+          const attempts = yield* Ref.make(0);
+          const initiallyAcceptedId = yield* Ref.make<string | null>(null);
+          const retryEntered = yield* Deferred.make<void>();
+          const retryPersisted = yield* Deferred.make<void>();
+          const stableSource = StableSource.ForkCompatibilityStableSource.of({
+            latestStableTag: () => Effect.succeed("v0.0.43"),
+            resolveStableTagCommit: () => Effect.succeed(fixture.targetSha),
+          });
+          const layer = makeIntegratedLayer({
+            dbPath: NodePath.join(fixture.root, `accept-retry-${mode}.sqlite`),
+            candidateRoot: NodePath.join(fixture.root, `accept-retry-${mode}-candidates`),
+            repositoryRoot: fixture.repositoryRoot,
+            upstreamRemote: fixture.upstreamRemote,
+            targetSha: fixture.targetSha,
+            profile: automaticProfile,
+            stableSource,
+            wrapRequestRepository: (actual) => ({
+              ...actual,
+              accept: (input) =>
+                Ref.updateAndGet(attempts, (count) => count + 1).pipe(
+                  Effect.flatMap((count) => {
+                    if (count === 1 && mode === "before-commit")
+                      return Effect.fail(
+                        forkCompatibilityError("temporary acceptance storage error"),
+                      );
+                    if (count === 1)
+                      return actual.accept(input).pipe(
+                        Effect.tap((accepted) =>
+                          Ref.set(initiallyAcceptedId, accepted.request.requestId),
+                        ),
+                        Effect.andThen(
+                          Effect.fail(
+                            forkCompatibilityError("acceptance reply was lost after commit"),
+                          ),
+                        ),
+                      );
+                    if (count === 2)
+                      return Deferred.succeed(retryEntered, undefined).pipe(
+                        Effect.andThen(actual.accept(input)),
+                      );
+                    return actual.accept(input);
+                  }),
+                ),
+            }),
+            wrapScheduleRepository: (actual) => ({
+              ...actual,
+              recordResult: (revision, result) =>
+                actual
+                  .recordResult(revision, result)
+                  .pipe(
+                    Effect.tap((written) =>
+                      result.lastStatus === "request-queued" && written
+                        ? Deferred.succeed(retryPersisted, undefined)
+                        : Effect.void,
+                    ),
+                  ),
+            }),
+          });
+          yield* Effect.gen(function* () {
+            const service = yield* Native.ForkCompatibilityNativeService;
+            const requests = yield* RequestRepository.ForkCompatibilityRequestRepository;
+            yield* service.configureAutomaticChecks({
+              enabled: true,
+              sourceDirectory: fixture.repositoryRoot,
+            });
+            const firstResult = yield* service.awaitAutomaticDiscovery();
+            assert.equal(
+              firstResult?.lastStatus,
+              "request-failed",
+              firstResult?.lastError ?? "acceptance failure status was not persisted",
+            );
+            assert.equal(firstResult?.lastRequestId, null);
+            assert.equal(yield* Ref.get(attempts), 1);
+            yield* TestClock.adjust("5 minutes");
+            yield* Deferred.await(retryEntered);
+            yield* Deferred.await(retryPersisted);
+            const retried = yield* service.getAutomaticCheckStatus();
+            assert.ok(retried?.lastRequestId);
+            const requestRows = yield* requests.getByKey(
+              `automatic-stable:${retried!.lastIdentitySha256}`,
+            );
+            assert.ok(requestRows);
+            if (mode === "after-commit")
+              assert.equal(requestRows!.requestId, yield* Ref.get(initiallyAcceptedId));
+            assert.equal(yield* Ref.get(attempts), 2);
+            yield* service.awaitCompletion(retried!.lastRequestId!);
+            assert.equal(git(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.sourceSha);
+          }).pipe(Effect.provide(layer));
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );

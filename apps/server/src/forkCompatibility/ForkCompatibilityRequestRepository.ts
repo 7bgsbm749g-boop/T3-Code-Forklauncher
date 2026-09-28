@@ -52,6 +52,7 @@ export interface AcceptInput {
   readonly repairPolicy?: RepairPolicy;
   readonly expectedTarget?: { readonly tag: string; readonly sha: string } | null;
   readonly expectedSource?: { readonly sha: string; readonly branch: string } | null;
+  readonly scheduleConfigRevision?: number;
   readonly now: string;
 }
 export interface ForkCompatibilityRequestRepositoryShape {
@@ -150,8 +151,20 @@ export const makeForkCompatibilityRequestRepository = Effect.gen(function* () {
     const expectedTargetSha = input.expectedTarget?.sha ?? null;
     const expectedSourceSha = input.expectedSource?.sha ?? null;
     const expectedSourceBranch = input.expectedSource?.branch ?? null;
-    yield* sql`INSERT INTO fork_compatibility_requests (request_id,idempotency_key,payload_sha256,repository_root,upstream_remote,profile_json,profile_revision,repair_policy_json,expected_target_tag,expected_target_sha,expected_source_sha,expected_source_branch,status,created_at,updated_at) VALUES (${input.requestId},${input.idempotencyKey},${input.payloadSha256},${input.repositoryRoot},${input.upstreamRemote},${profileJson},${input.profile.revision},${encodedRepairPolicy},${expectedTargetTag},${expectedTargetSha},${expectedSourceSha},${expectedSourceBranch},'queued',${input.now},${input.now}) ON CONFLICT(idempotency_key) DO NOTHING`;
+    if (input.scheduleConfigRevision === undefined) {
+      yield* sql`INSERT INTO fork_compatibility_requests (request_id,idempotency_key,payload_sha256,repository_root,upstream_remote,profile_json,profile_revision,repair_policy_json,expected_target_tag,expected_target_sha,expected_source_sha,expected_source_branch,status,created_at,updated_at) VALUES (${input.requestId},${input.idempotencyKey},${input.payloadSha256},${input.repositoryRoot},${input.upstreamRemote},${profileJson},${input.profile.revision},${encodedRepairPolicy},${expectedTargetTag},${expectedTargetSha},${expectedSourceSha},${expectedSourceBranch},'queued',${input.now},${input.now}) ON CONFLICT(idempotency_key) DO NOTHING`;
+    } else {
+      // Keep generation validation and insertion in one SQLite statement. A
+      // concurrent disable/reconfiguration linearizes either before this
+      // insert (no new request) or after durable acceptance (existing work is
+      // left alone).
+      yield* sql`INSERT INTO fork_compatibility_requests (request_id,idempotency_key,payload_sha256,repository_root,upstream_remote,profile_json,profile_revision,repair_policy_json,expected_target_tag,expected_target_sha,expected_source_sha,expected_source_branch,status,created_at,updated_at) SELECT ${input.requestId},${input.idempotencyKey},${input.payloadSha256},${input.repositoryRoot},${input.upstreamRemote},${profileJson},${input.profile.revision},${encodedRepairPolicy},${expectedTargetTag},${expectedTargetSha},${expectedSourceSha},${expectedSourceBranch},'queued',${input.now},${input.now} WHERE EXISTS (SELECT 1 FROM fork_compatibility_schedule WHERE schedule_id='official-stable' AND config_revision=${input.scheduleConfigRevision} AND enabled=1) ON CONFLICT(idempotency_key) DO NOTHING`;
+    }
     const request = yield* getByKey(input.idempotencyKey);
+    if (!request && input.scheduleConfigRevision !== undefined)
+      return yield* forkCompatibilityError(
+        "Automatic stable check configuration changed before request acceptance.",
+      );
     if (!request) return yield* forkCompatibilityError("Accepted request could not be read.");
     if (request.payloadSha256 !== input.payloadSha256)
       return yield* forkCompatibilityError(
