@@ -43,7 +43,7 @@ export class ForkCompatibilityScheduleRepository extends Context.Service<
   }
 >()("t3/forkCompatibility/ForkCompatibilityScheduleRepository") {}
 
-export const makeForkCompatibilityScheduleRepository = Effect.gen(function* () {
+const makeForkCompatibilityScheduleRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const get = Effect.fn("ForkCompatibilityScheduleRepository.get")(function* () {
     const rows =

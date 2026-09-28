@@ -23,6 +23,7 @@ const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 describe("ServerSettings default permissions", () => {
   it("keeps compatibility checks inert until a source directory is explicitly configured", () => {
     expect(decodeServerSettings({}).forkCompatibility).toEqual({
+      automaticStableChecks: false,
       sourceDirectory: null,
       validationProfileId: "t3-server-default",
       repair: {
