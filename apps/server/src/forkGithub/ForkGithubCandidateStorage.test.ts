@@ -52,11 +52,12 @@ const makeConfig = (
   tools = configuredTools(),
   fuseRuntimeLibraryDirectory = NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_LD_LIBRARY_PATH ??
     "/usr/lib/x86_64-linux-gnu",
+  hostFreeReserveBytes = Storage.MIN_HOST_FREE_RESERVE_BYTES,
 ): Storage.ForkGithubCandidateStorageConfig => ({
   rootDirectory: root,
   imageBytes,
   inodeLimit,
-  hostFreeReserveBytes: Storage.MIN_HOST_FREE_RESERVE_BYTES,
+  hostFreeReserveBytes,
   fuseRuntimeLibraryDirectory,
   tools: tools ?? {
     fuse2fs: "/usr/bin/fuse2fs",
@@ -111,32 +112,36 @@ it.effect("rejects unsafe size and non-private roots before allocating", () =>
   }),
 );
 
-it.effect(
-  "preserves the ten GiB host reserve and creates no image on a low-capacity filesystem",
-  () =>
-    Effect.gen(function* () {
-      const root = rootDirectory("/tmp");
-      try {
-        const inertTools = {
-          fuse2fs: NodeProcess.execPath,
-          fallocate: NodeProcess.execPath,
-          mke2fs: NodeProcess.execPath,
-          debugfs: NodeProcess.execPath,
-          dumpe2fs: NodeProcess.execPath,
-          fusermount3: NodeProcess.execPath,
-        };
-        const result = yield* withLease(
-          Storage.makeForkGithubCandidateStorage(makeConfig(root, inertTools, root)),
-          () => Effect.void,
-        ).pipe(Effect.result);
-        assert.equal(result._tag, "Failure");
-        if (result._tag === "Failure") assert.include(result.failure.reason, "free-space reserve");
-        assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
-        assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
-      } finally {
-        NodeFS.rmSync(root, { recursive: true, force: true });
-      }
-    }),
+it.effect("rejects an image that would violate the configured host free-space reserve", () =>
+  Effect.gen(function* () {
+    const root = rootDirectory("/tmp");
+    try {
+      // Make this deterministic on CI disks with arbitrary free capacity.
+      const free = NodeFS.statfsSync(root);
+      const requiredReserve = Math.max(
+        Storage.MIN_HOST_FREE_RESERVE_BYTES,
+        free.bavail * free.bsize,
+      );
+      const inertTools = {
+        fuse2fs: NodeProcess.execPath,
+        fallocate: NodeProcess.execPath,
+        mke2fs: NodeProcess.execPath,
+        debugfs: NodeProcess.execPath,
+        dumpe2fs: NodeProcess.execPath,
+        fusermount3: NodeProcess.execPath,
+      };
+      const result = yield* withLease(
+        Storage.makeForkGithubCandidateStorage(makeConfig(root, inertTools, root, requiredReserve)),
+        () => Effect.void,
+      ).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.include(result.failure.reason, "free-space reserve");
+      assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
+      assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  }),
 );
 
 it.effect("rejects a second service instance while a durable live-owner marker exists", () =>
