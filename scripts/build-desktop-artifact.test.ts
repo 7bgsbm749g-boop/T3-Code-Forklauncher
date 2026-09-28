@@ -2086,7 +2086,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   });
 
   it("derives the electron-builder package manager user agent from packageManager", () => {
-    assert.equal(resolvePackageManagerUserAgent("pnpm@11.10.0"), "pnpm/11.10.0");
+    assert.equal(resolvePackageManagerUserAgent("pnpm@11.28.1"), "pnpm/11.28.1");
     assert.equal(resolvePackageManagerUserAgent(" yarn@4.9.2 "), "yarn/4.9.2");
     assert.equal(resolvePackageManagerUserAgent("pnpm"), "pnpm");
   });

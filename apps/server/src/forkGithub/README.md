@@ -1,13 +1,12 @@
 # Native fork GitHub adapter
 
-Server startup and RPC now compose the command service, but startup still supplies
-inert trust providers. `makeForkGithubNativeServiceFromOperatorConfig(path)` is the
-validated local-file layer factory for a future explicit startup selection;
-until the shared startup owner selects it, remote promotion remains unavailable.
-It snapshots one operator file at runtime start and provides the existing trusted
-profile, gate policy, repository target, and workflow pin services. Credentials
-remain resolved only from ServerSecretStore references; neither the file nor RPC
-accepts private keys or tokens. `read` reports bounded configuration failures.
+Server startup and RPC compose the command service. Startup reads the operator
+configuration only when its path is explicitly configured and snapshots it for
+that runtime. Missing or invalid configuration is reported as unavailable;
+credentials resolve only from ServerSecretStore references, and neither the file
+nor RPC accepts private keys or tokens. `read` reports bounded configuration
+failures. A dedicated GitHub App is not provisioned, so remote mutations remain
+unavailable in the current deployment.
 
 `submitPromotion` and `submitDraft` persist an immutable operation ID and snapshot
 before returning `pending`. Repeating that ID with the same identity joins the
@@ -79,12 +78,12 @@ Credentialed ref mutation is disabled on Windows until its process-tree
 termination path receives an equivalent hosted lifecycle proof. Linux runs use
 a captured process group and wait for close before removing askpass material.
 
-Migration `056_ForkGithubActions.ts` creates the operation, action, release, and
-configuration journals but remains unregistered in `Migrations.ts`. Reservations pin action fingerprint and
-policy snapshot; only the current, unexpired lease owner may begin a write. An
-expired reservation can be reclaimed after reopen, observe an already advanced
-ref and record the applied result without pushing again. Cancellation is
-terminal before the write; receive-pack cannot be rolled back after acceptance.
+Migration `056_ForkGithubActions.ts` and the later fork GitHub migrations are
+registered in `Migrations.ts`. Reservations pin action fingerprint and policy
+snapshot; only the current, unexpired lease owner may begin a write. An expired
+reservation can be reclaimed after reopen, observe an already advanced ref and
+record the applied result without pushing again. Cancellation is terminal before
+the write; receive-pack cannot be rolled back after acceptance.
 
 The `.github` policy CLI is an orchestration and evidence adapter, not a second
 authority. Native profile bytes use the shared model canonicalizer. The CLI's
@@ -105,16 +104,22 @@ version-matched Linux CLI and server archives plus hosted Windows installer,
 blockmap, and update metadata. Archive download redirects are followed without
 forwarding the App token.
 
-To activate later, register migration 056 after migration 055, wire the
-configured layer from native startup, pin the reviewed workflow-control commit
-and file digests, and provision a dedicated GitHub App with Actions: read,
-Checks: write, Pull requests: read, and Contents: write permissions. Store App
-ID, installation ID and private key only as
+The internal custom PR evidence producer validates the exact merge candidate in
+an isolated, storage-backed checkout. It is not wired to startup, RPC, or check
+publication, so no custom PR gate is active. A stored passing result is historical
+until a read rechecks the current open PR identity, configured target, profile,
+and immutable toolchain snapshot; unavailable freshness checks cannot authorize
+it. The host FUSE helper and runtime-library digests are recorded as operator
+provenance but are not enforced by the configuration loader, which remains an
+additional activation prerequisite.
+Remote promotion and draft preparation also remain unavailable until an operator
+provides the pinned repository/workflow configuration and a dedicated GitHub App
+with Actions: read, Checks: write, Pull requests: read, and Contents: write
+permissions. Store App ID, installation ID and private key only as
 `fork-github-app-id`, `fork-github-installation-id` and
-`fork-github-app-private-key` in the server secret store. Set repository and
-workflow identity from trusted repository administration, not candidate
-metadata. Keep the App identity unset and branch rules inactive until the
-coordinator integration and trusted workflow branch rules are validated.
+`fork-github-app-private-key` in the server secret store. Keep branch rules
+inactive until the custom PR producer and its required-check identity are
+validated.
 
 GitHub's create-release API says `target_commitish` selects the commit from
 which a missing release tag is created, but does not document when a draft

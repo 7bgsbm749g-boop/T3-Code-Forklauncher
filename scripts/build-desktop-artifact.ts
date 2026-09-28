@@ -2603,8 +2603,8 @@ export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefi
 }
 
 // Electron Builder detects pnpm from npm_config_user_agent, whose value uses
-// user-agent syntax (pnpm/11.10.0) rather than packageManager syntax
-// (pnpm@11.10.0).
+// user-agent syntax (pnpm/11.28.1) rather than packageManager syntax
+// (pnpm@11.28.1).
 export function resolvePackageManagerUserAgent(packageManager: string): string {
   const trimmed = packageManager.trim();
   const versionSeparator = trimmed.lastIndexOf("@");
