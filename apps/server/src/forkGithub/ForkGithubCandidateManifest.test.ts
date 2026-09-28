@@ -221,13 +221,22 @@ it("accepts the assembled checksum output using canonical paths and filenames wi
     const sha256Sums = await NodeFSP.readFile(NodePath.join(artifactRoot, "SHA256SUMS"), "utf8");
     assert.isFalse(sha256Sums.includes("  ./"));
     const checksums = new TextEncoder().encode(sha256Sums);
-    snapshot.sha256Sums = sha256Sums;
-    snapshot.files.SHA256SUMS = {
-      path: NodePath.join(artifactRoot, "SHA256SUMS"),
-      size: checksums.byteLength,
-      sha256: hash(checksums),
+    const assembledSnapshot: CandidateArtifactSnapshot = {
+      ...snapshot,
+      sha256Sums,
+      files: {
+        ...snapshot.files,
+        SHA256SUMS: {
+          path: NodePath.join(artifactRoot, "SHA256SUMS"),
+          size: checksums.byteLength,
+          sha256: hash(checksums),
+        },
+      },
     };
-    assert.equal(verifyCandidateArtifact(snapshot, identity).candidateVersion, "0.0.43-fork.1");
+    assert.equal(
+      verifyCandidateArtifact(assembledSnapshot, identity).candidateVersion,
+      "0.0.43-fork.1",
+    );
 
     const spacedRoot = await NodeFSP.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "candidate-checksum-spaces-"),
