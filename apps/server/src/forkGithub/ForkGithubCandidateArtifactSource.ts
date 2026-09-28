@@ -37,7 +37,7 @@ export const trustedCandidateWorkflowPaths = [
   "scripts/update-release-package-versions.ts",
 ] as const;
 export const forkCandidateControlRef = "refs/tags/forklauncher-control-v1" as const;
-export const isTrustedCandidateWorkflowRef = (ref: string): boolean =>
+const isTrustedCandidateWorkflowRef = (ref: string): boolean =>
   ref === "refs/heads/forklauncher" || ref === forkCandidateControlRef;
 export const workflowRefName = (ref: string): string => ref.slice(ref.lastIndexOf("/") + 1);
 export interface TrustedCandidateWorkflow {

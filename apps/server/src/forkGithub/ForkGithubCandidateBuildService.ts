@@ -117,7 +117,7 @@ export class ForkGithubCandidateBuildService extends Context.Service<
   ForkGithubCandidateBuildServiceShape
 >()("t3/forkGithub/ForkGithubCandidateBuildService") {}
 
-export const candidateBuildRequestId = (identity: ReadonlyArray<string>) =>
+const candidateBuildRequestId = (identity: ReadonlyArray<string>) =>
   `fork-candidate-v1-${NodeCrypto.createHash("sha256").update(identity.join("\n")).digest("hex")}`;
 const candidateVersion = (stableTag: string, requestId: string) => {
   const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(stableTag);

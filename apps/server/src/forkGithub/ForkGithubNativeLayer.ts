@@ -96,7 +96,7 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
 };
 
 /** Compose the operator snapshot once so compatibility intake and GitHub execution share it. */
-export const makeForkGithubNativeServiceFromOperatorConfiguration = <R>(
+const makeForkGithubNativeServiceFromOperatorConfiguration = <R>(
   operator: Layer.Layer<
     | ForkGithubOperatorConfigurationService
     | ForkGithubGatePolicy
