@@ -106,7 +106,7 @@ const terminal = new Set([
   "stale",
 ]);
 
-export const makeForkCompatibilityRepairService = Effect.gen(function* () {
+const makeForkCompatibilityRepairService = Effect.gen(function* () {
   const repository = yield* RepairRepository.ForkCompatibilityRepairRepository;
   const engine = yield* OrchestrationEngineService;
   const receipts = yield* OrchestrationCommandReceiptRepository;

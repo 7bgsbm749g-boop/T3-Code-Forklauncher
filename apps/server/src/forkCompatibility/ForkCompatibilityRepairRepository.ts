@@ -116,7 +116,7 @@ export class ForkCompatibilityRepairRepository extends Context.Service<
   ForkCompatibilityRepairRepositoryShape
 >()("t3/forkCompatibility/ForkCompatibilityRepairRepository") {}
 
-export const makeForkCompatibilityRepairRepository = Effect.gen(function* () {
+const makeForkCompatibilityRepairRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const get: ForkCompatibilityRepairRepositoryShape["get"] = Effect.fn(
     "ForkCompatibilityRepairRepository.get",
