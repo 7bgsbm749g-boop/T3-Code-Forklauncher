@@ -1,10 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
-import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
+import { writeCandidateChecksums } from "../../../../.github/scripts/fork-candidate-metadata.mjs";
 import {
   verifyCandidateArtifact,
   type CandidateArtifactSnapshot,
@@ -209,15 +209,7 @@ it("accepts the assembled checksum output using canonical paths and filenames wi
       await NodeFSP.mkdir(NodePath.dirname(filePath), { recursive: true });
       await NodeFSP.writeFile(filePath, bytes);
     }
-    const helper = NodePath.resolve(
-      NodePath.dirname(new URL(import.meta.url).pathname),
-      "../../../../.github/scripts/create-candidate-checksums.sh",
-    );
-    const result = NodeChildProcess.spawnSync("bash", [helper], {
-      cwd: artifactRoot,
-      encoding: "utf8",
-    });
-    assert.equal(result.status, 0, result.stderr);
+    writeCandidateChecksums(artifactRoot);
     const sha256Sums = await NodeFSP.readFile(NodePath.join(artifactRoot, "SHA256SUMS"), "utf8");
     assert.isFalse(sha256Sums.includes("  ./"));
     const checksums = new TextEncoder().encode(sha256Sums);
@@ -244,11 +236,7 @@ it("accepts the assembled checksum output using canonical paths and filenames wi
     try {
       const spacedPath = NodePath.join(spacedRoot, "asset name with spaces.bin");
       await NodeFSP.writeFile(spacedPath, "space-safe");
-      const spacedResult = NodeChildProcess.spawnSync("bash", [helper], {
-        cwd: spacedRoot,
-        encoding: "utf8",
-      });
-      assert.equal(spacedResult.status, 0, spacedResult.stderr);
+      writeCandidateChecksums(spacedRoot);
       const spacedSums = await NodeFSP.readFile(NodePath.join(spacedRoot, "SHA256SUMS"), "utf8");
       assert.include(spacedSums, `  asset name with spaces.bin\n`);
     } finally {

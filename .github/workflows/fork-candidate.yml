@@ -382,7 +382,7 @@ jobs:
             -C candidate-work/builds/js-bundle/server dist
           node --input-type=module <<'NODE'
           import { readFile, writeFile } from 'node:fs/promises';
-          import { createCandidateManifest, candidateWorkflowDefinitionSha256, stageCandidateReleaseAssets } from './workflow-tools/.github/scripts/fork-candidate-metadata.mjs';
+          import { createCandidateManifest, candidateWorkflowDefinitionSha256, stageCandidateReleaseAssets, writeCandidateChecksums } from './workflow-tools/.github/scripts/fork-candidate-metadata.mjs';
           const identity = JSON.parse(await readFile('candidate-work/verified-candidate-identity.json', 'utf8'));
           const versions = JSON.parse(await readFile('candidate-work/metadata/version-alignment.json', 'utf8'));
           if (versions.candidateVersion !== process.env.CANDIDATE_VERSION) throw new Error('version provenance does not match tested candidate');
@@ -397,9 +397,8 @@ jobs:
           });
           await writeFile('candidate-artifacts/candidate-manifest.json', `${JSON.stringify(manifest, null, 2)}\n`);
           await writeFile('candidate-artifacts/checks.json', `${JSON.stringify({ serverTests: 'success', bundleVersionSmoke: 'release CLI archive --expect-version', linuxPackaging: 'success', windowsPackaging: 'success', windowsFeedTests: process.env.WINDOWS_FEED_TESTS }, null, 2)}\n`);
+          writeCandidateChecksums('candidate-artifacts');
           NODE
-          cd candidate-artifacts
-          bash ../workflow-tools/.github/scripts/create-candidate-checksums.sh
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@v7
         with:

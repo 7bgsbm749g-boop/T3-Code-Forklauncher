@@ -10,7 +10,6 @@ const versionPattern =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?$/;
 export const candidateWorkflowSourcePaths = [
   ".github/actions/setup-apt-mirrors/action.yml",
-  ".github/scripts/create-candidate-checksums.sh",
   ".github/scripts/fork-candidate-metadata.mjs",
   ".github/scripts/fork-candidate-versions.mjs",
   ".github/workflows/fork-candidate.yml",
@@ -26,6 +25,17 @@ export async function candidateWorkflowDefinitionSha256(root) {
     entries.push(`${path}\n${NodeCrypto.createHash("sha256").update(bytes).digest("hex")}`);
   }
   return NodeCrypto.createHash("sha256").update(entries.join("\n")).digest("hex");
+}
+
+export function writeCandidateChecksums(root) {
+  const script = [
+    "set -euo pipefail",
+    'cd -- "$1"',
+    "find . -type f ! -path './SHA256SUMS' -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS",
+  ].join("\n");
+  NodeChildProcess.execFileSync("bash", ["-c", script, "candidate-checksums", root], {
+    stdio: "pipe",
+  });
 }
 
 async function hashFile(path) {
