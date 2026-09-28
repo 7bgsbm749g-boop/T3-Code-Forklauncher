@@ -36,8 +36,6 @@ export const trustedCandidateWorkflowPaths = [
   "scripts/smoke-cli-archive.ts",
   "scripts/update-release-package-versions.ts",
 ] as const;
-const absentTrust = () => Effect.as(Effect.void, undefined as TrustedCandidateWorkflow | undefined);
-
 export interface TrustedCandidateWorkflow {
   readonly repository: string;
   readonly repositoryId: number;
@@ -73,10 +71,6 @@ export class ForkGithubCandidateWorkflowTrust extends Context.Service<
 export const ForkGithubCandidateWorkflowTrustConfigured = (value: TrustedCandidateWorkflow) =>
   Layer.succeed(ForkGithubCandidateWorkflowTrust, { get: () => Effect.succeed(value) });
 
-export const ForkGithubCandidateWorkflowTrustInert = Layer.succeed(
-  ForkGithubCandidateWorkflowTrust,
-  { get: absentTrust },
-);
 const decodeManifestJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 const fail = (reason: string) => Effect.fail(new Github.ForkGithubAdapterError({ reason }));

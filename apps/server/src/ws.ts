@@ -577,6 +577,7 @@ const makeWsRpcLayer = (
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const forkCompatibility = yield* ForkCompatibilityNative.ForkCompatibilityNativeService;
       const forkGithub = yield* ForkGithubNative.ForkGithubNativeService;
+      const forkGithubHandlers = ForkGithubNative.makeForkGithubNativeHandlers(forkGithub);
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -2731,7 +2732,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.forkGithubConfigure]: (input) =>
           observeRpcEffect(
             WS_METHODS.forkGithubConfigure,
-            forkGithub
+            forkGithubHandlers
               .configure(input)
               .pipe(
                 Effect.mapError((error) =>
@@ -2745,7 +2746,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.forkGithubRead]: () =>
           observeRpcEffect(
             WS_METHODS.forkGithubRead,
-            forkGithub
+            forkGithubHandlers
               .read()
               .pipe(
                 Effect.mapError((error) =>
@@ -2759,7 +2760,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.forkGithubSubmitPromotion]: (input) =>
           observeRpcEffect(
             WS_METHODS.forkGithubSubmitPromotion,
-            forkGithub
+            forkGithubHandlers
               .submitPromotion(input)
               .pipe(
                 Effect.mapError((error) =>
@@ -2773,7 +2774,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.forkGithubSubmitDraft]: (input) =>
           observeRpcEffect(
             WS_METHODS.forkGithubSubmitDraft,
-            forkGithub
+            forkGithubHandlers
               .submitDraft(input)
               .pipe(
                 Effect.mapError((error) =>
@@ -2787,7 +2788,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.forkGithubStatus]: ({ operationId }) =>
           observeRpcEffect(
             WS_METHODS.forkGithubStatus,
-            forkGithub
+            forkGithubHandlers
               .status(operationId)
               .pipe(
                 Effect.mapError((error) =>

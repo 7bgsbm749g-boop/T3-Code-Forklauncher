@@ -125,11 +125,6 @@ export class ForkGithubCredentialResolver extends Context.Service<
   }
 >()("t3/forkGithub/ForkGithubAdapter/ForkGithubCredentialResolver") {}
 
-const absent = <A>() => Effect.as(Effect.void, undefined as A | undefined);
-export const ForkGithubCredentialResolverInert = Layer.succeed(ForkGithubCredentialResolver, {
-  resolve: () => absent<GithubAppCredentials>(),
-});
-
 /** Loads credentials only from the server's private secret store. */
 export const ForkGithubCredentialResolverFromSecretStore = Layer.effect(
   ForkGithubCredentialResolver,
@@ -205,10 +200,6 @@ export class ForkGithubValidationProfile extends Context.Service<
     >;
   }
 >()("t3/forkGithub/ForkGithubAdapter/ForkGithubValidationProfile") {}
-
-export const ForkGithubValidationProfileInert = Layer.succeed(ForkGithubValidationProfile, {
-  get: () => absent<TrustedValidationProfileWithHash>(),
-});
 
 export interface RequiredCheckIdentity {
   readonly name: string;

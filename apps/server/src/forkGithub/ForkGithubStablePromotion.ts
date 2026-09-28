@@ -229,7 +229,3 @@ export const ForkGithubStablePromotionLive = Layer.effect(
   ForkGithubStablePromotion,
   makeForkGithubStablePromotion,
 );
-
-export const ForkGithubStablePromotionTargetInert = Layer.succeed(ForkGithubStablePromotionTarget, {
-  get: () => Effect.as(Effect.void, undefined),
-});

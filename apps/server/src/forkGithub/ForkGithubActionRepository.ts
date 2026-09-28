@@ -53,7 +53,7 @@ const reason = (message: string) => new ForkGithubAdapterError({ reason: message
 const isForkGithubAdapterError = Schema.is(ForkGithubAdapterError);
 const selectSql = `action_id AS "actionId", fingerprint, policy_snapshot_json AS "policySnapshot", owner_id AS "ownerId", lease_expires_at AS "leaseExpiresAt", state, result_sha AS "resultSha", outcome`;
 
-export const makeForkGithubActionRepository = Effect.gen(function* () {
+const makeForkGithubActionRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const read = (actionId: string) =>
     Effect.gen(function* () {

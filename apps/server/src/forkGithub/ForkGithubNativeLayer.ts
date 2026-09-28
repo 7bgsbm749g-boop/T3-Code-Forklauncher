@@ -11,7 +11,6 @@ import {
 import { ForkGithubReleaseRepositoryLive } from "./ForkGithubReleaseRepository.ts";
 import {
   ForkGithubCandidateArtifactSourceLive,
-  ForkGithubCandidateWorkflowTrustInert,
   type ForkGithubCandidateWorkflowTrust,
 } from "./ForkGithubCandidateArtifactSource.ts";
 import { ForkGithubNativeServiceLive } from "./ForkGithubNativeService.ts";
@@ -21,7 +20,7 @@ import { makeForkGithubOperatorConfigurationLayer } from "./ForkGithubOperatorCo
  * Production backing for the adapter. Native startup supplies this layer with its trusted
  * profile/evidence/policy, HTTP, Git/VCS and SQLite services; startup wiring remains explicit.
  */
-export const ForkGithubAdapterWithNativeBackingLive = ForkGithubAdapterLive.pipe(
+const ForkGithubAdapterWithNativeBackingLive = ForkGithubAdapterLive.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       ForkGithubDurableActionStoreLive,
@@ -32,48 +31,16 @@ export const ForkGithubAdapterWithNativeBackingLive = ForkGithubAdapterLive.pipe
 );
 
 /** Stable promotion entry point; callers must explicitly provide the trusted target and profile/policy. */
-export const ForkGithubStablePromotionWithNativeBackingLive = ForkGithubStablePromotionLive.pipe(
+const ForkGithubStablePromotionWithNativeBackingLive = ForkGithubStablePromotionLive.pipe(
   Layer.provideMerge(ForkGithubAdapterWithNativeBackingLive),
 );
-
-/** The default artifact trust is inert; callers must opt into a trusted workflow configuration. */
-export const ForkGithubDraftReleasePreparationWithNativeBackingLive =
-  ForkGithubDraftReleasePreparationLive.pipe(
-    Layer.provideMerge(ForkGithubAdapterWithNativeBackingLive),
-    Layer.provideMerge(ForkGithubReleaseRepositoryLive),
-    Layer.provideMerge(ForkGithubDraftReleaseApiLive),
-    Layer.provideMerge(
-      ForkGithubCandidateArtifactSourceLive.pipe(
-        Layer.provide(ForkGithubCandidateWorkflowTrustInert),
-        Layer.provideMerge(ForkGithubAdapterWithNativeBackingLive),
-      ),
-    ),
-  );
-
-/** Explicitly configured draft-preparation composition; never used by startup implicitly. */
-export const makeForkGithubDraftReleasePreparationWithNativeBacking = (
-  trust: Layer.Layer<
-    import("./ForkGithubCandidateArtifactSource.ts").ForkGithubCandidateWorkflowTrust
-  >,
-) =>
-  ForkGithubDraftReleasePreparationLive.pipe(
-    Layer.provideMerge(ForkGithubAdapterWithNativeBackingLive),
-    Layer.provideMerge(ForkGithubReleaseRepositoryLive),
-    Layer.provideMerge(ForkGithubDraftReleaseApiLive),
-    Layer.provideMerge(
-      ForkGithubCandidateArtifactSourceLive.pipe(
-        Layer.provide(trust),
-        Layer.provideMerge(ForkGithubAdapterWithNativeBackingLive),
-      ),
-    ),
-  );
 
 /**
  * Native command surface with production SQLite/GitHub/coordinator adapters. The caller must
  * supply the immutable workflow trust and the existing native profile, policy, target and
  * coordinator/repository layers. No startup path selects this layer implicitly.
  */
-export const makeForkGithubNativeServiceWithNativeBacking = <R>(
+const makeForkGithubNativeServiceWithNativeBacking = <R>(
   trust: Layer.Layer<
     ForkGithubCandidateWorkflowTrust,
     import("./ForkGithubAdapter.ts").ForkGithubAdapterError,

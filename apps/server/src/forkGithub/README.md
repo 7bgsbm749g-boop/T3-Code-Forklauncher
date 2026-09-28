@@ -33,21 +33,19 @@ snapshot before new delegated work can start. Operation result contracts are
 discriminated promotion/draft schemas rather than arbitrary JSON.
 
 The typed RPC schemas and native handlers are registered by shared startup/RPC
-integration. `makeForkGithubNativeHandlers` declares `orchestration:operate` for
-configure/submit and `orchestration:read` for status. The service remains inert
-until startup selects the operator-config layer and a dedicated App is provisioned.
+integration. Configure/submit require `orchestration:operate`; reads require
+`orchestration:read`. The service remains unavailable for remote operations
+until startup selects operator configuration and a dedicated App is provisioned.
 
-`ForkGithubAdapterWithNativeBackingLive` composes the SQLite
-action journal, Git transport, and native evidence resolver. The resolver follows
+The native layer composes the SQLite action journal, Git transport, and native evidence resolver. The resolver follows
 the persisted request-to-run link and calls the coordinator's freshness-checked
 read immediately before check publication and ref advancement. A repaired run
 is usable only when its completed native repair row and eligibility binding
 match the captured policy, failed baseline, repaired SHA, and fresh validation
 run. `review-required`, stale, missing, or mismatched rows remain denied. Custom
 PR evidence remains unsupported. Candidate Actions jobs are never accepted as
-evidence. Stable promotion is separately exposed as
-`ForkGithubStablePromotionWithNativeBackingLive` and requires an injected
-fork target, App credentials, trusted profile and policy.
+evidence. Stable promotion requires an injected fork target, App credentials,
+trusted profile and policy.
 
 Draft preparation is a separate operation after the durable ref action is
 `applied`. It verifies an exact successful `fork-candidate.yml` run/artifact and
@@ -55,8 +53,9 @@ the v2 candidate manifest, then creates or resumes a prerelease draft at the
 exact candidate and uploads only the Linux CLI archive, server distribution,
 Windows installer, blockmap, and update manifest. The GitHub release adapter verifies the peeled tag
 target and uploaded asset digests. It has no publish or install operation. The
-Actions artifact source is composed into the draft backing layer, but its default
-workflow-trust provider is inert and server startup remains unwired.
+Actions artifact source is composed into the draft backing layer. Server startup
+reads an operator-owned configuration file only when a path is explicitly
+configured; missing or invalid configuration leaves remote operations unavailable.
 
 The profile digest uses `forkCompatibility/model.ts::validationProfileJson`.
 Evidence must match every configured command, argument, timeout, zero exit,

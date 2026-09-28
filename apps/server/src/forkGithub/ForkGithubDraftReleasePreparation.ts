@@ -35,13 +35,6 @@ export class ForkGithubCandidateArtifactSource extends Context.Service<
   }
 >()("t3/forkGithub/ForkGithubDraftReleasePreparation/ForkGithubCandidateArtifactSource") {}
 
-export const ForkGithubCandidateArtifactSourceInert = Layer.succeed(
-  ForkGithubCandidateArtifactSource,
-  {
-    resolve: () => fail("Candidate artifact access is not configured."),
-  },
-);
-
 export interface DraftReleaseAsset {
   readonly name: string;
   readonly sha256: string;
@@ -101,13 +94,6 @@ export class ForkGithubDraftReleaseApi extends Context.Service<
     }) => Effect.Effect<DraftReleaseAsset, Github.ForkGithubAdapterFailure>;
   }
 >()("t3/forkGithub/ForkGithubDraftReleasePreparation/ForkGithubDraftReleaseApi") {}
-
-export const ForkGithubDraftReleaseApiInert = Layer.succeed(ForkGithubDraftReleaseApi, {
-  getTagTarget: () => fail("Draft release API is not configured."),
-  getByTag: () => fail("Draft release API is not configured."),
-  createDraft: () => fail("Draft release API is not configured."),
-  uploadAsset: () => fail("Draft release API is not configured."),
-});
 
 export const ForkGithubDraftReleaseApiLive = Layer.effect(
   ForkGithubDraftReleaseApi,
@@ -174,7 +160,7 @@ const unavailable = (reason: string): DraftPreparationOutcome => ({
 });
 const fail = (reason: string) => Effect.fail(new Github.ForkGithubAdapterError({ reason }));
 
-export const makeForkGithubDraftReleasePreparation = Effect.gen(function* () {
+const makeForkGithubDraftReleasePreparation = Effect.gen(function* () {
   const requests = yield* Requests.ForkCompatibilityRequestRepository;
   const runs = yield* Runs.ForkCompatibilityRunRepository;
   const repairs = yield* Repairs.ForkCompatibilityRepairRepository;
