@@ -99,6 +99,9 @@ import * as ForkCompatibilityRepairRepository from "./forkCompatibility/ForkComp
 import * as ForkCompatibilityRepair from "./forkCompatibility/ForkCompatibilityRepair.ts";
 import * as ForkCompatibilityScheduleRepository from "./forkCompatibility/ForkCompatibilityScheduleRepository.ts";
 import * as ForkGithubNativeLayer from "./forkGithub/ForkGithubNativeLayer.ts";
+import * as ForkGithubOperatorConfiguration from "./forkGithub/ForkGithubOperatorConfiguration.ts";
+import * as ForkGithubAutomaticPromotionIntents from "./forkGithub/ForkGithubAutomaticPromotionIntentRepository.ts";
+import * as ForkGithubStableFollowThrough from "./forkGithub/ForkGithubStableFollowThrough.ts";
 import * as Path from "effect/Path";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
@@ -800,26 +803,41 @@ export const makeServerLayer = Layer.unwrap(
         const repair = ForkCompatibilityRepair.ForkCompatibilityRepairServiceLive.pipe(
           Layer.provideMerge(persistence),
         );
+        const operator = ForkGithubOperatorConfiguration.makeForkGithubOperatorConfigurationLayer(
+          config.forkGithubConfigPath,
+        );
+        const automaticIntents =
+          ForkGithubAutomaticPromotionIntents.ForkGithubAutomaticPromotionIntentRepositoryLive.pipe(
+            Layer.provideMerge(persistence),
+          );
+        const githubNative =
+          ForkGithubNativeLayer.makeForkGithubNativeServiceFromOperatorConfiguration(operator).pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                persistence,
+                stableSource,
+                coordinator,
+                repair,
+                GitVcsDriver.layer,
+                ProcessRunner.layer,
+                FetchHttpClient.layer,
+              ),
+            ),
+          );
+        const githubBacking = githubNative.pipe(Layer.provideMerge(automaticIntents));
+        const github = ForkGithubStableFollowThrough.ForkGithubStableFollowThroughLive.pipe(
+          Layer.provideMerge(
+            Layer.mergeAll(githubBacking, persistence, stableSource, coordinator, repair),
+          ),
+        );
+        // The compatibility service depends on this composed layer, which has
+        // captured the operator snapshot before its scheduled worker starts.
         const native = ForkCompatibilityNativeService.ForkCompatibilityNativeServiceLive.pipe(
           Layer.provideMerge(stableSource),
           Layer.provideMerge(repair),
           Layer.provideMerge(persistence),
           Layer.provideMerge(coordinator),
-        );
-        const github = ForkGithubNativeLayer.makeForkGithubNativeServiceFromOperatorConfig(
-          config.forkGithubConfigPath,
-        ).pipe(
-          Layer.provideMerge(
-            Layer.mergeAll(
-              persistence,
-              stableSource,
-              coordinator,
-              repair,
-              GitVcsDriver.layer,
-              ProcessRunner.layer,
-              FetchHttpClient.layer,
-            ),
-          ),
+          Layer.provideMerge(github),
         );
         return Layer.mergeAll(native, github);
       }),

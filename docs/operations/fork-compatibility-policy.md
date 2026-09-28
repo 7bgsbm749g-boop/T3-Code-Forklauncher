@@ -35,11 +35,12 @@ remains unsupported.
 
 Do not treat ordinary Actions workflow success as compatibility acceptance.
 The native coordinator loads its validation profile from server-owned code and
-executes configured arguments against the candidate. Custom-PR evidence
-production is still unsupported. The `.github` policy evaluator is not wired to
-the native coordinator; its fixture tests do not prove that a PR can produce a
-passing check. The ruleset helper uses the actual native check context but emits
-only a disabled review payload until a native custom-PR producer exists.
+executes configured arguments against the candidate. A durable custom-PR
+evidence adapter now exists with local Git/SQLite coverage, but it is not wired
+into the production server check-publication path. The `.github` policy
+evaluator is also not authoritative. No custom-PR required check is currently
+produced, and the ruleset helper remains disabled; neither the adapter tests nor
+ordinary workflow success enable a merge gate.
 
 Candidate artifacts also bind an immutable workflow-control identity. Trusted
 configuration pins the dispatch workflow commit and SHA-256 digests for the
@@ -76,8 +77,9 @@ node .github/scripts/fork-ruleset.mjs --verify
 
 The checked-in App id is unset, so `--payload` fails closed. With a provisioned
 App ID, the payload requires `T3 Fork Compatibility` from that same App but is
-still disabled; `--apply` is hard-disabled until native custom-PR evidence
-production is implemented. `--verify` is read-only. Do not enable direct-push
+still disabled; `--apply` is hard-disabled until the native custom-PR evidence
+adapter is wired to trusted check publication and validated in production.
+`--verify` is read-only. Do not enable direct-push
 bypass or branch rules yet.
 
 The provisioned App needs Actions read for candidate artifact metadata and
@@ -116,6 +118,16 @@ never invents trust. Repository slug/id, branch, profile, check App identity,
 workflow control commit and required file digests are validated together. The
 loader rejects unknown fields and `directPushBypass: true`.
 
+Scheduled stable validation remains non-mutating by default. Set
+`automaticStablePromotion: true` to opt eligible scheduled requests into the
+durable promotion → candidate build → draft preparation path. The opt-in,
+schedule generation and policy are captured at request acceptance; manual and
+pre-opt-in history cannot be authorized later. Each new promotion, build and
+draft acceptance rechecks that snapshot, with SQLite guards at the write
+boundaries. Startup recovery resumes accepted stages from their journals, not
+the mutable latest request pointer. The server prepares a prerelease draft only;
+it never publishes the release or installs it.
+
 Illustrative generated shape (verify every ID and digest from the trusted
 repository and reviewed workflow revision; do not copy a hand-maintained
 profile):
@@ -130,6 +142,7 @@ profile):
   },
   "nativeAppId": 123456,
   "directPushBypass": false,
+  "automaticStablePromotion": false,
   "validationProfile": {
     "id": "t3-server-default",
     "revision": "3",
@@ -145,7 +158,7 @@ profile):
     "repositoryId": 123456789,
     "workflowId": 987654,
     "workflowPath": ".github/workflows/fork-candidate.yml",
-    "workflowRef": "refs/heads/forklauncher",
+    "workflowRef": "refs/tags/forklauncher-control-v1",
     "workflowCommitSha": "<40-hex-reviewed-control-commit>",
     "workflowFiles": [
       { "path": ".github/actions/setup-apt-mirrors/action.yml", "sha256": "<64-hex-digest>" },
@@ -162,13 +175,33 @@ profile):
 
 The profile digest comes from `forkCompatibility/model.ts::validationProfileJson`;
 the policy snapshot hash is derived from the validated file contents, including
-the target, App/check identities, profile digest and workflow pins. Configure
+the target, App/check identities, profile digest and workflow pins. The
+candidate workflow control ref is a separately provisioned immutable tag;
+the server resolves it before dispatch and refuses to dispatch if its peeled
+commit differs from `workflowCommitSha`. Protect that tag from updates in the
+repository. The production build dispatcher and draft preparation are composed
+into the server-scoped follow-through worker. Actions visibility is reconciled
+with bounded backoff; unresolved runs remain durable and are retried on a later
+wake or restart. Configure
 `fork-github-app-id`, `fork-github-installation-id` and
 `fork-github-app-private-key` through the existing server secret store. The App
-needs Checks write, Actions read, Pull requests read, and Contents write for the
-currently implemented promotion/draft operations. This is a configuration path,
-not provisioning: the App, secrets, workflow pins, protected rules, custom-PR
-evidence producer and Windows ref mutation remain separate unfinished work.
+needs Checks write, Actions write (for workflow dispatch and run/artifact reads),
+Pull requests read, and Contents write for the currently implemented promotion
+and draft operations. Workflow jobs retain only `contents: read`; App
+credentials are not passed to Actions. GitHub documents that `workflow_dispatch`
+accepts a branch or tag ref and requires Actions write. This is a configuration path,
+not provisioning: the App, secrets, workflow pins, protected rules,
+production custom-PR check publication and Windows ref mutation remain separate
+unfinished work.
+
+The server-scoped Fork Compatibility settings status includes the latest
+scheduled pipeline stage, candidate version, and exact Actions run/artifact IDs
+when available. Web/desktop and mobile refresh this read-only status on connect
+and when the operator requests refresh; reads do not reconcile or trigger
+mutations. Diagnostics are fixed public codes/messages, not candidate output or
+raw GitHub errors. A prepared result is explicitly a draft and is never
+published or installed by this path. The display requires the remaining App,
+workflow-control and production check-gate provisioning described above.
 
 ## GitHub API references
 

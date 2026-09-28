@@ -20,7 +20,12 @@ it.effect("runs fork migration 059 after the fork ledger has reached migration 0
     assert.deepEqual(through58.at(-1), [58, "ForkCompatibilityScheduleGeneration"]);
 
     const executed = yield* runMigrations();
-    assert.deepEqual(executed, [[59, "ForkGithubActionsBackfill"]]);
+    assert.deepEqual(executed, [
+      [59, "ForkGithubActionsBackfill"],
+      [60, "ForkGithubPullRequestEvidence"],
+      [61, "ForkGithubAutomaticPromotionIntents"],
+      [62, "ForkGithubCandidateBuilds"],
+    ]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fork_github_native_operations'
     `;
@@ -57,7 +62,7 @@ it.effect("creates the complete GitHub schema on a fresh disk database and repea
   return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const firstRun = yield* runMigrations();
-    assert.deepEqual(firstRun.at(-1), [59, "ForkGithubActionsBackfill"]);
+    assert.deepEqual(firstRun.at(-1), [62, "ForkGithubCandidateBuilds"]);
     assert.isTrue(firstRun.some(([id, name]) => id === 56 && name === "ForkGithubActions"));
 
     const requiredObjects = [
@@ -68,6 +73,13 @@ it.effect("creates the complete GitHub schema on a fresh disk database and repea
       "idx_fork_github_actions_state_lease",
       "idx_fork_github_release_lease",
       "idx_fork_github_native_operations_state",
+      "fork_github_pr_evidence",
+      "idx_fork_github_pr_evidence_status",
+      "fork_github_automatic_promotion_intents",
+      "idx_fork_github_auto_promotion_state",
+      "fork_github_automatic_promotion_runtime_policy",
+      "fork_github_candidate_builds",
+      "idx_fork_github_candidate_build_state",
     ];
     const objects = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE name IN ${sql.in(requiredObjects)}
@@ -81,7 +93,7 @@ it.effect("creates the complete GitHub schema on a fresh disk database and repea
     const fork = yield* sql<{ readonly migration_id: number; readonly name: string }>`
       SELECT migration_id, name FROM t3_fork_sql_migrations ORDER BY migration_id DESC LIMIT 1
     `;
-    assert.deepEqual(fork, [{ migration_id: 59, name: "ForkGithubActionsBackfill" }]);
+    assert.deepEqual(fork, [{ migration_id: 62, name: "ForkGithubCandidateBuilds" }]);
   }).pipe(
     Effect.provide(NodeSqliteClient.layer({ filename }).pipe(Layer.provide(NodeServices.layer))),
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),

@@ -32,6 +32,20 @@ import * as OperationRepository from "./ForkGithubNativeOperationRepository.ts";
 
 type NativeFailure = ForkGithubNativeError | Github.ForkGithubAdapterError;
 type OperationInput = ForkGithubPromotionCommand | ForkGithubDraftCommand;
+type AutomaticOperationGuard = {
+  readonly intentFingerprint: string;
+  readonly scheduleConfigRevision: number;
+  readonly intentSnapshotJson: string;
+} & (
+  | { readonly kind: "promotion" }
+  | {
+      readonly kind: "draft";
+      readonly promotionOperationId: string;
+      readonly candidateBuildRequestId: string;
+      readonly workflowRunId: string;
+      readonly artifactId: string;
+    }
+);
 const fail = (reason: string) => Effect.fail(new ForkGithubNativeError({ reason }));
 const JsonValue = Schema.fromJsonString(Schema.Unknown);
 const encodeJson = Schema.encodeSync(JsonValue);
@@ -83,12 +97,24 @@ export interface ForkGithubNativeServiceShape {
   readonly submitPromotion: (
     input: ForkGithubPromotionCommand,
   ) => Effect.Effect<ForkGithubOperation, NativeFailure>;
+  /** Internal scheduled path only; deliberately excluded from public RPC handlers. */
+  readonly submitScheduledPromotion: (
+    input: ForkGithubPromotionCommand,
+    guard: Omit<Extract<AutomaticOperationGuard, { readonly kind: "promotion" }>, "kind">,
+  ) => Effect.Effect<ForkGithubOperation, NativeFailure>;
+  /** Internal scheduled-only draft handoff. It is not exposed by RPC handlers. */
+  readonly submitScheduledDraft: (
+    input: ForkGithubDraftCommand,
+    guard: Omit<Extract<AutomaticOperationGuard, { readonly kind: "draft" }>, "kind">,
+  ) => Effect.Effect<ForkGithubOperation, NativeFailure>;
   readonly submitDraft: (
     input: ForkGithubDraftCommand,
   ) => Effect.Effect<ForkGithubOperation, NativeFailure>;
   readonly status: (
     operationId: string,
   ) => Effect.Effect<ForkGithubOperation | null, NativeFailure>;
+  /** Internal bounded recovery wake; not exposed through RPC. */
+  readonly wakePending: () => Effect.Effect<void, NativeFailure>;
 }
 export class ForkGithubNativeService extends Context.Service<
   ForkGithubNativeService,
@@ -527,7 +553,11 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
   );
   yield* Effect.addFinalizer(() => Queue.shutdown(queue));
 
-  const submit = (input: OperationInput, kind: "promotion" | "draft") =>
+  const submit = (
+    input: OperationInput,
+    kind: "promotion" | "draft",
+    automaticGuard?: AutomaticOperationGuard,
+  ) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
         const snapshotInput: InputSnapshot =
@@ -551,7 +581,7 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
         const encodedSnapshot = canonicalJson(snapshot);
         const digest = fingerprint({ input: snapshotInput, snapshot });
         const timestamp = yield* now;
-        const row = yield* repository.accept({
+        const operationRow: OperationRepository.NativeOperationRow = {
           operationId: input.operationId,
           kind,
           fingerprint: digest,
@@ -565,7 +595,23 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
           error: null,
           createdAt: timestamp,
           updatedAt: timestamp,
-        });
+        };
+        const row =
+          automaticGuard?.kind === "promotion"
+            ? yield* repository.acceptAutomaticPromotion({
+                row: operationRow,
+                requestId: input.requestId,
+                ...automaticGuard,
+                now: timestamp,
+              })
+            : automaticGuard?.kind === "draft"
+              ? yield* repository.acceptAutomaticDraft({
+                  row: operationRow,
+                  requestId: input.requestId,
+                  ...automaticGuard,
+                  now: timestamp,
+                })
+              : yield* repository.accept(operationRow);
         if (row.state === "pending") yield* Queue.offer(queue, undefined);
         return toPublic(row);
       }),
@@ -602,6 +648,9 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
         ),
       ),
     submitPromotion: (input) => submit(input, "promotion"),
+    submitScheduledPromotion: (input, guard) =>
+      submit(input, "promotion", { ...guard, kind: "promotion" }),
+    submitScheduledDraft: (input, guard) => submit(input, "draft", { ...guard, kind: "draft" }),
     submitDraft: (input) => submit(input, "draft"),
     status: (operationId) =>
       repository.get(operationId).pipe(
@@ -611,6 +660,12 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
             new ForkGithubNativeError({
               reason: "Could not read durable GitHub operation status.",
             }),
+        ),
+      ),
+    wakePending: () =>
+      Queue.offer(queue, undefined).pipe(
+        Effect.mapError(
+          () => new ForkGithubNativeError({ reason: "Could not wake durable GitHub operations." }),
         ),
       ),
   };
@@ -638,8 +693,11 @@ export const ForkGithubNativeServiceInert = Layer.succeed(ForkGithubNativeServic
   read: () =>
     Effect.succeed(configStatusSchema({ enabled: false, state: "disabled", missing: [] })),
   submitPromotion: () => fail("Native GitHub integration is not configured."),
+  submitScheduledPromotion: () => fail("Native GitHub integration is not configured."),
+  submitScheduledDraft: () => fail("Native GitHub integration is not configured."),
   submitDraft: () => fail("Native GitHub integration is not configured."),
   status: () => Effect.succeed(null),
+  wakePending: () => Effect.void,
 });
 
 export const makeForkGithubNativeHandlers = (service: ForkGithubNativeServiceShape) => ({

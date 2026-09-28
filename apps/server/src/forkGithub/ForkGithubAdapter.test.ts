@@ -212,7 +212,7 @@ const tokenResponse = () =>
   });
 
 it.effect(
-  "requests repository-scoped Actions read permission and checks exact run/workflow/artifact metadata",
+  "requests repository-scoped Actions write permission and checks exact run/workflow/artifact metadata",
   () => {
     let permissions: Record<string, unknown> | undefined;
     const layer = serviceLayer((request) => {
@@ -273,7 +273,7 @@ it.effect(
       assert.equal(metadata.workflow.id, 82);
       assert.equal(metadata.artifact.workflow_run.id, 91);
       assert.deepEqual(permissions, {
-        actions: "read",
+        actions: "write",
         checks: "write",
         contents: "write",
         pull_requests: "read",
@@ -281,6 +281,174 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect(
+  "dispatches only to the pinned workflow tag and reconciles exact run/artifact metadata",
+  () => {
+    const control = sha("e");
+    const annotated = sha("d");
+    const marker = `fork-candidate-v1-${"a".repeat(64)}`;
+    const artifactName = `fork-candidate-0.0.43-fork.abcdef123456-${sha("c")}`;
+    let dispatchBody: Record<string, unknown> | undefined;
+    const layer = serviceLayer((request) => {
+      if (request.url.includes("access_tokens")) return tokenResponse();
+      if (request.url.endsWith("/git/ref/tags/forklauncher-control-v1"))
+        return Response.json({ object: { sha: annotated, type: "tag" } });
+      if (request.url.endsWith(`/git/tags/${annotated}`))
+        return Response.json({ object: { sha: control } });
+      if (request.url.endsWith("/actions/workflows/82/dispatches")) {
+        const body = request.body as { readonly _tag?: string; readonly body?: Uint8Array };
+        if (body._tag === "Uint8Array" && body.body)
+          dispatchBody = decodeJson(new TextDecoder().decode(body.body)) as Record<string, unknown>;
+        return Response.json({ workflow_run_id: 901 });
+      }
+      if (request.url.includes("/actions/workflows/82/runs?"))
+        return Response.json({
+          workflow_runs: [
+            {
+              id: 901,
+              workflow_id: 82,
+              display_title: marker,
+              path: ".github/workflows/fork-candidate.yml@forklauncher-control-v1",
+              status: "completed",
+              conclusion: "success",
+              head_sha: control,
+              head_branch: "forklauncher-control-v1",
+              event: "workflow_dispatch",
+              repository: { id: 71, full_name: "downstream/project" },
+            },
+          ],
+        });
+      if (request.url.endsWith("/actions/runs/901/artifacts?per_page=100"))
+        return Response.json({
+          artifacts: [
+            {
+              id: 902,
+              name: artifactName,
+              size_in_bytes: 64,
+              expired: false,
+              expires_at: "2099-01-01T00:00:00Z",
+              digest: `sha256:${"b".repeat(64)}`,
+              workflow_run: {
+                id: 901,
+                repository_id: 71,
+                head_repository_id: 71,
+                head_branch: "forklauncher-control-v1",
+                head_sha: control,
+              },
+            },
+          ],
+        });
+      throw new Error(`Unexpected request ${request.method} ${request.url}`);
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ForkGithubAdapterModule.ForkGithubAdapter;
+      assert.equal(
+        yield* adapter.resolveCandidateWorkflowRef({
+          owner: "downstream",
+          repository: "project",
+          ref: "refs/tags/forklauncher-control-v1",
+        }),
+        control,
+      );
+      const workflowRunId = yield* adapter.dispatchCandidateWorkflow({
+        owner: "downstream",
+        repository: "project",
+        workflowId: 82,
+        ref: "refs/tags/forklauncher-control-v1",
+        dispatchRequestId: marker,
+        inputs: { candidate_sha: sha("c") },
+      });
+      assert.equal(workflowRunId, "901");
+      assert.deepEqual(dispatchBody, {
+        ref: "forklauncher-control-v1",
+        inputs: { candidate_sha: sha("c"), dispatch_request_id: marker },
+      });
+      const [run] = yield* adapter.listCandidateWorkflowRuns({
+        owner: "downstream",
+        repository: "project",
+        workflowId: 82,
+        headSha: control,
+      });
+      assert.equal(run?.display_title, marker);
+      const [artifact] = yield* adapter.listCandidateWorkflowArtifacts({
+        owner: "downstream",
+        repository: "project",
+        runId: workflowRunId,
+      });
+      assert.equal(artifact?.id, 902);
+      assert.equal(artifact?.name, artifactName);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("paginates candidate runs and artifacts within a fixed ten-page bound", () => {
+  const seen = new Set<string>();
+  const run = (id: number) => ({
+    id,
+    workflow_id: 82,
+    path: ".github/workflows/fork-candidate.yml",
+    status: "completed",
+    conclusion: "success",
+    head_sha: sha("e"),
+    head_branch: "forklauncher-control-v1",
+    event: "workflow_dispatch",
+    repository: { id: 71, full_name: "downstream/project" },
+  });
+  const artifact = (id: number) => ({
+    id,
+    name: `artifact-${id}`,
+    size_in_bytes: 1,
+    expired: false,
+    expires_at: "2099-01-01T00:00:00Z",
+    digest: null,
+    workflow_run: {
+      id: 901,
+      repository_id: 71,
+      head_repository_id: 71,
+      head_branch: "forklauncher-control-v1",
+      head_sha: sha("e"),
+    },
+  });
+  const layer = serviceLayer((request) => {
+    if (request.url.includes("access_tokens")) return tokenResponse();
+    if (request.url.includes("/actions/workflows/82/runs?")) {
+      const page = request.url.includes("page=2") ? 2 : 1;
+      seen.add(`runs:${page}`);
+      return Response.json({
+        total_count: 101,
+        workflow_runs: page === 1 ? Array.from({ length: 100 }, (_, i) => run(i + 1)) : [run(101)],
+      });
+    }
+    if (request.url.includes("/actions/runs/901/artifacts?")) {
+      const page = request.url.includes("page=2") ? 2 : 1;
+      seen.add(`artifacts:${page}`);
+      return Response.json({
+        total_count: 101,
+        artifacts:
+          page === 1 ? Array.from({ length: 100 }, (_, i) => artifact(i + 1)) : [artifact(101)],
+      });
+    }
+    throw new Error(`Unexpected fixture request ${request.url}`);
+  });
+  return Effect.gen(function* () {
+    const adapter = yield* ForkGithubAdapterModule.ForkGithubAdapter;
+    const runs = yield* adapter.listCandidateWorkflowRuns({
+      owner: "downstream",
+      repository: "project",
+      workflowId: 82,
+      headSha: sha("e"),
+    });
+    const artifacts = yield* adapter.listCandidateWorkflowArtifacts({
+      owner: "downstream",
+      repository: "project",
+      runId: "901",
+    });
+    assert.equal(runs.length, 101);
+    assert.equal(artifacts.length, 101);
+    assert.deepEqual([...seen].sort(), ["artifacts:1", "artifacts:2", "runs:1", "runs:2"]);
+  }).pipe(Effect.provide(layer));
+});
 
 it.effect("streams artifact redirects without forwarding the App token", () => {
   const archive = Buffer.from("bounded fixture archive");

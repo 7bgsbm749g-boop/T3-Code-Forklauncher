@@ -35,6 +35,7 @@ const makeFile = () => ({
   target: { repository, repositoryId: 987654321, branch: "forklauncher" },
   nativeAppId: appId,
   directPushBypass: false,
+  automaticStablePromotion: false,
   validationProfile: profile,
   requiredChecks: [
     { name: "T3 Fork Compatibility", appId },
@@ -101,6 +102,7 @@ it.effect("loads a coherent profile, policy, target and immutable workflow pin",
         assert.equal(values.profile?.sha256, Github.validationProfileSha256(profile));
         assert.equal(values.policy?.sha256.length, 64);
         assert.equal(values.policy?.requiredChecks[0]?.appId, appId);
+        assert.equal(values.configuration?.automaticStablePromotion, false);
         assert.deepEqual(values.target, {
           owner: "7bgsbm749g-boop",
           repository: "T3-Code-Forklauncher",
@@ -134,6 +136,7 @@ it.effect(
     });
     assert.equal(generated.status, "ready");
     if (generated.status !== "ready") return Effect.void;
+    assert.equal(generated.config.candidateWorkflow.workflowRef, Artifacts.forkCandidateControlRef);
 
     const root = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3-fork-github-generated-config-"),
@@ -241,6 +244,10 @@ it.effect(
       const firstHash = yield* getHash(first.config);
       const movedHash = yield* getHash(moved.config);
       assert.notEqual(firstHash, movedHash);
+
+      const automatic = { ...first.config, automaticStablePromotion: true };
+      const automaticHash = yield* getHash(automatic);
+      assert.notEqual(firstHash, automaticHash);
 
       const wrongCheck = {
         ...first.config,

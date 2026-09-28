@@ -161,6 +161,11 @@ const inspectProductionDatabase = (filename: string) =>
         "idx_fork_github_release_lease",
         "idx_fork_github_native_operations_state",
         "fork_compatibility_schedule",
+        "fork_github_pr_evidence",
+        "idx_fork_github_pr_evidence_status",
+        "fork_github_automatic_promotion_intents",
+        "idx_fork_github_auto_promotion_state",
+        "fork_github_automatic_promotion_runtime_policy",
       ];
       const objects = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE name IN ${sql.in(requiredObjects)}
@@ -253,7 +258,7 @@ it.effect("reconciles released gapped fork histories on production startup and r
       assert.deepEqual(first.legacy, legacyBefore, `${history} effect ledger was rewritten`);
       assert.deepEqual(
         first.fork.map(({ migration_id }) => Number(migration_id)),
-        [53, 54, 55, 56, 57, 58, 59],
+        [53, 54, 55, 56, 57, 58, 59, 60, 61, 62],
       );
       assert.deepEqual(first.objects, first.requiredObjects);
       assert.isTrue(first.scheduleColumns.includes("config_revision"));

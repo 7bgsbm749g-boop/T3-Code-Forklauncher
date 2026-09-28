@@ -23,6 +23,7 @@ const sha = (value: string | Uint8Array) =>
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const candidateSha = "c".repeat(40);
 const workflowCommitSha = "e".repeat(40);
+const dispatchRequestId = `fork-candidate-v1-${"9".repeat(64)}`;
 const workflowSources = new Map<string, Buffer>(
   trustedCandidateWorkflowPaths.map(
     (path) => [path, Buffer.from(`trusted source ${path}\n`)] as const,
@@ -155,6 +156,7 @@ const fixtureArchive = () => {
       workflowCommitSha,
       workflowDefinitionSha256: workflowDefinitionSha256(trust.workflowFiles),
       validationProfileSha256: profile,
+      dispatchRequestId,
       assets: assets.map(({ group, path, bytes }) => ({
         group,
         path,
@@ -190,6 +192,7 @@ const fixtureArchive = () => {
 interface ActionsMetadataFixture {
   run: {
     id: number;
+    display_title?: string;
     workflow_id: number;
     path: string;
     status: string;
@@ -224,6 +227,7 @@ const makeSource = (
   const metadata: ActionsMetadataFixture = {
     run: {
       id: 91,
+      display_title: dispatchRequestId,
       workflow_id: trust.workflowId,
       path: `${trust.workflowPath}@forklauncher`,
       status: "completed",
@@ -301,6 +305,7 @@ it.effect("resolves the exact trusted Actions run and validates extracted candid
         stableTag: "v0.0.42",
         profileSha256: profile,
         releaseRepository: trust.repository,
+        dispatchRequestId,
       });
       assert.equal(verified.candidateVersion, "0.0.43-fork.1");
       assert.equal(

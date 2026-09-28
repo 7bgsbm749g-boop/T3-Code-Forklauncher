@@ -45,6 +45,9 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.forkCompatibilityStatus)).toBe(
       AuthOrchestrationReadScope,
     );
+    expect(requiredScopeForRpcMethod(WS_METHODS.forkCompatibilityScheduleStatus)).toBe(
+      AuthOrchestrationReadScope,
+    );
   });
 
   it("uses operate scope for GitHub configuration/submissions and read scope for status", () => {

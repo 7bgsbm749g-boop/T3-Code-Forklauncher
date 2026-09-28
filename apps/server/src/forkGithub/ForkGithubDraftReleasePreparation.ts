@@ -281,6 +281,7 @@ const makeForkGithubDraftReleasePreparation = Effect.gen(function* () {
                 stableTag: run.targetTag,
                 profileSha256: run.profileSha256,
                 releaseRepository: repository,
+                dispatchRequestId: lease.dispatchRequestId,
               }),
             catch: (error) =>
               new Github.ForkGithubAdapterError({

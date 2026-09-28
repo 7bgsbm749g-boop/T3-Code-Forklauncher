@@ -83,6 +83,41 @@ export const ForkGithubOperation = Schema.Union([
 ]);
 export type ForkGithubOperation = typeof ForkGithubOperation.Type;
 
+/** Read-only scheduled pipeline summary. Diagnostics are fixed codes, never raw logs/errors. */
+export const ForkGithubPipelineStatus = Schema.Struct({
+  status: Schema.Literals([
+    "not-started",
+    "promotion-pending",
+    "build-pending",
+    "needs-review",
+    "failed",
+    "draft-pending",
+    "draft-prepared",
+    "unavailable",
+  ]),
+  stage: Schema.NullOr(Schema.Literals(["promotion", "build", "draft"])),
+  candidateVersion: Schema.NullOr(Schema.String.check(Schema.isMaxLength(128))),
+  workflowRunId: Schema.NullOr(Schema.String.check(Schema.isMaxLength(32))),
+  artifactId: Schema.NullOr(Schema.String.check(Schema.isMaxLength(32))),
+  draftTag: Schema.NullOr(Schema.String.check(Schema.isMaxLength(128))),
+  diagnostic: Schema.NullOr(
+    Schema.Literals([
+      "not-automatic",
+      "intent-stale",
+      "association-mismatch",
+      "promotion-failed",
+      "build-failed",
+      "build-needs-review",
+      "draft-failed",
+      "service-unavailable",
+    ]),
+  ),
+  release: Schema.Literals(["none", "draft"]),
+  published: Schema.Literal(false),
+  installed: Schema.Literal(false),
+});
+export type ForkGithubPipelineStatus = typeof ForkGithubPipelineStatus.Type;
+
 export const ForkGithubConfigurationStatus = Schema.Struct({
   enabled: Schema.Boolean,
   state: Schema.Literals(["disabled", "ready", "unavailable"]),

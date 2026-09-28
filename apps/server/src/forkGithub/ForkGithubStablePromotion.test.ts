@@ -115,6 +115,10 @@ it.effect(
       readonly identity: Github.CompatibilityIdentity;
     }> = [];
     const adapter = Github.ForkGithubAdapter.of({
+      resolveCandidateWorkflowRef: () => Effect.die("unused"),
+      dispatchCandidateWorkflow: () => Effect.die("unused"),
+      listCandidateWorkflowRuns: () => Effect.die("unused"),
+      listCandidateWorkflowArtifacts: () => Effect.die("unused"),
       inspectPullRequest: () => Effect.die("unused"),
       latestOfficialStable: () => Effect.succeed({ tag: run.targetTag, sha: run.targetSha }),
       publishCompatibilityCheck: ({ identity }) => {

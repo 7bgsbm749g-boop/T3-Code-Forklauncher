@@ -40,6 +40,28 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
     } as const;
+    const schedule = {
+      enabled: true,
+      sourceDirectory: "/fixture/fork",
+      lastStatus: "request-completed",
+      lastDiscoveredTag: "v0.0.44",
+      lastDiscoveredSha: "a".repeat(40),
+      lastRequestId: "scheduled-request-1",
+      lastError: null,
+      nextDueAt: null,
+      pipeline: {
+        status: "draft-prepared",
+        stage: "draft",
+        candidateVersion: "0.0.45-fork.abc",
+        workflowRunId: "12345",
+        artifactId: "67890",
+        draftTag: "v0.0.45-fork.abc",
+        diagnostic: null,
+        release: "draft",
+        published: false,
+        installed: false,
+      },
+    } as const;
     const rpc = (method: string, result: unknown) => (input: unknown) =>
       Effect.sync(() => {
         calls.push([method, input]);
@@ -55,6 +77,10 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
         status: "pending",
       }),
       [WS_METHODS.forkGithubStatus]: rpc(WS_METHODS.forkGithubStatus, operation),
+      [WS_METHODS.forkCompatibilityScheduleStatus]: rpc(
+        WS_METHODS.forkCompatibilityScheduleStatus,
+        schedule,
+      ),
     } as unknown as WsRpcProtocolClient;
     const session: RpcSession.RpcSession = {
       client,
@@ -131,12 +157,19 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
         input: { operationId: "operation-1" },
       }),
     ).toMatchObject({ _tag: "Success", value: operation });
+    expect(
+      yield* invoke(atoms.forkCompatibilityScheduleStatus, { environmentId, input: {} }),
+    ).toMatchObject({
+      _tag: "Success",
+      value: { lastRequestId: "scheduled-request-1", pipeline: schedule.pipeline },
+    });
     expect(calls.map(([method]) => method)).toEqual([
       WS_METHODS.forkGithubRead,
       WS_METHODS.forkGithubConfigure,
       WS_METHODS.forkGithubSubmitPromotion,
       WS_METHODS.forkGithubSubmitDraft,
       WS_METHODS.forkGithubStatus,
+      WS_METHODS.forkCompatibilityScheduleStatus,
     ]);
     registry.dispose();
   }),

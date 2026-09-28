@@ -36,12 +36,16 @@ export const trustedCandidateWorkflowPaths = [
   "scripts/smoke-cli-archive.ts",
   "scripts/update-release-package-versions.ts",
 ] as const;
+export const forkCandidateControlRef = "refs/tags/forklauncher-control-v1" as const;
+export const isTrustedCandidateWorkflowRef = (ref: string): boolean =>
+  ref === "refs/heads/forklauncher" || ref === forkCandidateControlRef;
+export const workflowRefName = (ref: string): string => ref.slice(ref.lastIndexOf("/") + 1);
 export interface TrustedCandidateWorkflow {
   readonly repository: string;
   readonly repositoryId: number;
   readonly workflowId: number;
   readonly workflowPath: ".github/workflows/fork-candidate.yml";
-  readonly workflowRef: "refs/heads/forklauncher";
+  readonly workflowRef: "refs/heads/forklauncher" | typeof forkCandidateControlRef;
   readonly workflowCommitSha: string;
   readonly workflowFiles: ReadonlyArray<{ readonly path: string; readonly sha256: string }>;
 }
@@ -223,7 +227,7 @@ export const ForkGithubCandidateArtifactSourceLive = Layer.effect(
           !Number.isSafeInteger(expected.workflowId) ||
           expected.workflowId < 1 ||
           expected.workflowPath !== ".github/workflows/fork-candidate.yml" ||
-          expected.workflowRef !== "refs/heads/forklauncher" ||
+          !isTrustedCandidateWorkflowRef(expected.workflowRef) ||
           !shaPattern.test(expected.workflowCommitSha) ||
           expected.workflowFiles.length !== trustedCandidateWorkflowPaths.length ||
           new Set(expected.workflowFiles.map((file) => file.path)).size !==
@@ -262,6 +266,7 @@ export const ForkGithubCandidateArtifactSourceLive = Layer.effect(
         const { run, workflow, artifact } = metadata;
         const workflowCommitSha = run.head_sha.toLowerCase();
         const artifactDigest = artifact.digest;
+        const dispatchRequestId = run.display_title ?? "";
         const now = DateTime.toEpochMillis(yield* DateTime.now);
         if (
           run.id.toString() !== workflowRunId ||
@@ -273,11 +278,11 @@ export const ForkGithubCandidateArtifactSourceLive = Layer.effect(
           run.repository.full_name.toLowerCase() !== expected.repository.toLowerCase() ||
           !(
             run.path === expected.workflowPath ||
-            run.path ===
-              `${expected.workflowPath}@${expected.workflowRef.slice("refs/heads/".length)}`
+            run.path === `${expected.workflowPath}@${workflowRefName(expected.workflowRef)}`
           ) ||
-          run.head_branch !== expected.workflowRef.slice("refs/heads/".length) ||
+          run.head_branch !== workflowRefName(expected.workflowRef) ||
           run.event !== "workflow_dispatch" ||
+          !/^fork-candidate-v1-[0-9a-f]{64}$/.test(dispatchRequestId) ||
           run.status !== "completed" ||
           run.conclusion !== "success" ||
           !shaPattern.test(workflowCommitSha) ||
@@ -401,6 +406,7 @@ export const ForkGithubCandidateArtifactSourceLive = Layer.effect(
                 runStatus: run.status,
                 runConclusion: run.conclusion,
                 runHeadSha: run.head_sha,
+                dispatchRequestId,
                 artifactId: artifact.id.toString(),
                 expired: artifact.expired,
                 artifactSize: downloaded.size,

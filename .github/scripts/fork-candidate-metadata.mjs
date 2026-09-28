@@ -273,7 +273,8 @@ export function createCandidateManifest(
   }
   if (
     !/^[1-9]\d*$/.test(String(build.workflowRunId ?? "")) ||
-    build.workflowRef !== "refs/heads/forklauncher" ||
+    !["refs/heads/forklauncher", "refs/tags/forklauncher-control-v1"].includes(build.workflowRef) ||
+    !/^fork-candidate-v1-[0-9a-f]{64}$/.test(build.dispatchRequestId ?? "") ||
     !/^[0-9a-f]{64}$/i.test(build.validationProfileSha256 ?? "") ||
     !fullShaPattern.test(build.workflowCommitSha ?? "") ||
     !/^[0-9a-f]{64}$/i.test(build.workflowDefinitionSha256 ?? "") ||
@@ -304,6 +305,7 @@ export function createCandidateManifest(
       workflowCommitSha: build.workflowCommitSha.toLowerCase(),
       workflowDefinitionSha256: build.workflowDefinitionSha256.toLowerCase(),
       validationProfileSha256: build.validationProfileSha256.toLowerCase(),
+      dispatchRequestId: build.dispatchRequestId,
       assets: build.assets,
     },
     acceptanceStatus: "artifact-only; not accepted for merge or release",

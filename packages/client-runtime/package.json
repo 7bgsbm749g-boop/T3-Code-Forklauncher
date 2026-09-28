@@ -187,6 +187,10 @@
       "types": "./src/state/forkCompatibilityUi.ts",
       "default": "./src/state/forkCompatibilityUi.ts"
     },
+    "./state/fork-github-pipeline": {
+      "types": "./src/state/forkGithubPipeline.ts",
+      "default": "./src/state/forkGithubPipeline.ts"
+    },
     "./state/session": {
       "types": "./src/state/session.ts",
       "default": "./src/state/session.ts"

@@ -28,6 +28,8 @@ import { pushExactLease } from "./ForkGithubGitTransport.ts";
 
 const API = "https://api.github.com";
 const API_VERSION = "2026-03-10";
+const ACTIONS_LIST_PAGE_SIZE = 100;
+const ACTIONS_LIST_MAX_PAGES = 10;
 export const FORK_GITHUB_COMPATIBILITY_CHECK_NAME = "T3 Fork Compatibility";
 const jsonBody = (value: unknown) =>
   HttpClientRequest.bodyUint8Array(
@@ -413,6 +415,7 @@ const UploadedReleaseAssetJson = Schema.Struct({
 const ActionsWorkflowRunJson = Schema.Struct({
   id: Schema.Finite,
   workflow_id: Schema.Finite,
+  display_title: Schema.optional(Schema.String),
   path: Schema.String,
   status: Schema.String,
   conclusion: Schema.NullOr(Schema.String),
@@ -434,6 +437,7 @@ const ActionsWorkflowFileJson = Schema.Struct({
 });
 const ActionsArtifactJson = Schema.Struct({
   id: Schema.Finite,
+  name: Schema.optional(Schema.String),
   size_in_bytes: Schema.Finite,
   expired: Schema.Boolean,
   expires_at: Schema.String,
@@ -446,6 +450,15 @@ const ActionsArtifactJson = Schema.Struct({
     head_sha: Schema.String,
   }),
 });
+const ActionsWorkflowRunsJson = Schema.Struct({
+  total_count: Schema.optional(Schema.Finite),
+  workflow_runs: Schema.Array(ActionsWorkflowRunJson),
+});
+const ActionsWorkflowArtifactsJson = Schema.Struct({
+  total_count: Schema.optional(Schema.Finite),
+  artifacts: Schema.Array(ActionsArtifactJson),
+});
+const WorkflowDispatchResponseJson = Schema.Struct({ workflow_run_id: Schema.Finite });
 const GatePolicyCanonicalSchema = Schema.Struct({
   sha256: Schema.String,
   requiredChecks: Schema.Array(Schema.Struct({ name: Schema.String, appId: Schema.Finite })),
@@ -463,7 +476,7 @@ export const canonicalGatePolicyJson = (policy: ForkGithubGatePolicySnapshot) =>
     .join("\n")}`;
 };
 const policyBytes = canonicalGatePolicyJson;
-const actionPolicySnapshot = (
+export const actionPolicySnapshot = (
   profile: TrustedValidationProfileWithHash,
   policy: ForkGithubGatePolicySnapshot,
   evidence: CompatibilityEvidence,
@@ -560,6 +573,30 @@ export type ForkGithubAdapterFailure =
   | VcsError;
 
 export interface ForkGithubAdapterShape {
+  readonly resolveCandidateWorkflowRef: (input: {
+    readonly owner: string;
+    readonly repository: string;
+    readonly ref: string;
+  }) => Effect.Effect<string | null, ForkGithubAdapterFailure>;
+  readonly dispatchCandidateWorkflow: (input: {
+    readonly owner: string;
+    readonly repository: string;
+    readonly workflowId: number;
+    readonly ref: string;
+    readonly dispatchRequestId: string;
+    readonly inputs: Readonly<Record<string, string>>;
+  }) => Effect.Effect<string, ForkGithubAdapterFailure>;
+  readonly listCandidateWorkflowRuns: (input: {
+    readonly owner: string;
+    readonly repository: string;
+    readonly workflowId: number;
+    readonly headSha: string;
+  }) => Effect.Effect<ReadonlyArray<typeof ActionsWorkflowRunJson.Type>, ForkGithubAdapterFailure>;
+  readonly listCandidateWorkflowArtifacts: (input: {
+    readonly owner: string;
+    readonly repository: string;
+    readonly runId: string;
+  }) => Effect.Effect<ReadonlyArray<typeof ActionsArtifactJson.Type>, ForkGithubAdapterFailure>;
   readonly inspectPullRequest: (input: {
     readonly owner: string;
     readonly repository: string;
@@ -697,6 +734,10 @@ export class ForkGithubAdapter extends Context.Service<ForkGithubAdapter, ForkGi
 const disabled = () =>
   fail("Fork GitHub integration is not configured; no GitHub operation was performed.");
 export const ForkGithubAdapterInert = Layer.succeed(ForkGithubAdapter, {
+  resolveCandidateWorkflowRef: disabled,
+  dispatchCandidateWorkflow: disabled,
+  listCandidateWorkflowRuns: disabled,
+  listCandidateWorkflowArtifacts: disabled,
   inspectPullRequest: disabled,
   latestOfficialStable: disabled,
   publishCompatibilityCheck: disabled,
@@ -743,7 +784,7 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
       jsonBody({
         repositories: [`${owner}/${repository}`],
         permissions: {
-          actions: "read",
+          actions: "write",
           checks: "write",
           contents: "write",
           pull_requests: "read",
@@ -829,6 +870,111 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
         ActionsArtifactJson,
       );
       return { run, workflow, artifact };
+    });
+
+  const resolveCandidateWorkflowRef: ForkGithubAdapterShape["resolveCandidateWorkflowRef"] =
+    Effect.fn("ForkGithubAdapter.resolveCandidateWorkflowRef")(function* ({
+      owner,
+      repository,
+      ref,
+    }) {
+      if (!/^refs\/(?:tags|heads)\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref))
+        return yield* fail("Candidate workflow control ref is not a full safe Git ref.");
+      const { token } = yield* auth(owner, repository);
+      if (ref.startsWith("refs/tags/"))
+        return yield* tagCommitSha(token, owner, repository, ref.slice("refs/tags/".length));
+      const name = ref.slice("refs/heads/".length);
+      const resolved = yield* requestJsonOr404(
+        token,
+        `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/git/ref/heads/${name.split("/").map(encodeURIComponent).join("/")}`,
+        RefTargetJson,
+      );
+      if (!resolved) return null;
+      if (resolved.object.type !== "commit" || !isGitSha(resolved.object.sha))
+        return yield* fail("Candidate workflow branch ref does not point directly to a commit.");
+      return resolved.object.sha.toLowerCase();
+    });
+
+  const dispatchCandidateWorkflow: ForkGithubAdapterShape["dispatchCandidateWorkflow"] = Effect.fn(
+    "ForkGithubAdapter.dispatchCandidateWorkflow",
+  )(function* (input) {
+    if (
+      !Number.isSafeInteger(input.workflowId) ||
+      input.workflowId < 1 ||
+      !/^refs\/tags\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(input.ref) ||
+      !/^fork-candidate-v1-[0-9a-f]{64}$/.test(input.dispatchRequestId) ||
+      Object.hasOwn(input.inputs, "dispatch_request_id")
+    )
+      return yield* fail("Candidate workflow dispatch identity is invalid.");
+    const { token } = yield* auth(input.owner, input.repository);
+    const url = `${API}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/actions/workflows/${input.workflowId}/dispatches`;
+    const response = yield* http
+      .execute(
+        HttpClientRequest.post(url).pipe(
+          HttpClientRequest.setHeader("Authorization", `Bearer ${token}`),
+          HttpClientRequest.setHeader("Accept", "application/vnd.github+json"),
+          HttpClientRequest.setHeader("X-GitHub-Api-Version", API_VERSION),
+          jsonBody({
+            ref: input.ref.slice("refs/tags/".length),
+            inputs: { ...input.inputs, dispatch_request_id: input.dispatchRequestId },
+          }),
+        ),
+      )
+      .pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
+    const result = yield* HttpClientResponse.schemaBodyJson(WorkflowDispatchResponseJson)(response);
+    if (!Number.isSafeInteger(result.workflow_run_id) || result.workflow_run_id < 1)
+      return yield* fail("GitHub returned an invalid workflow run ID.");
+    return String(result.workflow_run_id);
+  });
+
+  const listCandidateWorkflowRuns: ForkGithubAdapterShape["listCandidateWorkflowRuns"] = Effect.fn(
+    "ForkGithubAdapter.listCandidateWorkflowRuns",
+  )(function* (input) {
+    if (!Number.isSafeInteger(input.workflowId) || input.workflowId < 1 || !isGitSha(input.headSha))
+      return yield* fail("Candidate workflow run lookup identity is invalid.");
+    const { token } = yield* auth(input.owner, input.repository);
+    const url = `${API}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/actions/workflows/${input.workflowId}/runs?event=workflow_dispatch&head_sha=${encodeURIComponent(input.headSha)}&per_page=${ACTIONS_LIST_PAGE_SIZE}`;
+    const collected: (typeof ActionsWorkflowRunJson.Type)[] = [];
+    for (let page = 1; page <= ACTIONS_LIST_MAX_PAGES; page += 1) {
+      const pageUrl = page === 1 ? url : `${url}&page=${page}`;
+      const result = yield* requestJson(
+        token,
+        HttpClientRequest.get(pageUrl),
+        ActionsWorkflowRunsJson,
+      );
+      collected.push(...result.workflow_runs);
+      if (
+        (result.total_count !== undefined && collected.length >= result.total_count) ||
+        (result.total_count === undefined && result.workflow_runs.length < ACTIONS_LIST_PAGE_SIZE)
+      )
+        return collected;
+      if (result.workflow_runs.length === 0) return collected;
+    }
+    return yield* fail("Candidate workflow run lookup exceeded its bounded pagination window.");
+  });
+
+  const listCandidateWorkflowArtifacts: ForkGithubAdapterShape["listCandidateWorkflowArtifacts"] =
+    Effect.fn("ForkGithubAdapter.listCandidateWorkflowArtifacts")(function* (input) {
+      if (!/^[1-9]\d*$/.test(input.runId)) return yield* fail("Candidate run ID is invalid.");
+      const { token } = yield* auth(input.owner, input.repository);
+      const url = `${API}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/actions/runs/${input.runId}/artifacts?per_page=${ACTIONS_LIST_PAGE_SIZE}`;
+      const collected: (typeof ActionsArtifactJson.Type)[] = [];
+      for (let page = 1; page <= ACTIONS_LIST_MAX_PAGES; page += 1) {
+        const pageUrl = page === 1 ? url : `${url}&page=${page}`;
+        const result = yield* requestJson(
+          token,
+          HttpClientRequest.get(pageUrl),
+          ActionsWorkflowArtifactsJson,
+        );
+        collected.push(...result.artifacts);
+        if (
+          (result.total_count !== undefined && collected.length >= result.total_count) ||
+          (result.total_count === undefined && result.artifacts.length < ACTIONS_LIST_PAGE_SIZE)
+        )
+          return collected;
+        if (result.artifacts.length === 0) return collected;
+      }
+      return yield* fail("Candidate artifact lookup exceeded its bounded pagination window.");
     });
 
   const getCandidateWorkflowFile: ForkGithubAdapterShape["getCandidateWorkflowFile"] = Effect.fn(
@@ -1488,6 +1634,10 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
   });
 
   return {
+    resolveCandidateWorkflowRef,
+    dispatchCandidateWorkflow,
+    listCandidateWorkflowRuns,
+    listCandidateWorkflowArtifacts,
     inspectPullRequest,
     latestOfficialStable,
     publishCompatibilityCheck,

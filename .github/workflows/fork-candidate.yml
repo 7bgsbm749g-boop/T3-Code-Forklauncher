@@ -1,4 +1,5 @@
 name: Fork candidate artifacts
+run-name: ${{ inputs.dispatch_request_id }}
 
 on:
   workflow_dispatch:
@@ -27,6 +28,10 @@ on:
         description: Digest of the native validation profile whose run permits promotion
         required: true
         type: string
+      dispatch_request_id:
+        description: Immutable native build request correlation marker
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -41,8 +46,8 @@ jobs:
       candidate_sha: ${{ steps.verify.outputs.candidate_sha }}
       candidate_version: ${{ steps.verify.outputs.candidate_version }}
     steps:
-      - name: Require the trusted fork workflow ref
-        if: github.ref != 'refs/heads/forklauncher'
+      - name: Require a configured fork workflow control ref
+        if: github.ref != 'refs/heads/forklauncher' && github.ref != 'refs/tags/forklauncher-control-v1'
         run: exit 1
       # Keep the validator sourced from the workflow revision. Candidate source
       # is checked out separately only after scalar input validation succeeds.
@@ -66,6 +71,7 @@ jobs:
           OFFICIAL_STABLE_TAG: ${{ inputs.official_stable_tag }}
           CANDIDATE_VERSION: ${{ inputs.candidate_version }}
           VALIDATION_PROFILE_SHA256: ${{ inputs.validation_profile_sha256 }}
+          DISPATCH_REQUEST_ID: ${{ inputs.dispatch_request_id }}
         run: |
           node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
           import { validateCandidateMetadata } from './.github/scripts/fork-candidate-metadata.mjs';
@@ -77,6 +83,7 @@ jobs:
             candidateVersion: process.env.CANDIDATE_VERSION,
           });
           if (!/^[0-9a-f]{64}$/i.test(process.env.VALIDATION_PROFILE_SHA256 ?? '')) throw new Error('validation_profile_sha256 must be a full SHA-256');
+          if (!/^fork-candidate-v1-[0-9a-f]{64}$/.test(process.env.DISPATCH_REQUEST_ID ?? '')) throw new Error('dispatch_request_id must be a full native request identity');
           for (const [key, value] of Object.entries(result)) console.log(`${key}=${value}`);
           NODE
       - name: Checkout exact candidate commit without credentials
@@ -375,6 +382,7 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           WORKFLOW_REF: ${{ github.ref }}
           WORKFLOW_CONTROL_SHA: ${{ github.sha }}
+          DISPATCH_REQUEST_ID: ${{ inputs.dispatch_request_id }}
         run: |
           set -euo pipefail
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
@@ -393,6 +401,7 @@ jobs:
             workflowCommitSha: process.env.WORKFLOW_CONTROL_SHA,
             workflowDefinitionSha256: await candidateWorkflowDefinitionSha256('workflow-tools'),
             validationProfileSha256: process.env.VALIDATION_PROFILE_SHA256,
+            dispatchRequestId: process.env.DISPATCH_REQUEST_ID,
             assets,
           });
           await writeFile('candidate-artifacts/candidate-manifest.json', `${JSON.stringify(manifest, null, 2)}\n`);

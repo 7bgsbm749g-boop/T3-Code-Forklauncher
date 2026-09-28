@@ -4,6 +4,7 @@ import { CheckIcon, RefreshCwIcon, SaveIcon, Trash2Icon } from "lucide-react";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { randomUUID } from "../../lib/utils";
 import { serverEnvironment } from "../../state/server";
+import { describeForkGithubPipeline } from "@t3tools/client-runtime/state/fork-github-pipeline";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
@@ -89,20 +90,21 @@ export function ForkCompatibilitySettings() {
   const automaticStableChecks =
     environment?.serverConfig?.settings.forkCompatibility.automaticStableChecks ?? false;
   const [scheduleStatusEntry, setScheduleStatusEntry] = useState<{
-    readonly environmentId: string;
-    readonly result: Awaited<ReturnType<typeof readScheduleStatus>>;
+    readonly token: IdentityToken;
+    readonly result: Awaited<ReturnType<typeof readScheduleStatus>> | null;
   } | null>(null);
   const connected = connectedEnvironments.some(
     (candidate) => candidate.environmentId === environmentId,
   );
-  const scheduleStatus =
-    connected && scheduleStatusEntry?.environmentId === environmentId
-      ? scheduleStatusEntry.result
-      : null;
   const statusIdentity = JSON.stringify([environmentId, lastRequestId, connected]);
+  const scheduleIdentity = JSON.stringify([environmentId, connected]);
   const operationIdentity = JSON.stringify([environmentId, directory, connected]);
   const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
   const statusToken = statusEpoch.update(statusIdentity);
+  const scheduleEpoch = useRef(new IdentityEpoch(scheduleIdentity)).current;
+  const scheduleToken = scheduleEpoch.update(scheduleIdentity);
+  const scheduleStatus =
+    connected && scheduleStatusEntry?.token === scheduleToken ? scheduleStatusEntry.result : null;
   const operationEpoch = useRef(new IdentityEpoch(operationIdentity)).current;
   const operationToken = operationEpoch.update(operationIdentity);
   const [statusEntry, setStatusEntry] = useState<{
@@ -133,6 +135,25 @@ export function ForkCompatibilitySettings() {
   const finishBusy = useCallback((token: IdentityToken) => {
     setBusyEntry((current) => (current?.token === token ? null : current));
   }, []);
+
+  const refreshScheduleStatus = useCallback(async () => {
+    const token = scheduleToken;
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId || !connected) return;
+    try {
+      const result = await readScheduleStatus({ environmentId: targetEnvironmentId, input: {} });
+      if (scheduleEpoch.isCurrent(token)) setScheduleStatusEntry({ token, result });
+    } catch {
+      if (scheduleEpoch.isCurrent(token)) setScheduleStatusEntry({ token, result: null });
+    }
+  }, [
+    connected,
+    environmentId,
+    readScheduleStatus,
+    scheduleEpoch,
+    scheduleToken,
+    setScheduleStatusEntry,
+  ]);
 
   const refresh = useCallback(
     async (includeEvidence: boolean, background = false) => {
@@ -186,16 +207,8 @@ export function ForkCompatibilitySettings() {
   }, [connected, environmentId, lastRequestId, refresh]);
 
   useEffect(() => {
-    let current = true;
-    if (connected && environmentId) {
-      void readScheduleStatus({ environmentId, input: {} }).then((result) => {
-        if (current) setScheduleStatusEntry({ environmentId, result });
-      });
-    }
-    return () => {
-      current = false;
-    };
-  }, [connected, environmentId, readScheduleStatus]);
+    void refreshScheduleStatus();
+  }, [refreshScheduleStatus]);
 
   if (!environmentId || !environment?.serverConfig) {
     return (
@@ -366,7 +379,7 @@ export function ForkCompatibilitySettings() {
       />
       <SettingsRow
         title="Automatic stable checks"
-        description="Check official stable releases at startup and about every six hours. Checks validate an isolated candidate and never install it."
+        description="Check official stable releases at startup and about every six hours. The server operator may separately enable promotion and draft preparation; releases are never published or installed automatically."
         control={
           <label className="flex items-center gap-2 text-sm">
             <input
@@ -384,14 +397,7 @@ export function ForkCompatibilitySettings() {
                     automaticStableChecks: event.target.checked,
                   },
                 }).then((result) => {
-                  if (result._tag === "Success")
-                    void readScheduleStatus({ environmentId: targetEnvironmentId, input: {} }).then(
-                      (scheduleResult) =>
-                        setScheduleStatusEntry({
-                          environmentId: targetEnvironmentId,
-                          result: scheduleResult,
-                        }),
-                    );
+                  if (result._tag === "Success") void refreshScheduleStatus();
                   else
                     setOperationError({
                       token: operationToken,
@@ -411,6 +417,11 @@ export function ForkCompatibilitySettings() {
             ? "Automatic discovery status unavailable."
             : "Reconnect to view automatic discovery status."}
       </p>
+      {scheduleStatus?._tag === "Success" ? (
+        <p className="break-all px-4 pb-2 text-xs text-muted-foreground">
+          Automatic release pipeline: {describeForkGithubPipeline(scheduleStatus.value.pipeline)}
+        </p>
+      ) : null}
       <SettingsRow
         title="Compatibility check"
         description={
@@ -516,12 +527,16 @@ export function ForkCompatibilitySettings() {
           ) : staleEvidence ? (
             <span className="text-warning">· stale evidence</span>
           ) : null}
-          {lastRequestId ? (
+          {lastRequestId ||
+          (scheduleStatus?._tag === "Success" && scheduleStatus.value.lastRequestId) ? (
             <Button
               size="xs"
               variant="ghost"
               disabled={!connected || busy}
-              onClick={() => void refresh(evidenceVisible)}
+              onClick={() => {
+                void refreshScheduleStatus();
+                if (lastRequestId) void refresh(evidenceVisible);
+              }}
             >
               <RefreshCwIcon className="size-3" /> Refresh
             </Button>

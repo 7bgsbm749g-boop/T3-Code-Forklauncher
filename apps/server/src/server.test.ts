@@ -5164,6 +5164,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               const read = yield* client[WS_METHODS.forkGithubRead]({});
               assert.equal(read.enabled, reopened);
               assert.equal(read.state, reopened ? "unavailable" : "disabled");
+              const schedule = yield* client[WS_METHODS.forkCompatibilityScheduleStatus]({});
+              assert.equal(schedule.pipeline.status, "not-started");
+              assert.equal(schedule.pipeline.published, false);
+              assert.equal(schedule.pipeline.installed, false);
               if (!reopened) {
                 const configured = yield* client[WS_METHODS.forkGithubConfigure]({
                   enabled: true,
@@ -5465,6 +5469,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         awaitCompletion: (requestId) =>
           Ref.get(capturedService).pipe(
             Effect.flatMap((service) => Option.getOrThrow(service).awaitCompletion(requestId)),
+          ),
+        acceptScheduled: (input, guard) =>
+          Ref.get(capturedService).pipe(
+            Effect.flatMap((service) => Option.getOrThrow(service).acceptScheduled(input, guard)),
           ),
       });
       const proxyLayer = Layer.succeed(

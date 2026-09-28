@@ -33,6 +33,11 @@ import * as Repair from "./ForkCompatibilityRepair.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as StableSource from "./ForkCompatibilityStableSource.ts";
 import * as ScheduleRepository from "./ForkCompatibilityScheduleRepository.ts";
+import * as AutomaticIntents from "../forkGithub/ForkGithubAutomaticPromotionIntentRepository.ts";
+import * as GithubOperator from "../forkGithub/ForkGithubOperatorConfiguration.ts";
+import * as FollowThroughSignal from "../forkGithub/ForkGithubStableFollowThroughSignal.ts";
+import * as ForkGithubNative from "../forkGithub/ForkGithubNativeService.ts";
+import * as ForkGithubAdapter from "../forkGithub/ForkGithubAdapter.ts";
 import {
   assessRepairEligibility,
   forkCompatibilityRepairPolicyDigest,
@@ -73,7 +78,10 @@ type NativeError =
   | SqlError.SqlError
   | ForkCompatibilityAutomaticDiscoveryError
   | ScheduleRepository.ForkCompatibilityScheduleWriteError
-  | Schema.SchemaError;
+  | Schema.SchemaError
+  | Effect.Error<
+      ReturnType<AutomaticIntents.AutomaticPromotionIntentRepositoryShape["acceptScheduled"]>
+    >;
 export interface ForkCompatibilityNativeServiceShape {
   readonly configureAutomaticChecks: (input: {
     readonly enabled: boolean;
@@ -89,6 +97,18 @@ export interface ForkCompatibilityNativeServiceShape {
     NativeError
   >;
   readonly accept: (input: AcceptCompatibilityInput) => Effect.Effect<
+    {
+      readonly requestId: string;
+      readonly runId: string | null;
+      readonly status: Requests.ForkCompatibilityRequest["status"];
+    },
+    NativeError
+  >;
+  /** Internal scheduler entry only; never included in a WebSocket handler. */
+  readonly acceptScheduled: (
+    input: AcceptCompatibilityInput,
+    scheduleConfigRevision: number,
+  ) => Effect.Effect<
     {
       readonly requestId: string;
       readonly runId: string | null;
@@ -177,6 +197,18 @@ export const makeForkCompatibilityNativeService = (options?: {
     const scheduleRepository = yield* Effect.serviceOption(
       ScheduleRepository.ForkCompatibilityScheduleRepository,
     );
+    const automaticIntentRepository = yield* Effect.serviceOption(
+      AutomaticIntents.ForkGithubAutomaticPromotionIntentRepository,
+    );
+    const githubOperator = yield* Effect.serviceOption(
+      GithubOperator.ForkGithubOperatorConfigurationService,
+    );
+    const followThroughSignal = yield* Effect.serviceOption(
+      FollowThroughSignal.ForkGithubStableFollowThroughSignal,
+    );
+    const forkGithubNativeService = yield* Effect.serviceOption(
+      ForkGithubNative.ForkGithubNativeService,
+    );
     const scheduleQueue = yield* Queue.dropping<void>(1);
     // This queue is only a coalesced wakeup. Accepted requests live in SQLite,
     // so dropping a redundant wake cannot drop work.
@@ -233,6 +265,16 @@ export const makeForkCompatibilityNativeService = (options?: {
         const changed = yield* requests.finish(requestId, status, error, yield* now, ownerToken);
         if (!changed) return false;
         yield* completeReceipt(requestId);
+        if (status === "completed" && Option.isSome(followThroughSignal)) {
+          const notified = yield* Effect.result(
+            followThroughSignal.value.notifyCompleted(requestId),
+          );
+          if (notified._tag === "Failure")
+            yield* Effect.logError("Could not wake durable automatic promotion follow-through", {
+              requestId,
+              error: errorMessage(notified.failure as NativeError),
+            });
+        }
         return true;
       });
     const runRepairAttempts = (
@@ -684,28 +726,88 @@ export const makeForkCompatibilityNativeService = (options?: {
               }),
             )
             .digest("hex");
-          const accepted = yield* requests
-            .accept({
-              requestId: NodeCrypto.randomUUID(),
-              idempotencyKey: input.idempotencyKey,
-              payloadSha256,
-              repositoryRoot: input.repositoryRoot,
-              upstreamRemote,
-              profile,
-              repairPolicy: capturedRepairPolicy,
-              expectedTarget: input.expectedTarget ?? null,
-              expectedSource: input.expectedSource ?? null,
-              ...(scheduleConfigRevision === undefined ? {} : { scheduleConfigRevision }),
-              now: yield* now,
-            })
-            .pipe(
-              Effect.tapError((error) =>
-                Effect.logError("Failed to persist accepted compatibility request", {
-                  error: errorMessage(error),
-                  cause: SqlError.isSqlError(error) ? String(error.reason.cause) : undefined,
-                }),
-              ),
-            );
+          const requestInput: Requests.AcceptInput = {
+            requestId: NodeCrypto.randomUUID(),
+            idempotencyKey: input.idempotencyKey,
+            payloadSha256,
+            repositoryRoot: input.repositoryRoot,
+            upstreamRemote,
+            profile,
+            repairPolicy: capturedRepairPolicy,
+            expectedTarget: input.expectedTarget ?? null,
+            expectedSource: input.expectedSource ?? null,
+            ...(scheduleConfigRevision === undefined ? {} : { scheduleConfigRevision }),
+            now: yield* now,
+          };
+          const capturedOperator =
+            scheduleConfigRevision !== undefined && Option.isSome(githubOperator)
+              ? yield* githubOperator.value.get().pipe(Effect.result)
+              : null;
+          const capturedGithubReadiness =
+            scheduleConfigRevision !== undefined && Option.isSome(forkGithubNativeService)
+              ? yield* forkGithubNativeService.value.read().pipe(Effect.result)
+              : null;
+          const expectedInputsPresent =
+            requestInput.expectedSource !== null &&
+            requestInput.expectedTarget !== null &&
+            requestInput.expectedSource !== undefined &&
+            requestInput.expectedTarget !== undefined;
+          let acceptEffect: Effect.Effect<
+            { readonly request: Requests.ForkCompatibilityRequest; readonly created: boolean },
+            NativeError
+          > = requests.accept(requestInput);
+          if (
+            scheduleConfigRevision !== undefined &&
+            Option.isSome(automaticIntentRepository) &&
+            capturedGithubReadiness?._tag === "Success" &&
+            capturedGithubReadiness.success.enabled &&
+            capturedGithubReadiness.success.state === "ready" &&
+            capturedOperator?._tag === "Success" &&
+            capturedOperator.success?.automaticStablePromotion === true &&
+            capturedOperator.success.validationProfile.sha256.toLowerCase() ===
+              ForkGithubAdapter.validationProfileSha256(profile).toLowerCase() &&
+            expectedInputsPresent
+          ) {
+            const configuration = capturedOperator.success;
+            const targetRepository = `${configuration.target.owner}/${configuration.target.repository}`;
+            const snapshot: AutomaticIntents.AutomaticPromotionSnapshot = {
+              automaticStablePromotion: true,
+              scheduleConfigRevision,
+              targetRepository,
+              targetRepositoryId: configuration.repositoryId,
+              targetBranch: configuration.target.branch,
+              profileSha256: configuration.validationProfile.sha256,
+              policySha256: configuration.gatePolicy.sha256,
+              operatorSnapshotSha256: AutomaticIntents.automaticPromotionOperatorSnapshotSha256({
+                automaticStablePromotion: true,
+                targetRepository,
+                targetRepositoryId: configuration.repositoryId,
+                targetBranch: configuration.target.branch,
+                profileSha256: configuration.validationProfile.sha256,
+                policySha256: configuration.gatePolicy.sha256,
+              }),
+              requestPayloadSha256: payloadSha256,
+              sourceSha: requestInput.expectedSource!.sha,
+              targetTag: requestInput.expectedTarget!.tag,
+              targetSha: requestInput.expectedTarget!.sha,
+            };
+            acceptEffect = automaticIntentRepository.value
+              .acceptScheduled({
+                request: requestInput as Requests.AcceptInput & {
+                  readonly scheduleConfigRevision: number;
+                },
+                snapshot,
+              })
+              .pipe(Effect.map(({ request, created }) => ({ request, created })));
+          }
+          const accepted = yield* acceptEffect.pipe(
+            Effect.tapError((error) =>
+              Effect.logError("Failed to persist accepted compatibility request", {
+                error: errorMessage(error),
+                cause: SqlError.isSqlError(error) ? String(error.reason.cause) : undefined,
+              }),
+            ),
+          );
           if (["queued", "running"].includes(accepted.request.status))
             // A replay returns the same persisted row and is also an explicit redrive.
             yield* Queue.offer(queue, undefined);
@@ -717,6 +819,10 @@ export const makeForkCompatibilityNativeService = (options?: {
         }),
       );
     const accept: ForkCompatibilityNativeServiceShape["accept"] = (input) => acceptRequest(input);
+    const acceptScheduled: ForkCompatibilityNativeServiceShape["acceptScheduled"] = (
+      input,
+      revision,
+    ) => acceptRequest(input, revision);
     const automaticDiscoveryReceipt = yield* Ref.make<{
       readonly configRevision: number;
       readonly deferred: Deferred.Deferred<void, ForkCompatibilityAutomaticDiscoveryError>;
@@ -1218,6 +1324,7 @@ export const makeForkCompatibilityNativeService = (options?: {
     });
     return {
       accept,
+      acceptScheduled,
       get,
       awaitCompletion,
       configureAutomaticChecks,

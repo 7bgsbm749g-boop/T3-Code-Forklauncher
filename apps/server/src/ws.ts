@@ -122,6 +122,7 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ForkCompatibilityNative from "./forkCompatibility/ForkCompatibilityNativeService.ts";
 import * as ForkGithubNative from "./forkGithub/ForkGithubNativeService.ts";
+import * as ForkGithubFollowThrough from "./forkGithub/ForkGithubStableFollowThrough.ts";
 import { validateAllowedRepairPaths } from "./forkCompatibility/ForkCompatibilityRepairEligibility.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
@@ -578,6 +579,9 @@ const makeWsRpcLayer = (
       const forkCompatibility = yield* ForkCompatibilityNative.ForkCompatibilityNativeService;
       const forkGithub = yield* ForkGithubNative.ForkGithubNativeService;
       const forkGithubHandlers = ForkGithubNative.makeForkGithubNativeHandlers(forkGithub);
+      const forkGithubFollowThrough = yield* Effect.serviceOption(
+        ForkGithubFollowThrough.ForkGithubStableFollowThrough,
+      );
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -2701,32 +2705,75 @@ const makeWsRpcLayer = (
         [WS_METHODS.forkCompatibilityScheduleStatus]: () =>
           observeRpcEffect(
             WS_METHODS.forkCompatibilityScheduleStatus,
-            forkCompatibility.getAutomaticCheckStatus().pipe(
-              Effect.mapError((error) => new ForkCompatibilityRpcError({ message: error.message })),
-              Effect.map((status) =>
-                status
-                  ? {
-                      enabled: status.enabled,
-                      sourceDirectory: status.sourceDirectory,
-                      lastStatus: status.lastStatus,
-                      lastDiscoveredTag: status.lastDiscoveredTag,
-                      lastDiscoveredSha: status.lastDiscoveredSha,
-                      lastRequestId: status.lastRequestId,
-                      lastError: status.lastError,
-                      nextDueAt: status.nextDueAt,
-                    }
-                  : {
-                      enabled: false,
-                      sourceDirectory: null,
-                      lastStatus: "inert",
-                      lastDiscoveredTag: null,
-                      lastDiscoveredSha: null,
-                      lastRequestId: null,
-                      lastError: null,
-                      nextDueAt: null,
-                    },
-              ),
-            ),
+            Effect.gen(function* () {
+              const status = yield* forkCompatibility
+                .getAutomaticCheckStatus()
+                .pipe(
+                  Effect.mapError(
+                    (error) => new ForkCompatibilityRpcError({ message: error.message }),
+                  ),
+                );
+              const pipeline =
+                status?.lastRequestId && Option.isSome(forkGithubFollowThrough)
+                  ? yield* forkGithubFollowThrough.value
+                      .statusForRequest(status.lastRequestId)
+                      .pipe(
+                        Effect.mapError(
+                          () =>
+                            new ForkCompatibilityRpcError({
+                              message: "Could not read automatic release pipeline status.",
+                            }),
+                        ),
+                      )
+                  : status?.lastRequestId
+                    ? {
+                        status: "unavailable" as const,
+                        stage: null,
+                        candidateVersion: null,
+                        workflowRunId: null,
+                        artifactId: null,
+                        draftTag: null,
+                        diagnostic: "service-unavailable" as const,
+                        release: "none" as const,
+                        published: false as const,
+                        installed: false as const,
+                      }
+                    : {
+                        status: "not-started" as const,
+                        stage: null,
+                        candidateVersion: null,
+                        workflowRunId: null,
+                        artifactId: null,
+                        draftTag: null,
+                        diagnostic: "not-automatic" as const,
+                        release: "none" as const,
+                        published: false as const,
+                        installed: false as const,
+                      };
+              return status
+                ? {
+                    enabled: status.enabled,
+                    sourceDirectory: status.sourceDirectory,
+                    lastStatus: status.lastStatus,
+                    lastDiscoveredTag: status.lastDiscoveredTag,
+                    lastDiscoveredSha: status.lastDiscoveredSha,
+                    lastRequestId: status.lastRequestId,
+                    lastError: status.lastError,
+                    nextDueAt: status.nextDueAt,
+                    pipeline,
+                  }
+                : {
+                    enabled: false,
+                    sourceDirectory: null,
+                    lastStatus: "inert",
+                    lastDiscoveredTag: null,
+                    lastDiscoveredSha: null,
+                    lastRequestId: null,
+                    lastError: null,
+                    nextDueAt: null,
+                    pipeline,
+                  };
+            }),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.forkGithubConfigure]: (input) =>

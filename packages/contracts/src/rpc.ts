@@ -14,6 +14,7 @@ import {
   ForkGithubDraftCommand,
   ForkGithubNativeError,
   ForkGithubOperation,
+  ForkGithubPipelineStatus,
   ForkGithubPromotionCommand,
 } from "./forkGithub.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -644,6 +645,7 @@ const WsForkCompatibilityScheduleStatusRpc = Rpc.make(WS_METHODS.forkCompatibili
     lastRequestId: Schema.NullOr(Schema.String),
     lastError: Schema.NullOr(Schema.String),
     nextDueAt: Schema.NullOr(Schema.String),
+    pipeline: ForkGithubPipelineStatus,
   }),
   error: Schema.Union([ForkCompatibilityRpcError, EnvironmentAuthorizationError]),
 });

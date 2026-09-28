@@ -17,6 +17,7 @@ const target = "b".repeat(40);
 const profile = "d".repeat(64);
 const workflowCommit = "e".repeat(40);
 const workflowDefinition = "f".repeat(64);
+const dispatchRequestId = `fork-candidate-v1-${"9".repeat(64)}`;
 
 const fixture = () => {
   const linux = new TextEncoder().encode("linux");
@@ -59,6 +60,7 @@ const fixture = () => {
       workflowCommitSha: workflowCommit,
       workflowDefinitionSha256: workflowDefinition,
       validationProfileSha256: profile,
+      dispatchRequestId,
       assets: [
         {
           group: "linux-cli-server",
@@ -132,6 +134,7 @@ const fixture = () => {
     runStatus: "completed",
     runConclusion: "success",
     runHeadSha: workflowCommit,
+    dispatchRequestId,
     artifactId: "5678",
     expired: false,
     artifactSize: 1024,
@@ -152,15 +155,32 @@ const identity = {
   stableTag: "v0.0.42",
   profileSha256: profile,
   releaseRepository: "7bgsbm749g-boop/T3-Code-Forklauncher",
+  dispatchRequestId,
 };
 
 it("verifies exact workflow/artifact identity, profile, version record and all file hashes", () => {
   const { snapshot: artifact } = fixture();
   assert.equal(verifyCandidateArtifact(artifact, identity).candidateVersion, "0.0.43-fork.1");
+  const fixedControl = {
+    ...artifact,
+    workflowRef: "refs/tags/forklauncher-control-v1",
+    manifest: {
+      ...(artifact.manifest as Record<string, unknown>),
+      build: {
+        ...(artifact.manifest as { build: Record<string, unknown> }).build,
+        workflowRef: "refs/tags/forklauncher-control-v1",
+      },
+    },
+  };
+  assert.equal(
+    verifyCandidateArtifact(fixedControl, identity).build.workflowRef,
+    "refs/tags/forklauncher-control-v1",
+  );
   for (const bad of [
     { ...artifact, expired: true },
     { ...artifact, runHeadSha: source },
     { ...artifact, workflowRef: "refs/heads/untrusted" },
+    { ...artifact, dispatchRequestId: `fork-candidate-v1-${"8".repeat(64)}` },
     { ...artifact, artifactId: "other" },
     { ...artifact, sha256Sums: artifact.sha256Sums.replace(/^[0-9a-f]{64}/, "e".repeat(64)) },
     (() => {

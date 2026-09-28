@@ -47,6 +47,7 @@ import {
   MIN_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
 } from "@t3tools/contracts";
 import { supportsSharedSettingsSync } from "@t3tools/client-runtime/state/shared-settings";
+import { describeForkGithubPipeline } from "@t3tools/client-runtime/state/fork-github-pipeline";
 import { useThreadListV2Enabled } from "../threads/use-thread-list-v2-enabled";
 import {
   type AppUpdateCheckState,
@@ -645,8 +646,11 @@ function ForkCompatibilitySettingsRows() {
     : null;
   const connectionPhase = environment?.connection.phase ?? "disconnected";
   const statusIdentity = JSON.stringify([environmentId, requestId, connectionPhase]);
+  const scheduleIdentity = JSON.stringify([environmentId, connectionPhase]);
   const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
   const statusToken = statusEpoch.update(statusIdentity);
+  const scheduleEpoch = useRef(new IdentityEpoch(scheduleIdentity)).current;
+  const scheduleToken = scheduleEpoch.update(scheduleIdentity);
   const preferencesRef = useRef(preferences);
   preferencesRef.current = preferences;
   const [directoryDraft, setDirectoryDraft] = useState<{
@@ -658,11 +662,11 @@ function ForkCompatibilitySettingsRows() {
   const automaticStableChecks =
     environment?.serverConfig?.settings.forkCompatibility.automaticStableChecks ?? false;
   const [scheduleStatusEntry, setScheduleStatusEntry] = useState<{
-    readonly environmentId: string;
-    readonly result: Awaited<ReturnType<typeof readScheduleStatus>>;
+    readonly token: IdentityToken;
+    readonly result: Awaited<ReturnType<typeof readScheduleStatus>> | null;
   } | null>(null);
   const scheduleStatus =
-    connectionPhase === "connected" && scheduleStatusEntry?.environmentId === environmentId
+    connectionPhase === "connected" && scheduleStatusEntry?.token === scheduleToken
       ? scheduleStatusEntry.result
       : null;
   const configuredRepair = environment?.serverConfig?.settings.forkCompatibility.repair;
@@ -721,6 +725,24 @@ function ForkCompatibilitySettingsRows() {
   const finishBusy = useCallback((token: IdentityToken) => {
     setBusyEntry((current) => (current === token ? null : current));
   }, []);
+  const refreshScheduleStatus = useCallback(async () => {
+    const token = scheduleToken;
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId || connectionPhase !== "connected") return;
+    try {
+      const result = await readScheduleStatus({ environmentId: targetEnvironmentId, input: {} });
+      if (scheduleEpoch.isCurrent(token)) setScheduleStatusEntry({ token, result });
+    } catch {
+      if (scheduleEpoch.isCurrent(token)) setScheduleStatusEntry({ token, result: null });
+    }
+  }, [
+    connectionPhase,
+    environmentId,
+    readScheduleStatus,
+    scheduleEpoch,
+    scheduleToken,
+    setScheduleStatusEntry,
+  ]);
   const refresh = useCallback(
     async (includeEvidence = false) => {
       const token = statusToken;
@@ -771,16 +793,8 @@ function ForkCompatibilitySettingsRows() {
   }, [environment?.connection.phase, refresh, requestId]);
 
   useEffect(() => {
-    let current = true;
-    if (environmentId && environment?.connection.phase === "connected") {
-      void readScheduleStatus({ environmentId, input: {} }).then((result) => {
-        if (current) setScheduleStatusEntry({ environmentId, result });
-      });
-    }
-    return () => {
-      current = false;
-    };
-  }, [environmentId, environment?.connection.phase, readScheduleStatus]);
+    void refreshScheduleStatus();
+  }, [refreshScheduleStatus]);
 
   if (!environmentId || !environment?.serverConfig) {
     return (
@@ -973,7 +987,7 @@ function ForkCompatibilitySettingsRows() {
       <SettingsSwitchRow
         icon="clock"
         label="Automatic stable checks"
-        subtitle="Discover official stable releases at startup and about every six hours. This only validates an isolated candidate; it never installs."
+        subtitle="Discover official stable releases at startup and about every six hours. The server operator may separately enable promotion and draft preparation; releases are never published or installed automatically."
         value={automaticStableChecks}
         disabled={busy || !configured}
         onValueChange={(enabled) => {
@@ -983,14 +997,7 @@ function ForkCompatibilitySettingsRows() {
             environmentId: targetEnvironmentId,
             input: { sourceDirectory: configuredDirectory, automaticStableChecks: enabled },
           }).then((result) => {
-            if (result._tag === "Success")
-              void readScheduleStatus({ environmentId: targetEnvironmentId, input: {} }).then(
-                (scheduleResult) =>
-                  setScheduleStatusEntry({
-                    environmentId: targetEnvironmentId,
-                    result: scheduleResult,
-                  }),
-              );
+            if (result._tag === "Success") void refreshScheduleStatus();
             else
               setOperationError({
                 token: operationToken,
@@ -1004,6 +1011,11 @@ function ForkCompatibilitySettingsRows() {
           ? `${scheduleStatus.value.lastStatus}${scheduleStatus.value.lastDiscoveredTag ? ` · ${scheduleStatus.value.lastDiscoveredTag}` : ""}${scheduleStatus.value.lastError ? ` · ${scheduleStatus.value.lastError}` : ""}${scheduleStatus.value.nextDueAt ? ` · next ${scheduleStatus.value.nextDueAt}` : ""}`
           : "Automatic discovery status unavailable while disconnected."}
       </Text>
+      {scheduleStatus?._tag === "Success" ? (
+        <Text selectable className="px-4 pb-2 text-xs text-foreground-muted">
+          Automatic release pipeline: {describeForkGithubPipeline(scheduleStatus.value.pipeline)}
+        </Text>
+      ) : null}
       <SettingsSwitchRow
         icon="wrench.and.screwdriver"
         label="Optional compatibility repair"
@@ -1077,8 +1089,15 @@ function ForkCompatibilitySettingsRows() {
               ? "No check request has been recorded on this device."
               : (visibleStatus?.error ?? "Request accepted; status has not been refreshed yet.")}
         </Text>
-        {requestId ? (
-          <Pressable accessibilityRole="button" disabled={busy} onPress={() => void refresh()}>
+        {requestId || (scheduleStatus?._tag === "Success" && scheduleStatus.value.lastRequestId) ? (
+          <Pressable
+            accessibilityRole="button"
+            disabled={busy}
+            onPress={() => {
+              void refreshScheduleStatus();
+              if (requestId) void refresh();
+            }}
+          >
             <Text className="text-sm text-foreground">Refresh</Text>
           </Pressable>
         ) : null}

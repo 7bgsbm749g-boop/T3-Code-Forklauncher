@@ -30,6 +30,7 @@ const OperatorFileSchema = Schema.Struct({
   }),
   nativeAppId: Schema.Finite,
   directPushBypass: Schema.Boolean,
+  automaticStablePromotion: Schema.optional(Schema.Boolean),
   validationProfile: ValidationProfileSchema,
   requiredChecks: Schema.Array(RequiredCheckSchema),
   candidateWorkflow: Schema.Struct({
@@ -37,7 +38,7 @@ const OperatorFileSchema = Schema.Struct({
     repositoryId: Schema.Finite,
     workflowId: Schema.Finite,
     workflowPath: Schema.Literal(".github/workflows/fork-candidate.yml"),
-    workflowRef: Schema.Literal("refs/heads/forklauncher"),
+    workflowRef: Schema.Literals(["refs/heads/forklauncher", "refs/tags/forklauncher-control-v1"]),
     workflowCommitSha: Schema.String,
     workflowFiles: Schema.Array(WorkflowFileSchema),
   }),
@@ -50,6 +51,7 @@ export interface ForkGithubOperatorConfiguration {
   readonly target: Promotion.StablePromotionTarget;
   readonly repositoryId: number;
   readonly nativeAppId: number;
+  readonly automaticStablePromotion: boolean;
   readonly validationProfile: Github.TrustedValidationProfileWithHash;
   readonly gatePolicy: Github.ForkGithubGatePolicySnapshot;
   readonly workflow: Artifacts.TrustedCandidateWorkflow;
@@ -223,6 +225,7 @@ const validateAndBuild = (
     branch: value.target.branch,
     directPushBypass: false,
     nativeAppId: value.nativeAppId,
+    automaticStablePromotion: value.automaticStablePromotion === true,
     profileSha256: profileWithHash.sha256,
     requiredChecks: [...requiredChecks].toSorted(
       (left, right) => left.name.localeCompare(right.name) || left.appId - right.appId,
@@ -258,6 +261,7 @@ const validateAndBuild = (
     },
     repositoryId: value.target.repositoryId,
     nativeAppId: value.nativeAppId,
+    automaticStablePromotion: value.automaticStablePromotion === true,
     validationProfile: profileWithHash,
     gatePolicy: policy,
     workflow,
@@ -278,6 +282,7 @@ export const generateForkGithubOperatorConfig = (
     },
     nativeAppId: input.nativeAppId,
     directPushBypass: false,
+    automaticStablePromotion: false,
     validationProfile: SERVER_VALIDATION_PROFILE,
     requiredChecks: [
       {
@@ -290,7 +295,7 @@ export const generateForkGithubOperatorConfig = (
       repositoryId: input.repositoryId,
       workflowId: input.workflowId,
       workflowPath: ".github/workflows/fork-candidate.yml",
-      workflowRef: "refs/heads/forklauncher",
+      workflowRef: Artifacts.forkCandidateControlRef,
       workflowCommitSha: input.workflowCommitSha,
       workflowFiles: input.workflowFiles.map(({ path, sha256 }) => ({ path, sha256 })),
     },
@@ -307,9 +312,7 @@ export const makeForkGithubOperatorConfigurationLayer = (path: string | undefine
       const selectedPath = path.trim();
       const parsed = yield* Effect.gen(function* () {
         if (!isAbsoluteConfigPath(selectedPath))
-          return yield* Effect.fail(
-            invalid("T3CODE_FORK_GITHUB_CONFIG must select an absolute local file"),
-          );
+          return yield* invalid("T3CODE_FORK_GITHUB_CONFIG must select an absolute local file");
         const raw = yield* readBoundedConfig(selectedPath);
         const value = yield* decodeOperatorFile(raw).pipe(
           Effect.mapError(() => invalid("Selected fork GitHub config JSON/schema is invalid")),
@@ -366,5 +369,5 @@ export const makeForkGithubOperatorConfigurationLayer = (path: string | undefine
       }),
     ),
   );
-  return Layer.mergeAll(config, profile, policy, target, workflow);
+  return Layer.mergeAll(profile, policy, target, workflow).pipe(Layer.provideMerge(config));
 };

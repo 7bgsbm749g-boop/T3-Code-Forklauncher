@@ -1,4 +1,5 @@
 import * as Layer from "effect/Layer";
+import * as Effect from "effect/Effect";
 import { ForkGithubCredentialResolverFromSecretStore } from "./ForkGithubAdapter.ts";
 import { ForkGithubDurableActionStoreLive } from "./ForkGithubActionRepository.ts";
 import { ForkGithubAdapterLive, ForkGithubRefUpdateTransportLive } from "./ForkGithubAdapter.ts";
@@ -11,10 +12,17 @@ import {
 import { ForkGithubReleaseRepositoryLive } from "./ForkGithubReleaseRepository.ts";
 import {
   ForkGithubCandidateArtifactSourceLive,
-  type ForkGithubCandidateWorkflowTrust,
+  ForkGithubCandidateWorkflowTrust,
 } from "./ForkGithubCandidateArtifactSource.ts";
 import { ForkGithubNativeServiceLive } from "./ForkGithubNativeService.ts";
-import { makeForkGithubOperatorConfigurationLayer } from "./ForkGithubOperatorConfiguration.ts";
+import {
+  ForkGithubOperatorConfigurationService,
+  makeForkGithubOperatorConfigurationLayer,
+} from "./ForkGithubOperatorConfiguration.ts";
+import { ForkGithubGatePolicy, ForkGithubValidationProfile } from "./ForkGithubAdapter.ts";
+import { ForkGithubStablePromotionTarget } from "./ForkGithubStablePromotion.ts";
+import * as CandidateBuildRepository from "./ForkGithubCandidateBuildRepository.ts";
+import * as CandidateBuild from "./ForkGithubCandidateBuildService.ts";
 
 /**
  * Production backing for the adapter. Native startup supplies this layer with its trusted
@@ -46,6 +54,15 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
     import("./ForkGithubAdapter.ts").ForkGithubAdapterError,
     R
   >,
+  operator: Layer.Layer<
+    | ForkGithubOperatorConfigurationService
+    | ForkGithubGatePolicy
+    | ForkGithubValidationProfile
+    | ForkGithubStablePromotionTarget
+    | ForkGithubCandidateWorkflowTrust,
+    never,
+    R
+  >,
 ) => {
   const adapter = ForkGithubAdapterWithNativeBackingLive.pipe(
     Layer.provideMerge(ForkGithubCredentialResolverFromSecretStore),
@@ -63,7 +80,45 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
   const promotion = ForkGithubStablePromotionWithNativeBackingLive.pipe(
     Layer.provideMerge(ForkGithubCredentialResolverFromSecretStore),
   );
-  return ForkGithubNativeServiceLive.pipe(Layer.provideMerge(promotion), Layer.provideMerge(draft));
+  const native = ForkGithubNativeServiceLive.pipe(
+    Layer.provideMerge(promotion),
+    Layer.provideMerge(draft),
+  );
+  const candidateBuild = CandidateBuild.ForkGithubCandidateBuildServiceLive.pipe(
+    Layer.provideMerge(CandidateBuildRepository.ForkGithubCandidateBuildRepositoryLive),
+    Layer.provideMerge(native),
+    Layer.provideMerge(promotion),
+    Layer.provideMerge(operator),
+    Layer.provideMerge(artifacts),
+    Layer.provideMerge(adapter),
+  );
+  return Layer.merge(native, candidateBuild);
+};
+
+/** Compose the operator snapshot once so compatibility intake and GitHub execution share it. */
+export const makeForkGithubNativeServiceFromOperatorConfiguration = <R>(
+  operator: Layer.Layer<
+    | ForkGithubOperatorConfigurationService
+    | ForkGithubGatePolicy
+    | ForkGithubValidationProfile
+    | ForkGithubStablePromotionTarget
+    | ForkGithubCandidateWorkflowTrust,
+    never,
+    R
+  >,
+) => {
+  const trust = Layer.effect(
+    ForkGithubCandidateWorkflowTrust,
+    Effect.gen(function* () {
+      const configuration = yield* ForkGithubOperatorConfigurationService;
+      return {
+        get: () => configuration.get().pipe(Effect.map((value) => value?.workflow)),
+      };
+    }),
+  ).pipe(Layer.provide(operator));
+  return makeForkGithubNativeServiceWithNativeBacking(trust, operator).pipe(
+    Layer.provideMerge(operator),
+  );
 };
 
 /**
@@ -72,5 +127,5 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
  */
 export const makeForkGithubNativeServiceFromOperatorConfig = (path: string | undefined) => {
   const operator = makeForkGithubOperatorConfigurationLayer(path);
-  return makeForkGithubNativeServiceWithNativeBacking(operator).pipe(Layer.provideMerge(operator));
+  return makeForkGithubNativeServiceFromOperatorConfiguration(operator);
 };

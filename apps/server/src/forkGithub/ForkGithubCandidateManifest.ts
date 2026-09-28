@@ -22,10 +22,11 @@ export interface CandidateManifestV2 {
   };
   readonly build: {
     readonly workflowRunId: string;
-    readonly workflowRef: "refs/heads/forklauncher";
+    readonly workflowRef: "refs/heads/forklauncher" | "refs/tags/forklauncher-control-v1";
     readonly workflowCommitSha: string;
     readonly workflowDefinitionSha256: string;
     readonly validationProfileSha256: string;
+    readonly dispatchRequestId: string;
     readonly assets: ReadonlyArray<CandidateManifestAsset>;
   };
 }
@@ -43,6 +44,7 @@ export interface CandidateArtifactSnapshot {
   readonly runStatus: string;
   readonly runConclusion: string | null;
   readonly runHeadSha: string;
+  readonly dispatchRequestId: string;
   readonly artifactId: string;
   readonly expired: boolean;
   readonly artifactSize: number;
@@ -64,6 +66,7 @@ export interface CandidateArtifactIdentity {
   readonly stableTag: string;
   readonly profileSha256: string;
   readonly releaseRepository: string;
+  readonly dispatchRequestId: string;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -72,6 +75,8 @@ const isSha = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
 const isDigest = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
+const isControlRef = (value: unknown): value is CandidateManifestV2["build"]["workflowRef"] =>
+  value === "refs/heads/forklauncher" || value === "refs/tags/forklauncher-control-v1";
 
 /** Validates the v2 manifest emitted by fork-candidate-metadata.mjs without trusting its claims. */
 export const verifyCandidateArtifact = (
@@ -85,7 +90,7 @@ export const verifyCandidateArtifact = (
     !Number.isSafeInteger(artifact.workflowId) ||
     artifact.workflowId < 1 ||
     artifact.workflowPath !== ".github/workflows/fork-candidate.yml" ||
-    artifact.workflowRef !== "refs/heads/forklauncher" ||
+    !isControlRef(artifact.workflowRef) ||
     artifact.event !== "workflow_dispatch" ||
     !isSha(artifact.workflowCommitSha) ||
     !isDigest(artifact.workflowDefinitionSha256) ||
@@ -93,6 +98,7 @@ export const verifyCandidateArtifact = (
     artifact.runStatus !== "completed" ||
     artifact.runConclusion !== "success" ||
     artifact.runHeadSha.toLowerCase() !== artifact.workflowCommitSha.toLowerCase() ||
+    !/^fork-candidate-v1-[0-9a-f]{64}$/.test(artifact.dispatchRequestId) ||
     artifact.artifactId !== identity.artifactId ||
     artifact.expired
   )
@@ -167,6 +173,10 @@ export const verifyCandidateArtifact = (
       artifact.workflowDefinitionSha256.toLowerCase() ||
     raw.build.validationProfileSha256?.toString().toLowerCase() !==
       identity.profileSha256.toLowerCase() ||
+    raw.build.dispatchRequestId !== artifact.dispatchRequestId ||
+    typeof raw.build.dispatchRequestId !== "string" ||
+    !/^fork-candidate-v1-[0-9a-f]{64}$/.test(raw.build.dispatchRequestId) ||
+    !isControlRef(raw.build.workflowRef) ||
     !Array.isArray(raw.build.assets)
   )
     throw new Error("candidate build provenance does not match the native validation profile");

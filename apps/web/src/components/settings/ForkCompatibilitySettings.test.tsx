@@ -20,6 +20,7 @@ const state = vi.hoisted(() => ({
   commands: [] as Array<{ command: string; environmentId: string; input: unknown }>,
   storage: new Map<string, unknown>(),
   statusWaiters: new Map<string, () => Promise<unknown>>(),
+  scheduleWaiters: new Map<string, () => Promise<unknown>>(),
   configureWaiter: null as (() => Promise<unknown>) | null,
   checkHandler: null as ((input: { idempotencyKey: string }) => Promise<unknown>) | null,
   idCounter: 0,
@@ -55,6 +56,7 @@ vi.mock("../../state/server", () => ({
     forkCompatibilityConfigure: "configure",
     forkCompatibilityCheck: "check",
     forkCompatibilityStatus: "status",
+    forkCompatibilityScheduleStatus: "schedule-status",
   },
 }));
 vi.mock("../../state/use-atom-command", async () => {
@@ -88,6 +90,35 @@ vi.mock("../../state/use-atom-command", async () => {
                   error: null,
                 },
                 ...(input.includeEvidence ? { evidence: { checks: [{ stdout: "passed" }] } } : {}),
+              },
+            };
+          }
+          if (command === "schedule-status") {
+            const waiter = state.scheduleWaiters.get(target.environmentId);
+            if (waiter) return await waiter();
+            return {
+              _tag: "Success",
+              value: {
+                enabled: true,
+                sourceDirectory: "/srv/fork",
+                lastStatus: "request-completed",
+                lastDiscoveredTag: "v0.0.44",
+                lastDiscoveredSha: "a".repeat(40),
+                lastRequestId: "scheduled-request",
+                lastError: null,
+                nextDueAt: null,
+                pipeline: {
+                  status: "build-pending",
+                  stage: "build",
+                  candidateVersion: "0.0.45-fork.test",
+                  workflowRunId: null,
+                  artifactId: null,
+                  draftTag: null,
+                  diagnostic: null,
+                  release: "none",
+                  published: false,
+                  installed: false,
+                },
               },
             };
           }
@@ -208,6 +239,7 @@ beforeEach(() => {
   state.commands = [];
   state.storage.clear();
   state.statusWaiters.clear();
+  state.scheduleWaiters.clear();
   state.configureWaiter = null;
   state.checkHandler = null;
   state.idCounter = 0;
@@ -220,6 +252,67 @@ afterEach(() => {
 });
 
 describe("ForkCompatibilitySettings", () => {
+  it("shows the scheduled build stage and drops a delayed response from another server", async () => {
+    const oldStatus = deferred<unknown>();
+    const selectedStatus = deferred<unknown>();
+    state.scheduleWaiters.set("server-1", () => oldStatus.promise);
+    state.scheduleWaiters.set("server-2", () => selectedStatus.promise);
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    state.selectedEnvironment = "server-2";
+    await act(async () => {
+      renderer!.update(<ForkCompatibilitySettings />);
+    });
+    const pipelineResult = (candidateVersion: string) => ({
+      _tag: "Success",
+      value: {
+        enabled: true,
+        sourceDirectory: "/srv/fork",
+        lastStatus: "request-completed",
+        lastDiscoveredTag: "v0.0.44",
+        lastDiscoveredSha: "a".repeat(40),
+        lastRequestId: "scheduled-request",
+        lastError: null,
+        nextDueAt: null,
+        pipeline: {
+          status: "build-pending",
+          stage: "build",
+          candidateVersion,
+          workflowRunId: null,
+          artifactId: null,
+          draftTag: null,
+          diagnostic: null,
+          release: "none",
+          published: false,
+          installed: false,
+        },
+      },
+    });
+    await act(async () => {
+      selectedStatus.resolve(pipelineResult("0.0.45-fork.server-2"));
+      await selectedStatus.promise;
+    });
+    expect(
+      renderer!.root
+        .findAllByType("p")
+        .some((node) => JSON.stringify(node.children).includes("0.0.45-fork.server-2")),
+    ).toBe(true);
+    await act(async () => {
+      oldStatus.resolve(pipelineResult("0.0.45-fork.server-1"));
+      await oldStatus.promise;
+    });
+    const displayed = renderer!.root
+      .findAllByType("p")
+      .map((node) => JSON.stringify(node.children));
+    expect(displayed.some((value) => value.includes("server-2"))).toBe(true);
+    expect(displayed.some((value) => value.includes("server-1"))).toBe(false);
+    expect(state.commands.filter((entry) => entry.command === "schedule-status")).toHaveLength(2);
+    expect(
+      state.commands.some((entry) => entry.command === "configure" || entry.command === "check"),
+    ).toBe(false);
+  });
+
   it("saves explicit repair intent, path scope, and bounded attempts over native configure RPC", async () => {
     await act(async () => {
       renderer = create(<ForkCompatibilitySettings />);

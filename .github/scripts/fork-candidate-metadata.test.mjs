@@ -76,6 +76,7 @@ function validBuild() {
     workflowCommitSha: "e".repeat(40),
     workflowDefinitionSha256: "f".repeat(64),
     validationProfileSha256: "a".repeat(64),
+    dispatchRequestId: `fork-candidate-v1-${"b".repeat(64)}`,
     assets: [
       {
         group: "linux-cli-server",

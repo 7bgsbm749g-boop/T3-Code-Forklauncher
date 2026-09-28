@@ -73,6 +73,9 @@ import Migration0056 from "./Migrations/056_ForkGithubActions.ts";
 import Migration0057 from "./Migrations/057_ForkCompatibilitySchedule.ts";
 import Migration0058 from "./Migrations/058_ForkCompatibilityScheduleGeneration.ts";
 import Migration0059 from "./Migrations/059_ForkGithubActionsBackfill.ts";
+import Migration0060 from "./Migrations/060_ForkGithubPullRequestEvidence.ts";
+import Migration0061 from "./Migrations/061_ForkGithubAutomaticPromotionIntents.ts";
+import Migration0062 from "./Migrations/062_ForkGithubCandidateBuilds.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -144,6 +147,9 @@ const migrationEntries = [
   [57, "ForkCompatibilitySchedule", Migration0057],
   [58, "ForkCompatibilityScheduleGeneration", Migration0058],
   [59, "ForkGithubActionsBackfill", Migration0059],
+  [60, "ForkGithubPullRequestEvidence", Migration0060],
+  [61, "ForkGithubAutomaticPromotionIntents", Migration0061],
+  [62, "ForkGithubCandidateBuilds", Migration0062],
 ] as const satisfies ReadonlyArray<MigrationEntry>;
 
 type MigrationEntry = readonly [number, string, typeof Migration0056];
@@ -230,6 +236,13 @@ const forkRequiredObjects: Readonly<Record<number, ReadonlyArray<string>>> = {
     "idx_fork_github_release_lease",
     "idx_fork_github_native_operations_state",
   ],
+  60: ["fork_github_pr_evidence", "idx_fork_github_pr_evidence_status"],
+  61: [
+    "fork_github_automatic_promotion_intents",
+    "idx_fork_github_auto_promotion_state",
+    "fork_github_automatic_promotion_runtime_policy",
+  ],
+  62: ["fork_github_candidate_builds", "idx_fork_github_candidate_build_state"],
 };
 
 const forkRequiredColumns: Readonly<
@@ -295,6 +308,45 @@ const forkRequiredColumns: Readonly<
   59: {
     fork_github_native_operations: ["operation_id", "kind", "fingerprint", "state"],
   },
+  60: {
+    fork_github_pr_evidence: [
+      "request_id",
+      "evidence_fingerprint",
+      "snapshot_json",
+      "profile_json",
+      "profile_sha256",
+      "status",
+      "evidence_json",
+    ],
+  },
+  61: {
+    fork_github_automatic_promotion_intents: [
+      "request_id",
+      "fingerprint",
+      "operator_snapshot_sha256",
+      "schedule_config_revision",
+      "snapshot_json",
+      "state",
+      "operation_id",
+    ],
+    fork_github_automatic_promotion_runtime_policy: [
+      "id",
+      "operator_snapshot_sha256",
+      "updated_at",
+    ],
+  },
+  62: {
+    fork_github_candidate_builds: [
+      "request_id",
+      "fingerprint",
+      "promotion_operation_id",
+      "snapshot_json",
+      "candidate_version",
+      "state",
+      "workflow_run_id",
+      "artifact_id",
+    ],
+  },
 };
 
 // Released fork builds before migration 056 registered 057/058 directly after
@@ -312,6 +364,12 @@ const knownForkHistories: ReadonlyArray<ReadonlyArray<number>> = [
   [53, 54, 55, 57],
   [53, 54, 55, 57, 58],
   [53, 54, 55, 57, 58, 59],
+  [53, 54, 55, 56, 57, 58, 59, 60],
+  [53, 54, 55, 57, 58, 59, 60],
+  [53, 54, 55, 56, 57, 58, 59, 60, 61],
+  [53, 54, 55, 57, 58, 59, 60, 61],
+  [53, 54, 55, 56, 57, 58, 59, 60, 61, 62],
+  [53, 54, 55, 57, 58, 59, 60, 61, 62],
 ];
 
 export class MigrationLineageError extends Schema.TaggedError<MigrationLineageError>()(
