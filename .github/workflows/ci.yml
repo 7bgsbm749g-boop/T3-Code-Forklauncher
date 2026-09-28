@@ -313,7 +313,7 @@ jobs:
           # Sources scripts/mobile-native-static-check.ts lints, plus the tool
           # and rule configuration that decides how it lints them, plus the
           # root package.json that defines the lint:mobile command.
-          pattern='^apps/mobile/.*\.(swift|kt|kts)$|^apps/mobile/(\.swiftlint\.yml|detekt\.yml|\.editorconfig|Brewfile)$|^scripts/mobile-native-static-check\.ts$|^package\.json$|^\.github/workflows/ci\.yml$'
+          pattern='^apps/mobile/.*\.(swift|kt|kts)$|^apps/mobile/(\.swiftlint\.yml|detekt\.yml|\.editorconfig|Brewfile)$|^scripts/mobile-native-static-check\.ts$|^apps/server/vite\.config\.ts$|^package\.json$|^\.github/workflows/ci\.yml$'
 
           if grep -qE "$pattern" <<< "$paths"; then
             echo "Native sources or lint configuration changed:"

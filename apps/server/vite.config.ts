@@ -3,7 +3,11 @@ import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
-import { resolveCliReleaseBuildRepository } from "@t3tools/shared/cliRelease";
+// Vite+ loads this config while building the root task graph, including in
+// filtered installs that do not link apps/server's workspace dependencies.
+// Import the source entry directly so config evaluation does not depend on the
+// package symlink being present under apps/server/node_modules.
+import { resolveCliReleaseBuildRepository } from "../../packages/shared/src/cliRelease.ts";
 import packageJson from "./package.json" with { type: "json" };
 
 // The bundle used to inline only workspace packages, leaving every third-party
