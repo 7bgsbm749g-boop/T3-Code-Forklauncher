@@ -50,13 +50,14 @@ const configuredTools = (): Storage.ForkGithubCandidateStorageConfig["tools"] | 
 const makeConfig = (
   root: string,
   tools = configuredTools(),
+  fuseRuntimeLibraryDirectory = NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_LD_LIBRARY_PATH ??
+    "/usr/lib/x86_64-linux-gnu",
 ): Storage.ForkGithubCandidateStorageConfig => ({
   rootDirectory: root,
   imageBytes,
   inodeLimit,
   hostFreeReserveBytes: Storage.MIN_HOST_FREE_RESERVE_BYTES,
-  fuseRuntimeLibraryDirectory:
-    NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_LD_LIBRARY_PATH ?? "/usr/lib/x86_64-linux-gnu",
+  fuseRuntimeLibraryDirectory,
   tools: tools ?? {
     fuse2fs: "/usr/bin/fuse2fs",
     fallocate: "/usr/bin/fallocate",
@@ -116,17 +117,16 @@ it.effect(
     Effect.gen(function* () {
       const root = rootDirectory("/tmp");
       try {
+        const inertTools = {
+          fuse2fs: NodeProcess.execPath,
+          fallocate: NodeProcess.execPath,
+          mke2fs: NodeProcess.execPath,
+          debugfs: NodeProcess.execPath,
+          dumpe2fs: NodeProcess.execPath,
+          fusermount3: NodeProcess.execPath,
+        };
         const result = yield* withLease(
-          Storage.makeForkGithubCandidateStorage(
-            makeConfig(root, {
-              fuse2fs: "/usr/bin/bwrap",
-              fallocate: "/usr/bin/bwrap",
-              mke2fs: "/usr/bin/bwrap",
-              debugfs: "/usr/bin/bwrap",
-              dumpe2fs: "/usr/bin/bwrap",
-              fusermount3: "/usr/bin/bwrap",
-            }),
-          ),
+          Storage.makeForkGithubCandidateStorage(makeConfig(root, inertTools, root)),
           () => Effect.void,
         ).pipe(Effect.result);
         assert.equal(result._tag, "Failure");
@@ -163,15 +163,15 @@ it.effect("rejects a second service instance while a durable live-owner marker e
         mode: 0o600,
       });
       const tools = {
-        fuse2fs: "/usr/bin/bwrap",
-        fallocate: "/usr/bin/bwrap",
-        mke2fs: "/usr/bin/bwrap",
-        debugfs: "/usr/bin/bwrap",
-        dumpe2fs: "/usr/bin/bwrap",
-        fusermount3: "/usr/bin/bwrap",
+        fuse2fs: NodeProcess.execPath,
+        fallocate: NodeProcess.execPath,
+        mke2fs: NodeProcess.execPath,
+        debugfs: NodeProcess.execPath,
+        dumpe2fs: NodeProcess.execPath,
+        fusermount3: NodeProcess.execPath,
       };
       const result = yield* withLease(
-        Storage.makeForkGithubCandidateStorage(makeConfig(root, tools)),
+        Storage.makeForkGithubCandidateStorage(makeConfig(root, tools, root)),
         () => Effect.void,
       ).pipe(Effect.result);
       assert.equal(result._tag, "Failure");
