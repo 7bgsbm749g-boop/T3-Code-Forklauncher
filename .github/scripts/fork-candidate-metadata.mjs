@@ -10,6 +10,7 @@ const versionPattern =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?$/;
 export const candidateWorkflowSourcePaths = [
   ".github/actions/setup-apt-mirrors/action.yml",
+  ".github/scripts/create-candidate-checksums.sh",
   ".github/scripts/fork-candidate-metadata.mjs",
   ".github/scripts/fork-candidate-versions.mjs",
   ".github/workflows/fork-candidate.yml",
