@@ -67,6 +67,8 @@ export interface ClaimForkCompatibilityRunInput extends CompatibilityIdentity {
   readonly candidatePath: string;
   readonly candidateBranch: string;
   readonly attempt: number;
+  readonly initialStatus?: ForkCompatibilityRun["status"];
+  readonly candidateSha?: string | null;
   readonly ownerPid: number;
   readonly ownerToken: string;
   readonly now: string;
@@ -192,13 +194,13 @@ export const makeForkCompatibilityRunRepository = Effect.gen(function* () {
       INSERT INTO fork_compatibility_runs (
         run_id, repository_root, source_sha, source_branch, source_tree_sha256, upstream_remote,
         target_tag, target_sha, profile_id, profile_revision, profile_sha256, profile_json,
-        candidate_path, candidate_branch, attempt, owner_pid, owner_token, status, created_at, updated_at
+        candidate_path, candidate_branch, candidate_sha, attempt, owner_pid, owner_token, status, created_at, updated_at
       ) VALUES (
         ${input.runId}, ${input.repositoryRoot}, ${input.sourceSha}, ${input.sourceBranch},
         ${input.sourceTreeSha256}, ${input.upstreamRemote}, ${input.targetTag}, ${input.targetSha},
         ${input.profileId}, ${input.profileRevision}, ${input.profileSha256}, ${profileJson},
-        ${input.candidatePath}, ${input.candidateBranch}, ${input.attempt}, ${input.ownerPid},
-        ${input.ownerToken}, 'claimed', ${input.now}, ${input.now}
+        ${input.candidatePath}, ${input.candidateBranch}, ${input.candidateSha ?? null}, ${input.attempt}, ${input.ownerPid},
+        ${input.ownerToken}, ${input.initialStatus ?? "claimed"}, ${input.now}, ${input.now}
       ) ON CONFLICT (
         repository_root, source_sha, source_branch, source_tree_sha256, target_tag, target_sha,
         profile_id, profile_revision, profile_sha256, attempt

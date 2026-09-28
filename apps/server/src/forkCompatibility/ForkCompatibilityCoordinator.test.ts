@@ -352,6 +352,71 @@ it.effect("records merge conflicts as terminal failures without moving source HE
   return program.pipe(Effect.ensuring(Effect.sync(() => cleanUpFixture(fixture))));
 });
 
+it.effect("validates a resolved repair commit in a new candidate with fresh pinned checks", () => {
+  const fixture = makeGitFixture(true);
+  const candidateRoot = NodePath.join(fixture.root, "candidates");
+  const profile: ValidationProfile = {
+    id: "repair-check",
+    revision: "1",
+    commands: [
+      {
+        command: NodeProcess.execPath,
+        args: [
+          "-e",
+          "if (!require('fs').readFileSync('README.md', 'utf8').includes('upstream')) process.exit(1)",
+        ],
+        timeoutMs: 10_000,
+      },
+    ],
+  };
+  const program = Effect.gen(function* () {
+    const coordinator = yield* ForkCompatibilityCoordinator;
+    const failed = yield* coordinator.start({
+      repositoryRoot: fixture.repositoryRoot,
+      upstreamRemote: fixture.upstreamRemote,
+      profile,
+    });
+    assert.equal(failed.status, "merge-conflict");
+    const candidatePath = failed.candidatePath;
+    NodeFS.writeFileSync(
+      NodePath.join(candidatePath, "README.md"),
+      "upstream stable update\nfork behavior retained\n",
+    );
+    runGit(candidatePath, ["add", "README.md"]);
+    runGit(candidatePath, ["commit", "-m", "Resolve compatibility merge"]);
+    const repairedSha = runGit(candidatePath, ["rev-parse", "HEAD"]);
+
+    const linkedRunIds: string[] = [];
+    const validated = yield* coordinator.validateRepairedCandidate({
+      baseRunId: failed.runId,
+      repairedSha,
+      onValidationRunLinked: (run) =>
+        Effect.sync(() => {
+          linkedRunIds.push(run.runId);
+        }),
+    });
+    assert.equal(validated.status, "ready");
+    assert.notEqual(validated.runId, failed.runId);
+    assert.equal(validated.candidateSha, repairedSha);
+    assert.equal(validated.evidence?.candidateSha, repairedSha);
+    assert.equal(validated.evidence?.checks.length, profile.commands.length);
+    const duplicateCompletion = yield* coordinator.validateRepairedCandidate({
+      baseRunId: failed.runId,
+      repairedSha,
+      onValidationRunLinked: (run) =>
+        Effect.sync(() => {
+          linkedRunIds.push(run.runId);
+        }),
+    });
+    assert.equal(duplicateCompletion.runId, validated.runId);
+    assert.deepEqual(linkedRunIds, [validated.runId, validated.runId]);
+    assert.equal(NodeFS.readdirSync(candidateRoot).length, 2);
+    assert.equal(runGit(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.sourceSha);
+    assert.equal(runGit(fixture.repositoryRoot, ["branch", "--show-current"]), "forklauncher");
+  }).pipe(Effect.provide(testRuntimeLayer({ fixture, candidateRoot })));
+  return program.pipe(Effect.ensuring(Effect.sync(() => cleanUpFixture(fixture))));
+});
+
 it.effect("keeps failed validation terminal and never certifies a dirty candidate", () => {
   const fixture = makeGitFixture(false);
   const candidateRoot = NodePath.join(fixture.root, "candidates");

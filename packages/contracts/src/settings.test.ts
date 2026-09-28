@@ -25,6 +25,12 @@ describe("ServerSettings default permissions", () => {
     expect(decodeServerSettings({}).forkCompatibility).toEqual({
       sourceDirectory: null,
       validationProfileId: "t3-server-default",
+      repair: {
+        enabled: false,
+        preservedIntent: "Preserve the fork's existing behavior while adapting it to upstream.",
+        maxAttempts: 1,
+        allowedPaths: [],
+      },
     });
     expect(
       decodeServerSettingsPatch({

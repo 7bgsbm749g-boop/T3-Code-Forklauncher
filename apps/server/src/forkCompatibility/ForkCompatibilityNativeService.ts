@@ -9,6 +9,13 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as SqlError from "effect/unstable/sql/SqlError";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
+import {
+  type ForkCompatibilityRepairEligibility,
+  ForkCompatibilityRepairPolicy as RepairPolicySchema,
+  ForkCompatibilityRepairStatus,
+  type ForkCompatibilityRepairPolicy,
+} from "@t3tools/contracts";
 import { ForkCompatibilityError, forkCompatibilityError } from "./ForkCompatibilityError.ts";
 import {
   OFFICIAL_UPSTREAM_REMOTE,
@@ -17,6 +24,16 @@ import {
 } from "./model.ts";
 import * as Coordinator from "./ForkCompatibilityCoordinator.ts";
 import * as Requests from "./ForkCompatibilityRequestRepository.ts";
+import * as RepairRepository from "./ForkCompatibilityRepairRepository.ts";
+import * as Repair from "./ForkCompatibilityRepair.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import {
+  assessRepairEligibility,
+  forkCompatibilityRepairPolicyDigest,
+  isRepairEligibilityBound,
+  parseRawRepairDiff,
+  validateAllowedRepairPaths,
+} from "./ForkCompatibilityRepairEligibility.ts";
 
 export const SERVER_VALIDATION_PROFILE: ValidationProfile = {
   id: "t3-server-default",
@@ -39,10 +56,12 @@ export const SERVER_VALIDATION_PROFILE: ValidationProfile = {
 export interface AcceptCompatibilityInput {
   readonly idempotencyKey: string;
   readonly repositoryRoot: string;
+  readonly repairPolicy?: ForkCompatibilityRepairPolicy;
 }
 type NativeError =
   | ForkCompatibilityError
   | Coordinator.CoordinatorError
+  | Effect.Error<ReturnType<Repair.ForkCompatibilityRepairServiceShape["dispatch"]>>
   | SqlError.SqlError
   | Schema.SchemaError;
 export interface ForkCompatibilityNativeServiceShape {
@@ -59,6 +78,17 @@ export interface ForkCompatibilityNativeServiceShape {
       readonly request: Requests.ForkCompatibilityRequest | null;
       readonly run: ForkCompatibilityRun | null;
       readonly usable: boolean;
+      readonly repair: {
+        readonly attempt: number;
+        readonly maxAttempts: number;
+        readonly baseRunId: string;
+        readonly validatedRunId: string | null;
+        readonly threadId: string;
+        readonly modelSelection: ForkCompatibilityRepairPolicy["modelSelection"];
+        readonly status: typeof ForkCompatibilityRepairStatus.Type;
+        readonly error: string | null;
+        readonly eligibility: ForkCompatibilityRepairEligibility | null;
+      } | null;
     },
     NativeError
   >;
@@ -97,6 +127,7 @@ const SnapshotSchema = Schema.Struct({
       }),
     ),
   }),
+  repairPolicy: RepairPolicySchema,
 });
 const encodeSnapshot = Schema.encodeSync(Schema.fromJsonString(SnapshotSchema));
 
@@ -107,6 +138,11 @@ export const makeForkCompatibilityNativeService = (options?: {
   Effect.gen(function* () {
     const requests = yield* Requests.ForkCompatibilityRequestRepository;
     const coordinator = yield* Coordinator.ForkCompatibilityCoordinator;
+    const repairRepository = yield* Effect.serviceOption(
+      RepairRepository.ForkCompatibilityRepairRepository,
+    );
+    const repairService = yield* Effect.serviceOption(Repair.ForkCompatibilityRepairService);
+    const git = yield* Effect.serviceOption(GitVcsDriver.GitVcsDriver);
     // This queue is only a coalesced wakeup. Accepted requests live in SQLite,
     // so dropping a redundant wake cannot drop work.
     const queue = yield* Queue.dropping<void>(1);
@@ -164,6 +200,228 @@ export const makeForkCompatibilityNativeService = (options?: {
         yield* completeReceipt(requestId);
         return true;
       });
+    const runRepairAttempts = (
+      request: Requests.ForkCompatibilityRequest,
+      baseRun: ForkCompatibilityRun,
+    ) =>
+      Effect.gen(function* () {
+        if (!request.repairPolicy.enabled) return null;
+        if (
+          Option.isNone(repairRepository) ||
+          Option.isNone(repairService) ||
+          Option.isNone(git) ||
+          !request.repairPolicy.modelSelection
+        )
+          return yield* forkCompatibilityError(
+            "Repair request is enabled but the native repair, Git, repository, or explicit provider layer is unavailable.",
+          );
+        const repo = repairRepository.value;
+        const service = repairService.value;
+        const vcs = git.value;
+        const policySha256 = forkCompatibilityRepairPolicyDigest(request.repairPolicy);
+        const allowedRepairPaths = request.repairPolicy.allowedPaths ?? [];
+        let latest = yield* repo.latest(request.requestId);
+        let validated: ForkCompatibilityRun | null = null;
+        const terminalRepairStatuses = new Set([
+          "completed",
+          "review-required",
+          "failed",
+          "refused",
+          "cancelled",
+          "provider-unavailable",
+          "interrupted",
+          "stale",
+        ]);
+        for (let attempt = 1; attempt <= request.repairPolicy.maxAttempts; attempt++) {
+          let row = latest;
+          const newlyDispatched = !row || row.attempt < attempt;
+          if (newlyDispatched) {
+            const head = yield* vcs.resolveCommit({ cwd: baseRun.candidatePath, revision: "HEAD" });
+            row = yield* service.dispatch({
+              requestId: request.requestId,
+              attempt,
+              baseRunId: baseRun.runId,
+              sourceSha: baseRun.sourceSha,
+              targetSha: baseRun.targetSha,
+              sourceProjectId: request.repairPolicy.projectId,
+              sourceThreadId: null,
+              modelSelection: request.repairPolicy.modelSelection,
+              candidatePath: baseRun.candidatePath,
+              candidateBranch: baseRun.candidateBranch,
+              candidateSha: head.commitSha,
+              preservedIntent: request.repairPolicy.preservedIntent,
+              allowedPaths: allowedRepairPaths,
+              now: yield* now,
+            });
+          }
+          if (!row)
+            return yield* forkCompatibilityError(
+              `Repair attempt ${attempt} could not be loaded after dispatch.`,
+            );
+          // A just-dispatched attempt still has a live observer; recover() is
+          // only for work reconstructed by a later worker, where accepted but
+          // unbound provider dispatch is intentionally treated as ambiguous.
+          if (!terminalRepairStatuses.has(row.status)) {
+            if (!newlyDispatched) row = yield* service.recover(request.requestId, row.attempt);
+            if (!terminalRepairStatuses.has(row.status))
+              row = yield* service.awaitOutcome(request.requestId, row.attempt);
+          }
+          if (["interrupted", "cancelled", "provider-unavailable", "stale"].includes(row.status))
+            return null;
+          if (row.status === "completed" || row.status === "review-required") {
+            if (row.validatedRunId) {
+              validated = yield* coordinator.get(row.validatedRunId);
+              if (validated && ["claimed", "merging", "validating"].includes(validated.status)) {
+                yield* coordinator.reconcile();
+                validated =
+                  (yield* coordinator.awaitRun(row.validatedRunId)) ??
+                  (yield* coordinator.get(row.validatedRunId));
+                if (validated && ["claimed", "merging", "validating"].includes(validated.status))
+                  return null;
+              }
+            } else {
+              const head = row.repairedSha
+                ? { commitSha: row.repairedSha }
+                : yield* vcs.resolveCommit({ cwd: row.candidatePath, revision: "HEAD" });
+              const recordedCommit = yield* repo.recordRepairedCommit({
+                requestId: request.requestId,
+                attempt: row.attempt,
+                expectedStatus: row.status,
+                repairedSha: head.commitSha,
+                now: yield* now,
+              });
+              if (!recordedCommit)
+                return yield* forkCompatibilityError(
+                  "Repaired commit identity conflicted with its durable attempt.",
+                );
+              row = (yield* repo.get(request.requestId, row.attempt)) ?? row;
+              validated = yield* coordinator
+                .validateRepairedCandidate({
+                  baseRunId: baseRun.runId,
+                  repairedSha: head.commitSha,
+                  onValidationRunLinked: (validation) =>
+                    repo
+                      .linkValidatedRun({
+                        requestId: request.requestId,
+                        attempt: row!.attempt,
+                        runId: validation.runId,
+                      })
+                      .pipe(
+                        Effect.flatMap((linked) =>
+                          linked
+                            ? Effect.void
+                            : Effect.fail(
+                                forkCompatibilityError(
+                                  "Could not persist repaired validation run identity.",
+                                ),
+                              ),
+                        ),
+                      ),
+                })
+                .pipe(
+                  Effect.catch((error) =>
+                    now.pipe(
+                      Effect.flatMap((timestamp) =>
+                        repo.transition({
+                          requestId: request.requestId,
+                          attempt: row!.attempt,
+                          expected: "completed",
+                          status: "stale",
+                          error: errorMessage(error),
+                          now: timestamp,
+                        }),
+                      ),
+                      Effect.andThen(Effect.fail(error)),
+                    ),
+                  ),
+                );
+              row = (yield* repo.get(request.requestId, attempt)) ?? row;
+            }
+            const freshValidation =
+              validated?.status === "ready" ? yield* coordinator.getUsable(validated.runId) : null;
+            // Each bounded repair attempt may start from the prior attempt's
+            // commit. Bind its eligibility diff to that attempt's exact input.
+            const diffBaseSha = baseRun.status === "merge-conflict" ? null : row.candidateSha;
+            let diff: ReturnType<typeof parseRawRepairDiff> = null;
+            let diffFromSha: string | null = null;
+            let diffToSha: string | null = null;
+            if (diffBaseSha && row.repairedSha) {
+              const diffResult = yield* vcs.execute({
+                operation: "ForkCompatibilityNativeService.repairEligibilityDiff",
+                cwd: row.candidatePath,
+                args: ["diff", "--no-renames", "--raw", "-z", diffBaseSha, row.repairedSha],
+                allowNonZeroExit: true,
+              });
+              if (diffResult.exitCode === 0) {
+                diff = parseRawRepairDiff(diffResult.stdout);
+                diffFromSha = diffBaseSha;
+                diffToSha = row.repairedSha;
+              }
+            }
+            const eligibility = assessRepairEligibility({
+              policy: request.repairPolicy,
+              policySha256,
+              diffBaseSha,
+              diffFromSha,
+              diffToSha,
+              repairedSha: row.repairedSha ?? row.candidateSha,
+              validatedRunId: validated?.runId ?? row.validatedRunId,
+              validationProfileSha256: validated?.profileSha256 ?? null,
+              checksPassed: freshValidation !== null,
+              inputsFresh: freshValidation !== null,
+              diff,
+              assessedAt: yield* now,
+            });
+            const eligibilityRecorded =
+              validated?.runId && row.status === "completed"
+                ? yield* repo.recordEligibility({
+                    requestId: request.requestId,
+                    attempt: row.attempt,
+                    expectedStatus: "completed",
+                    validatedRunId: validated.runId,
+                    eligibility,
+                  })
+                : false;
+            if (validated?.runId && row.status === "completed" && !eligibilityRecorded)
+              return yield* forkCompatibilityError(
+                "Repair eligibility evidence lost its attempt CAS.",
+              );
+            if (freshValidation) {
+              if (eligibility.status === "eligible") return freshValidation;
+              if (row.status === "completed")
+                yield* repo.transition({
+                  requestId: request.requestId,
+                  attempt: row.attempt,
+                  expected: "completed",
+                  status: "review-required",
+                  error: eligibility.reasons.join(" ").slice(0, 4_000),
+                  now: yield* now,
+                });
+              // The checks have produced fresh mechanical evidence. Preserve
+              // that ready run for status while the outer result remains
+              // unusable for promotion because this attempt needs review.
+              return freshValidation;
+            }
+            if (row.status === "completed")
+              yield* repo.transition({
+                requestId: request.requestId,
+                attempt: row.attempt,
+                expected: "completed",
+                status: validated?.status === "stale" ? "stale" : "failed",
+                error: validated?.error ?? "Repaired candidate did not pass fresh validation.",
+                now: yield* now,
+              });
+          }
+          latest = yield* repo.latest(request.requestId);
+          if (
+            latest &&
+            latest.attempt >= attempt &&
+            ["provider-unavailable", "interrupted", "cancelled"].includes(latest.status)
+          )
+            return null;
+        }
+        return validated;
+      });
     const runOwnedRequest = (request: Requests.ForkCompatibilityRequest, ownerToken: string) =>
       Effect.gen(function* () {
         let run = request.runId ? yield* coordinator.get(request.runId) : null;
@@ -209,7 +467,19 @@ export const makeForkCompatibilityNativeService = (options?: {
           );
           return;
         }
-        const usable = run.status === "ready" ? yield* coordinator.getUsable(run.runId) : null;
+        let usable = run.status === "ready" ? yield* coordinator.getUsable(run.runId) : null;
+        if (
+          !usable &&
+          request.repairPolicy.enabled &&
+          ["failed", "merge-conflict"].includes(run.status)
+        ) {
+          const repaired = yield* runRepairAttempts(request, run);
+          if (repaired) {
+            run = repaired;
+            usable =
+              repaired.status === "ready" ? yield* coordinator.getUsable(repaired.runId) : null;
+          }
+        }
         const status = usable
           ? "completed"
           : run.status === "ready" || run.status === "stale"
@@ -324,12 +594,40 @@ export const makeForkCompatibilityNativeService = (options?: {
             return yield* forkCompatibilityError("Invalid idempotency key.");
           const profile = options?.profile ?? SERVER_VALIDATION_PROFILE;
           const upstreamRemote = options?.upstreamRemote ?? OFFICIAL_UPSTREAM_REMOTE;
+          const repairPolicy = input.repairPolicy ?? {
+            enabled: false,
+            preservedIntent: "",
+            maxAttempts: 1,
+            allowedPaths: [],
+            projectId: null,
+            modelSelection: null,
+          };
+          const validatedAllowedPaths = validateAllowedRepairPaths(repairPolicy.allowedPaths ?? []);
+          if (repairPolicy.enabled) {
+            if (!repairPolicy.preservedIntent.trim())
+              return yield* forkCompatibilityError(
+                "Enabled repair requires preserved fork intent.",
+              );
+            if (!repairPolicy.modelSelection?.instanceId || !repairPolicy.modelSelection.model)
+              return yield* forkCompatibilityError(
+                "Enabled repair requires an explicit provider and model.",
+              );
+            if (!validatedAllowedPaths.valid)
+              return yield* forkCompatibilityError(validatedAllowedPaths.reason);
+          }
+          const capturedRepairPolicy = {
+            ...repairPolicy,
+            allowedPaths: validatedAllowedPaths.valid
+              ? [...validatedAllowedPaths.paths]
+              : [...(repairPolicy.allowedPaths ?? [])],
+          };
           const payloadSha256 = NodeCrypto.createHash("sha256")
             .update(
               encodeSnapshot({
                 repositoryRoot: input.repositoryRoot,
                 remote: upstreamRemote,
                 profile,
+                repairPolicy: capturedRepairPolicy,
               }),
             )
             .digest("hex");
@@ -341,6 +639,7 @@ export const makeForkCompatibilityNativeService = (options?: {
               repositoryRoot: input.repositoryRoot,
               upstreamRemote,
               profile,
+              repairPolicy: capturedRepairPolicy,
               now: yield* now,
             })
             .pipe(
@@ -365,20 +664,128 @@ export const makeForkCompatibilityNativeService = (options?: {
       "ForkCompatibilityNativeService.get",
     )(function* (requestId) {
       let request = yield* requests.get(requestId);
-      if (!request || !request.runId) return { request, run: null, usable: false };
-      const runId = request.runId;
+      let repairAttempt =
+        request && Option.isSome(repairRepository)
+          ? yield* repairRepository.value.latest(requestId)
+          : null;
+      const runId = repairAttempt?.validatedRunId ?? request?.runId;
+      if (!request || !runId) return { request, run: null, usable: false, repair: null };
       const historical = yield* coordinator.get(runId);
-      if (!historical) return { request, run: null, usable: false };
+      if (!historical) return { request, run: null, usable: false, repair: null };
       const usableRun = historical.status === "ready" ? yield* coordinator.getUsable(runId) : null;
-      if (!usableRun && historical.status === "ready" && request.status === "completed") {
+      const repairEligibilityBound =
+        repairAttempt === null ||
+        repairAttempt.eligibility?.status !== "eligible" ||
+        isRepairEligibilityBound({
+          policy: request.repairPolicy,
+          eligibility: repairAttempt.eligibility,
+          diffBaseSha: repairAttempt.candidateSha,
+          repairedSha: repairAttempt.repairedSha,
+          validatedRunId: repairAttempt.validatedRunId,
+          run: usableRun,
+        });
+      if (
+        !usableRun &&
+        historical.status === "ready" &&
+        (request.status === "completed" || request.status === "failed")
+      ) {
         yield* requests.markStale(requestId, yield* now);
         request = yield* requests.get(requestId);
+        if (repairAttempt && repairAttempt.status !== "stale" && Option.isSome(repairRepository)) {
+          if (repairAttempt.eligibility) {
+            yield* repairRepository.value.recordEligibility({
+              requestId,
+              attempt: repairAttempt.attempt,
+              expectedStatus: repairAttempt.status,
+              validatedRunId: runId,
+              eligibility: {
+                ...repairAttempt.eligibility,
+                status: "stale",
+                reasons: [
+                  ...new Set([
+                    ...repairAttempt.eligibility.reasons,
+                    "Fresh candidate evidence no longer matches current source, stable target, or profile inputs.",
+                  ]),
+                ].sort(),
+              },
+            });
+          }
+          yield* repairRepository.value.transition({
+            requestId,
+            attempt: repairAttempt.attempt,
+            expected: repairAttempt.status,
+            status: "stale",
+            error: "Validated repaired candidate is no longer fresh.",
+            now: yield* now,
+          });
+          repairAttempt = yield* repairRepository.value.get(requestId, repairAttempt.attempt);
+        }
       }
+      if (
+        !repairEligibilityBound &&
+        repairAttempt?.eligibility &&
+        repairAttempt.status !== "stale" &&
+        Option.isSome(repairRepository)
+      ) {
+        const staleEligibility = {
+          ...repairAttempt.eligibility,
+          status: "stale" as const,
+          reasons: [
+            ...new Set([
+              ...repairAttempt.eligibility.reasons,
+              "Persisted repair eligibility is not bound to the accepted policy and exact fresh validation run.",
+            ]),
+          ].sort(),
+        };
+        yield* repairRepository.value.recordEligibility({
+          requestId,
+          attempt: repairAttempt.attempt,
+          expectedStatus: repairAttempt.status,
+          validatedRunId: repairAttempt.validatedRunId ?? runId,
+          eligibility: staleEligibility,
+        });
+        yield* repairRepository.value.transition({
+          requestId,
+          attempt: repairAttempt.attempt,
+          expected: repairAttempt.status,
+          status: "stale",
+          error: "Persisted repair eligibility does not match its accepted identity.",
+          now: yield* now,
+        });
+        yield* requests.markStale(requestId, yield* now);
+        request = yield* requests.get(requestId);
+        repairAttempt = yield* repairRepository.value.get(requestId, repairAttempt.attempt);
+      }
+      const repair = repairAttempt
+        ? {
+            attempt: repairAttempt.attempt,
+            maxAttempts: request?.repairPolicy.maxAttempts ?? repairAttempt.attempt,
+            baseRunId: repairAttempt.baseRunId,
+            validatedRunId: repairAttempt.validatedRunId,
+            threadId: repairAttempt.threadId,
+            modelSelection: repairAttempt.modelSelection,
+            status: repairAttempt.status,
+            error: repairAttempt.error,
+            eligibility: repairAttempt.eligibility,
+          }
+        : null;
       const current =
         !usableRun && historical.status === "ready"
           ? ((yield* coordinator.get(runId)) ?? historical)
           : historical;
-      return { request, run: usableRun ?? current, usable: usableRun !== null };
+      const reviewRequired = repairAttempt?.status === "review-required";
+      return {
+        request,
+        run: usableRun ?? current,
+        // Fresh validation and policy eligibility are distinct. Downstream
+        // callers must honor both the candidate status and this eligibility.
+        usable:
+          usableRun !== null &&
+          !reviewRequired &&
+          repairEligibilityBound &&
+          (repairAttempt === null || repairAttempt.eligibility?.status === "eligible"),
+        repair,
+      };
     });
     const awaitCompletion: ForkCompatibilityNativeServiceShape["awaitCompletion"] = Effect.fn(
       "ForkCompatibilityNativeService.awaitCompletion",

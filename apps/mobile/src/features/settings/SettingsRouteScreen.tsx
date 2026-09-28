@@ -652,10 +652,35 @@ function ForkCompatibilitySettingsRows() {
   } | null>(null);
   const configuredDirectory =
     environment?.serverConfig?.settings.forkCompatibility.sourceDirectory ?? null;
+  const configuredRepair = environment?.serverConfig?.settings.forkCompatibility.repair;
+  const configuredModel = environment?.serverConfig?.settings.defaultModelSelection ?? null;
   const directory =
     directoryDraft?.environmentId === environmentId
       ? directoryDraft.value
       : (configuredDirectory ?? "");
+  const repair = configuredRepair ?? {
+    enabled: false,
+    preservedIntent: "Preserve the fork's existing behavior while adapting it to upstream.",
+    allowedPaths: [],
+    maxAttempts: 1,
+  };
+  const [repairDraft, setRepairDraft] = useState<{
+    readonly environmentId: string;
+    readonly enabled: boolean;
+    readonly preservedIntent: string;
+    readonly allowedPathsText: string;
+    readonly maxAttempts: number;
+  } | null>(null);
+  const repairFields =
+    repairDraft?.environmentId === environmentId
+      ? repairDraft
+      : {
+          environmentId: environmentId ?? "",
+          enabled: repair.enabled,
+          preservedIntent: repair.preservedIntent,
+          allowedPathsText: repair.allowedPaths.join("\n"),
+          maxAttempts: repair.maxAttempts,
+        };
   const operationIdentity = JSON.stringify([environmentId, directory, connectionPhase]);
   const operationEpoch = useRef(new IdentityEpoch(operationIdentity)).current;
   const operationToken = operationEpoch.update(operationIdentity);
@@ -761,6 +786,40 @@ function ForkCompatibilitySettingsRows() {
       if (operationEpoch.isCurrent(token)) {
         setOperationError({ token, message: "Could not save the source checkout." });
       }
+    } finally {
+      finishBusy(token);
+    }
+  };
+
+  const saveRepairPolicy = async () => {
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId) return;
+    const token = operationToken;
+    setBusyEntry(token);
+    try {
+      const result = await configure({
+        environmentId: targetEnvironmentId,
+        input: {
+          sourceDirectory: configuredDirectory,
+          repair: {
+            enabled: repairFields.enabled,
+            preservedIntent: repairFields.preservedIntent,
+            allowedPaths: repairFields.allowedPathsText
+              .split("\n")
+              .map((path) => path.trim())
+              .filter(Boolean),
+            maxAttempts: repairFields.maxAttempts,
+          },
+        },
+      });
+      if (operationEpoch.isCurrent(token) && result._tag === "Failure")
+        setOperationError({
+          token,
+          message: "Could not save repair policy. Check paths and intent.",
+        });
+    } catch {
+      if (operationEpoch.isCurrent(token))
+        setOperationError({ token, message: "Could not save repair policy. Reconnect and retry." });
     } finally {
       finishBusy(token);
     }
@@ -886,10 +945,75 @@ function ForkCompatibilitySettingsRows() {
           <Text className="text-sm text-foreground">Check</Text>
         </Pressable>
       </View>
+      <SettingsSwitchRow
+        icon="wrench.and.screwdriver"
+        label="Optional compatibility repair"
+        subtitle="Uses the selected server provider in an isolated candidate; never installs."
+        value={repairFields.enabled}
+        disabled={busy}
+        onValueChange={(enabled) => setRepairDraft({ ...repairFields, enabled })}
+      />
+      <Text className="px-4 text-xs text-foreground-muted">
+        {configuredModel
+          ? `Server model: ${configuredModel.instanceId} · ${configuredModel.model}`
+          : "Provider/model comes from the active project's explicit choice or server default; repair cannot start if neither is configured."}
+      </Text>
+      <Text className="px-4 pt-2 text-xs text-foreground-muted">
+        In-scope source edits can be eligible after fresh checks. Test, validation, CI, dependency,
+        security, symlink, and out-of-scope changes require review.
+      </Text>
+      <TextInput
+        accessibilityLabel="Preserved fork intent"
+        className="mx-4 mt-3 min-h-20 rounded-xl border border-border-subtle px-3 py-2 text-base text-foreground"
+        placeholder="Preserved fork intent"
+        value={repairFields.preservedIntent}
+        onChangeText={(preservedIntent) => setRepairDraft({ ...repairFields, preservedIntent })}
+        editable={!busy}
+        multiline
+      />
+      <TextInput
+        accessibilityLabel="Allowed repair paths"
+        className="mx-4 mt-2 min-h-16 rounded-xl border border-border-subtle px-3 py-2 text-sm text-foreground"
+        placeholder="Allowed repository path prefixes, one per line"
+        value={repairFields.allowedPathsText}
+        onChangeText={(allowedPathsText) => setRepairDraft({ ...repairFields, allowedPathsText })}
+        editable={!busy}
+        autoCapitalize="none"
+        autoCorrect={false}
+        multiline
+      />
+      <View className="mx-4 mt-2 flex-row items-center gap-3">
+        <Text className="flex-1 text-sm text-foreground-muted">
+          Maximum attempts: {repairFields.maxAttempts}
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Maximum repair attempts ${repairFields.maxAttempts}`}
+          disabled={busy}
+          className="rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+          onPress={() =>
+            setRepairDraft({ ...repairFields, maxAttempts: (repairFields.maxAttempts % 3) + 1 })
+          }
+        >
+          <Text className="text-sm text-foreground">Change</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          disabled={
+            busy ||
+            (repairFields.enabled &&
+              (!repairFields.preservedIntent.trim() || !repairFields.allowedPathsText.trim()))
+          }
+          className="rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+          onPress={() => void saveRepairPolicy()}
+        >
+          <Text className="text-sm text-foreground">Save repair policy</Text>
+        </Pressable>
+      </View>
       <View className="mt-3 flex-row items-center gap-3">
         <Text className="flex-1 text-sm text-foreground-muted">
           {visibleStatus?.summary
-            ? `${visibleStatus.summary.requestStatus}${visibleStatus.summary.runStatus ? ` · ${visibleStatus.summary.runStatus}` : ""}${visibleStatus.summary.usable ? " · current evidence" : visibleStatus.summary.runStatus === "ready" && visibleStatus.summary.candidateSha ? " · stale evidence" : ""}`
+            ? `${visibleStatus.summary.requestStatus}${visibleStatus.summary.runStatus ? ` · ${visibleStatus.summary.runStatus}` : ""}${visibleStatus.summary.usable ? " · current evidence" : visibleStatus.summary.requestStatus === "stale" || visibleStatus.summary.runStatus === "stale" ? " · stale evidence" : ""}`
             : !requestId
               ? "No check request has been recorded on this device."
               : (visibleStatus?.error ?? "Request accepted; status has not been refreshed yet.")}
@@ -900,6 +1024,17 @@ function ForkCompatibilitySettingsRows() {
           </Pressable>
         ) : null}
       </View>
+      {visibleStatus?.summary?.repair ? (
+        <Text selectable className="mt-2 px-4 text-xs text-foreground-muted">
+          Repair attempt {visibleStatus.summary.repair.attempt}/
+          {visibleStatus.summary.repair.maxAttempts} · {visibleStatus.summary.repair.status} ·
+          thread {visibleStatus.summary.repair.threadId ?? "pending"} · eligibility{" "}
+          {visibleStatus.summary.repair.eligibility?.status ?? "not assessed"}
+          {visibleStatus.summary.repair.eligibility?.reasons.length
+            ? ` · ${visibleStatus.summary.repair.eligibility.reasons.join(" ")}`
+            : ""}
+        </Text>
+      ) : null}
       {requestId && visibleStatus?.summary?.usable ? (
         <Pressable
           accessibilityRole="button"

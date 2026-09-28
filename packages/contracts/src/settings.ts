@@ -2,6 +2,7 @@ import { SshDeviceHostConfigs } from "./device.ts";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as Schema from "effect/Schema";
+import { ForkCompatibilityRepairSettings } from "./forkCompatibility.ts";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import {
   ForwardCompatibleNullable,
@@ -1015,6 +1016,16 @@ export const ServerSettings = Schema.Struct({
     validationProfileId: Schema.Literal("t3-server-default").pipe(
       Schema.withDecodingDefault(Effect.succeed("t3-server-default" as const)),
     ),
+    repair: ForkCompatibilityRepairSettings.pipe(
+      Schema.withDecodingDefault(
+        Effect.succeed({
+          enabled: false,
+          preservedIntent: "Preserve the fork's existing behavior while adapting it to upstream.",
+          maxAttempts: 1,
+          allowedPaths: [],
+        }),
+      ),
+    ),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // How assistant text reaches clients during a turn. Deliberately a fresh
   // key (was `enableLegacyTokenStreaming`, before that
@@ -1359,6 +1370,7 @@ export const ServerSettingsPatch = Schema.Struct({
     Schema.Struct({
       sourceDirectory: Schema.NullOr(TrimmedString),
       validationProfileId: Schema.Literal("t3-server-default"),
+      repair: Schema.optionalKey(ForkCompatibilityRepairSettings),
     }),
   ),
   // Server settings

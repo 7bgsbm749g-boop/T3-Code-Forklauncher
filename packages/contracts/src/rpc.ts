@@ -5,6 +5,8 @@ import {
   ForkCompatibilityEvidence,
   ForkCompatibilityRequestStatus,
   ForkCompatibilityRunStatus,
+  ForkCompatibilityRepairSettings,
+  ForkCompatibilityRepairSummary,
 } from "./forkCompatibility.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
@@ -602,9 +604,13 @@ const ForkCompatibilitySummary = Schema.Struct({
   candidateSha: Schema.NullOr(Schema.String),
   usable: Schema.Boolean,
   error: Schema.NullOr(Schema.String),
+  repair: Schema.NullOr(ForkCompatibilityRepairSummary),
 });
 const WsForkCompatibilityConfigureRpc = Rpc.make(WS_METHODS.forkCompatibilityConfigure, {
-  payload: Schema.Struct({ sourceDirectory: Schema.NullOr(Schema.String) }),
+  payload: Schema.Struct({
+    sourceDirectory: Schema.NullOr(Schema.String),
+    repair: Schema.optional(ForkCompatibilityRepairSettings),
+  }),
   success: Schema.Struct({ configured: Schema.Boolean }),
   error: Schema.Union([
     ServerSettingsError,

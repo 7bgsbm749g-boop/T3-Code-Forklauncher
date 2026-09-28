@@ -868,7 +868,7 @@ const buildAppUnderTest = (options?: {
                     "Compatibility checks are not configured in this router test.",
                   ),
                 ),
-              get: () => Effect.succeed({ request: null, run: null, usable: false }),
+              get: () => Effect.succeed({ request: null, run: null, usable: false, repair: null }),
               awaitCompletion: () => Effect.void,
             }),
           Layer.mock(ExternalLauncher.ExternalLauncher)({
@@ -5006,6 +5006,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const holdInterruptedValidation = yield* Deferred.make<void>();
       const validationNumber = yield* Ref.make(0);
       const configuredSource = yield* Ref.make<string | null>(null);
+      const configuredRepair = yield* Ref.make(DEFAULT_SERVER_SETTINGS.forkCompatibility.repair);
       const profile = {
         id: "rpc-git-fixture",
         revision: "1",
@@ -5109,21 +5110,28 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ForkCompatibilityNativeService.ForkCompatibilityNativeService,
         proxyService,
       );
-      const getSettings = Ref.get(configuredSource).pipe(
-        Effect.map((sourceDirectory) => ({
+      const getSettings = Effect.gen(function* () {
+        const [sourceDirectory, repair] = yield* Effect.all([
+          Ref.get(configuredSource),
+          Ref.get(configuredRepair),
+        ]);
+        return {
           ...DEFAULT_SERVER_SETTINGS,
           forkCompatibility: {
             ...DEFAULT_SERVER_SETTINGS.forkCompatibility,
             sourceDirectory,
+            repair,
           },
-        })),
-      );
+        };
+      });
       const updateSettings: ServerSettings.ServerSettingsService["Service"]["updateSettings"] = (
         patch,
       ) =>
         Effect.gen(function* () {
           if (patch.forkCompatibility)
             yield* Ref.set(configuredSource, patch.forkCompatibility.sourceDirectory);
+          if (patch.forkCompatibility?.repair)
+            yield* Ref.set(configuredRepair, patch.forkCompatibility.repair);
           return yield* getSettings;
         });
       const makeAppScope = Effect.gen(function* () {
@@ -5216,6 +5224,30 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
       assert.equal(git(source, ["rev-parse", "HEAD"]), sourceSha);
       assert.equal(git(source, ["branch", "--show-current"]), "forklauncher");
+
+      const repairDisabled = {
+        enabled: false,
+        preservedIntent: "Keep fork behavior.",
+        maxAttempts: 1,
+        allowedPaths: [],
+      };
+      const repairRejected = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.forkCompatibilityConfigure]({
+            sourceDirectory: source,
+            repair: { ...repairDisabled, enabled: true },
+          }).pipe(Effect.flip),
+        ),
+      );
+      assert.include(repairRejected.message, "At least one allowed source path is required");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.forkCompatibilityConfigure]({
+            sourceDirectory: source,
+            repair: repairDisabled,
+          }),
+        ),
+      );
 
       NodeFS.writeFileSync(NodePath.join(source, "restart-fixture.txt"), "new source identity\n");
       git(source, ["add", "restart-fixture.txt"]);

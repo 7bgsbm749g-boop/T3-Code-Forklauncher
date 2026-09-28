@@ -95,6 +95,8 @@ import * as ForkCompatibilityNativeService from "./forkCompatibility/ForkCompati
 import * as ForkCompatibilityRunRepository from "./forkCompatibility/ForkCompatibilityRunRepository.ts";
 import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCompatibilityRequestRepository.ts";
 import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
+import * as ForkCompatibilityRepairRepository from "./forkCompatibility/ForkCompatibilityRepairRepository.ts";
+import * as ForkCompatibilityRepair from "./forkCompatibility/ForkCompatibilityRepair.ts";
 import * as Path from "effect/Path";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
@@ -778,6 +780,7 @@ const makeServerLayer = Layer.unwrap(
         const persistence = Layer.mergeAll(
           ForkCompatibilityRunRepository.ForkCompatibilityRunRepositoryLive,
           ForkCompatibilityRequestRepository.ForkCompatibilityRequestRepositoryLive,
+          ForkCompatibilityRepairRepository.ForkCompatibilityRepairRepositoryLive,
         ).pipe(Layer.provideMerge(PersistenceLayerLive));
         const stableSource = ForkCompatibilityStableSource.ForkCompatibilityStableSourceLive.pipe(
           Layer.provideMerge(GitVcsDriver.layer),
@@ -791,11 +794,23 @@ const makeServerLayer = Layer.unwrap(
           Layer.provideMerge(GitVcsDriver.layer),
           Layer.provide(ProcessRunner.layer),
         );
-        return ForkCompatibilityNativeService.ForkCompatibilityNativeServiceLive.pipe(
+        const repair = ForkCompatibilityRepair.ForkCompatibilityRepairServiceLive.pipe(
+          Layer.provideMerge(persistence),
+        );
+        const native = ForkCompatibilityNativeService.ForkCompatibilityNativeServiceLive.pipe(
+          Layer.provideMerge(repair),
           Layer.provideMerge(persistence),
           Layer.provideMerge(coordinator),
         );
+        return native;
       }),
+    );
+
+    // Fork compatibility consumes the orchestration services exported by the
+    // already assembled runtime graph. Keep this as one provider graph so the
+    // repair adapter shares the server's engine, event stream and reactors.
+    const RuntimeDependenciesWithCompatibilityLive = compatibilityLayer.pipe(
+      Layer.provideMerge(RuntimeDependenciesLive),
     );
 
     const runtimeServicesLive = ServerRuntimeStartup.layerWithOptions({
@@ -811,8 +826,7 @@ const makeServerLayer = Layer.unwrap(
         { concurrency: "unbounded" },
       ).pipe(Effect.asVoid),
     }).pipe(
-      Layer.provideMerge(RuntimeDependenciesLive),
-      Layer.provideMerge(compatibilityLayer),
+      Layer.provideMerge(RuntimeDependenciesWithCompatibilityLive),
       Layer.provide(launcherLayer),
     );
 

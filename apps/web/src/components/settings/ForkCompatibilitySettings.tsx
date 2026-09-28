@@ -31,6 +31,8 @@ export function ForkCompatibilitySettings() {
   const { environment, connectedEnvironments } = useSettingsScope();
   const environmentId = environment?.environmentId ?? null;
   const configuredDirectory = environment?.serverConfig?.settings.forkCompatibility.sourceDirectory;
+  const configuredRepair = environment?.serverConfig?.settings.forkCompatibility.repair;
+  const configuredModel = environment?.serverConfig?.settings.defaultModelSelection ?? null;
   const configure = useAtomCommand(serverEnvironment.forkCompatibilityConfigure, {
     reportFailure: false,
   });
@@ -44,10 +46,33 @@ export function ForkCompatibilitySettings() {
     readonly environmentId: string | null;
     readonly value: string;
   } | null>(null);
+  const [repairDraft, setRepairDraft] = useState<{
+    readonly environmentId: string | null;
+    readonly enabled: boolean;
+    readonly preservedIntent: string;
+    readonly allowedPathsText: string;
+    readonly maxAttempts: number;
+  } | null>(null);
   const directory =
     directoryDraft?.environmentId === environmentId
       ? directoryDraft.value
       : (configuredDirectory ?? "");
+  const repair = configuredRepair ?? {
+    enabled: false,
+    preservedIntent: "Preserve the fork's existing behavior while adapting it to upstream.",
+    allowedPaths: [],
+    maxAttempts: 1,
+  };
+  const repairFields =
+    repairDraft?.environmentId === environmentId
+      ? repairDraft
+      : {
+          environmentId,
+          enabled: repair.enabled,
+          preservedIntent: repair.preservedIntent,
+          allowedPathsText: repair.allowedPaths.join("\n"),
+          maxAttempts: repair.maxAttempts,
+        };
   const [lastRequestId, setLastRequestId] = useLocalStorage(
     `fork-compatibility:last-request:${environmentId ?? "none"}`,
     null,
@@ -185,6 +210,40 @@ export function ForkCompatibilitySettings() {
     }
   };
 
+  const saveRepairPolicy = async () => {
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId) return;
+    const token = operationToken;
+    setOperationBusy(token, operationIdentity);
+    try {
+      const result = await configure({
+        environmentId: targetEnvironmentId,
+        input: {
+          sourceDirectory: configuredDirectory ?? null,
+          repair: {
+            enabled: repairFields.enabled,
+            preservedIntent: repairFields.preservedIntent,
+            allowedPaths: repairFields.allowedPathsText
+              .split("\n")
+              .map((path) => path.trim())
+              .filter(Boolean),
+            maxAttempts: repairFields.maxAttempts,
+          },
+        },
+      });
+      if (operationEpoch.isCurrent(token) && result._tag === "Failure")
+        setOperationError({
+          token,
+          message: "Could not save repair policy. Check paths and intent.",
+        });
+    } catch {
+      if (operationEpoch.isCurrent(token))
+        setOperationError({ token, message: "Could not save repair policy. Reconnect and retry." });
+    } finally {
+      finishBusy(token);
+    }
+  };
+
   const requestCheck = async () => {
     const targetEnvironmentId = environmentId;
     const sourceDirectory = configuredDirectory?.trim();
@@ -237,8 +296,7 @@ export function ForkCompatibilitySettings() {
         : lastRequestId
           ? "accepted; waiting for status"
           : "no request"));
-  const staleEvidence =
-    summary?.runStatus === "ready" && summary.usable === false && !!summary.candidateSha;
+  const staleEvidence = summary?.requestStatus === "stale" || summary?.runStatus === "stale";
 
   return (
     <SettingsSection id="fork-compatibility" title="Fork compatibility">
@@ -299,6 +357,83 @@ export function ForkCompatibilitySettings() {
           </Button>
         }
       />
+      <div className="space-y-3 border-t px-4 py-3 text-sm">
+        <label className="flex items-center gap-2 font-medium">
+          <input
+            aria-label="Enable optional compatibility repair"
+            type="checkbox"
+            checked={repairFields.enabled}
+            disabled={!connected || busy}
+            onChange={(event) => setRepairDraft({ ...repairFields, enabled: event.target.checked })}
+          />
+          Allow optional native repair
+        </label>
+        <p className="text-xs text-muted-foreground">
+          Repair uses the configured provider/model in an isolated candidate and never installs the
+          result. Scope permits eligible source edits only; test, validation, CI, dependency,
+          security, and out-of-scope changes remain review-required.
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {configuredModel
+            ? `Configured server model: ${configuredModel.instanceId} · ${configuredModel.model}`
+            : "Provider/model will come from the active project's explicit choice or the server default; repair cannot start if neither is configured."}
+        </p>
+        <label className="block space-y-1">
+          <span>Preserved fork intent</span>
+          <textarea
+            aria-label="Preserved fork intent"
+            className="min-h-20 w-full rounded-md border bg-background p-2"
+            value={repairFields.preservedIntent}
+            disabled={!connected || busy}
+            onChange={(event) =>
+              setRepairDraft({ ...repairFields, preservedIntent: event.target.value })
+            }
+          />
+        </label>
+        <label className="block space-y-1">
+          <span>Allowed repository path prefixes, one per line</span>
+          <textarea
+            aria-label="Allowed repair paths"
+            className="min-h-16 w-full rounded-md border bg-background p-2 font-mono"
+            value={repairFields.allowedPathsText}
+            placeholder="apps/server/src"
+            disabled={!connected || busy}
+            onChange={(event) =>
+              setRepairDraft({ ...repairFields, allowedPathsText: event.target.value })
+            }
+          />
+        </label>
+        <label className="flex items-center gap-2">
+          <span>Maximum repair attempts</span>
+          <select
+            aria-label="Maximum repair attempts"
+            value={repairFields.maxAttempts}
+            disabled={!connected || busy}
+            onChange={(event) =>
+              setRepairDraft({ ...repairFields, maxAttempts: Number(event.target.value) })
+            }
+          >
+            {[1, 2, 3].map((count) => (
+              <option key={count} value={count}>
+                {count}
+              </option>
+            ))}
+          </select>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={
+              !connected ||
+              busy ||
+              (repairFields.enabled &&
+                (!repairFields.preservedIntent.trim() || !repairFields.allowedPathsText.trim()))
+            }
+            onClick={() => void saveRepairPolicy()}
+          >
+            Save repair policy
+          </Button>
+        </label>
+      </div>
       <div className="space-y-2 px-4 py-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">Latest request:</span>
@@ -333,6 +468,19 @@ export function ForkCompatibilitySettings() {
             {summary.sourceSha ? ` · source ${summary.sourceSha}` : ""}
             {summary.targetSha ? ` · target ${summary.targetSha}` : ""}
             {summary.candidateSha ? ` · candidate ${summary.candidateSha}` : ""}
+            {summary.repair
+              ? ` · attempt ${summary.repair.attempt}/${summary.repair.maxAttempts} · thread ${summary.repair.threadId ?? "pending"} · ${summary.repair.eligibility?.status ?? summary.repair.status}`
+              : ""}
+          </p>
+        ) : null}
+        {summary?.repair ? (
+          <p className="break-all text-xs text-muted-foreground">
+            Repair attempt {summary.repair.attempt}/{summary.repair.maxAttempts} ·{" "}
+            {summary.repair.status} · thread {summary.repair.threadId ?? "pending"} · eligibility{" "}
+            {summary.repair.eligibility?.status ?? "not assessed"}
+            {summary.repair.eligibility?.reasons.length
+              ? ` · ${summary.repair.eligibility.reasons.join(" ")}`
+              : ""}
           </p>
         ) : null}
         {summary?.error || statusError || operationErrorMessage ? (

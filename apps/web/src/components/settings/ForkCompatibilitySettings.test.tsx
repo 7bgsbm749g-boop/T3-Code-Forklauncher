@@ -1,6 +1,7 @@
 import { act, type ReactNode } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { ProviderInstanceId, type ForkCompatibilityRepairSummary } from "@t3tools/contracts";
 
 type StoredPending = ReadonlyArray<{ sourceDirectory: string; idempotencyKey: string }> | null;
 const state = vi.hoisted(() => ({
@@ -10,6 +11,12 @@ const state = vi.hoisted(() => ({
     "server-1": "/srv/fork-1",
     "server-2": "/srv/fork-2",
   } as Record<string, string | null>,
+  repair: {
+    enabled: false,
+    preservedIntent: "Preserve current fork behavior.",
+    allowedPaths: [],
+    maxAttempts: 1,
+  },
   commands: [] as Array<{ command: string; environmentId: string; input: unknown }>,
   storage: new Map<string, unknown>(),
   statusWaiters: new Map<string, () => Promise<unknown>>(),
@@ -109,7 +116,9 @@ vi.mock("./SettingsScopeContext", () => ({
         settings: {
           forkCompatibility: {
             sourceDirectory: state.sourceDirectories[state.selectedEnvironment] ?? null,
+            repair: state.repair,
           },
+          defaultModelSelection: { instanceId: "codex", model: "fixture-model" },
         },
       },
     },
@@ -178,6 +187,7 @@ function statusResult(requestId: string, sourceSha: string, runStatus = "ready",
         candidateSha: "candidate",
         usable,
         error: runStatus === "failed" ? "validation failed" : null,
+        repair: null as ForkCompatibilityRepairSummary | null,
       },
       evidence: { checks: [{ stdout: "passed" }] },
     },
@@ -189,6 +199,12 @@ beforeEach(() => {
   state.connected = true;
   state.selectedEnvironment = "server-1";
   state.sourceDirectories = { "server-1": "/srv/fork-1", "server-2": "/srv/fork-2" };
+  state.repair = {
+    enabled: false,
+    preservedIntent: "Preserve current fork behavior.",
+    allowedPaths: [],
+    maxAttempts: 1,
+  };
   state.commands = [];
   state.storage.clear();
   state.statusWaiters.clear();
@@ -204,6 +220,44 @@ afterEach(() => {
 });
 
 describe("ForkCompatibilitySettings", () => {
+  it("saves explicit repair intent, path scope, and bounded attempts over native configure RPC", async () => {
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    const checkbox = renderer!.root.findByProps({
+      "aria-label": "Enable optional compatibility repair",
+    });
+    await act(async () => checkbox.props.onChange({ target: { checked: true } }));
+    await act(async () => {
+      renderer!.root.findByProps({ "aria-label": "Preserved fork intent" }).props.onChange({
+        target: { value: "Keep the fork's server behavior." },
+      });
+    });
+    await act(async () => {
+      renderer!.root.findByProps({ "aria-label": "Allowed repair paths" }).props.onChange({
+        target: { value: "apps/server/src\napps/web/src" },
+      });
+    });
+    await act(async () => {
+      renderer!.root.findByProps({ "aria-label": "Maximum repair attempts" }).props.onChange({
+        target: { value: "2" },
+      });
+    });
+    await act(async () => {
+      await button("Save repair policy").props.onClick();
+    });
+    const call = state.commands.find((entry) => entry.command === "configure");
+    expect(call?.input).toMatchObject({
+      sourceDirectory: "/srv/fork-1",
+      repair: {
+        enabled: true,
+        preservedIntent: "Keep the fork's server behavior.",
+        allowedPaths: ["apps/server/src", "apps/web/src"],
+        maxAttempts: 2,
+      },
+    });
+  });
+
   it("keeps accepted request discoverable across disconnect and explicitly fetches evidence", async () => {
     await act(async () => {
       renderer = create(<ForkCompatibilitySettings />);
@@ -356,7 +410,9 @@ describe("ForkCompatibilitySettings", () => {
       renderer = create(<ForkCompatibilitySettings />);
     });
     await act(async () => {
-      renderer!.root.findByType("input").props.onChange({ target: { value: "/srv/fork-1-next" } });
+      renderer!.root
+        .findByProps({ "aria-label": "Fork source checkout directory" })
+        .props.onChange({ target: { value: "/srv/fork-1-next" } });
     });
     await act(async () => {
       await button("Save").props.onClick();
@@ -376,7 +432,7 @@ describe("ForkCompatibilitySettings", () => {
     ).toBe(false);
   });
 
-  it("shows failed work as failed and only labels ready unusable evidence stale", async () => {
+  it("shows failed work as failed and only labels stale status as stale evidence", async () => {
     state.storage.set("fork-compatibility:last-request:server-1", "request-failed");
     state.statusWaiters.set("server-1:request-failed", () =>
       Promise.resolve(statusResult("request-failed", "source", "failed", false)),
@@ -398,7 +454,7 @@ describe("ForkCompatibilitySettings", () => {
     renderer = null;
     state.storage.set("fork-compatibility:last-request:server-1", "request-stale");
     state.statusWaiters.set("server-1:request-stale", () =>
-      Promise.resolve(statusResult("request-stale", "source", "ready", false)),
+      Promise.resolve(statusResult("request-stale", "source", "stale", false)),
     );
     await act(async () => {
       renderer = create(<ForkCompatibilitySettings />);
@@ -408,5 +464,41 @@ describe("ForkCompatibilitySettings", () => {
         .findAllByType("span")
         .some((node) => node.children.join("").includes("stale evidence")),
     ).toBe(true);
+  });
+
+  it("shows review-required repair separately from stale evidence", async () => {
+    state.storage.set("fork-compatibility:last-request:server-1", "request-review");
+    const result = statusResult("request-review", "source", "ready", false);
+    result.value.summary.repair = {
+      attempt: 1,
+      maxAttempts: 2,
+      baseRunId: "base-run",
+      validatedRunId: "repaired-run",
+      threadId: "repair-thread",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "fixture" },
+      status: "review-required",
+      error: "Test changes require review.",
+      eligibility: {
+        status: "review-required",
+        policySha256: "a".repeat(64),
+        diffBaseSha: "b".repeat(40),
+        repairedSha: "c".repeat(40),
+        validatedRunId: "repaired-run",
+        validationProfileSha256: "d".repeat(64),
+        changedPaths: ["apps/server/src/repair.test.ts"],
+        reasons: ["Validation, test, dependency, CI, or security configuration changed."],
+        assessedAt: "2026-09-28T00:00:00.000Z",
+      },
+    };
+    state.statusWaiters.set("server-1:request-review", () => Promise.resolve(result));
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    const paragraphs = renderer!.root.findAllByType("p").map((node) => node.children.join(""));
+    expect(
+      paragraphs.some((text) => text.includes("attempt 1/2") && text.includes("repair-thread")),
+    ).toBe(true);
+    expect(paragraphs.some((text) => text.includes("eligibility review-required"))).toBe(true);
+    expect(paragraphs.some((text) => text.includes("stale evidence"))).toBe(false);
   });
 });

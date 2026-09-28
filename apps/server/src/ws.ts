@@ -120,6 +120,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ForkCompatibilityNative from "./forkCompatibility/ForkCompatibilityNativeService.ts";
+import { validateAllowedRepairPaths } from "./forkCompatibility/ForkCompatibilityRepairEligibility.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -2536,21 +2537,56 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "server",
             },
           ),
-        [WS_METHODS.forkCompatibilityConfigure]: ({ sourceDirectory }) =>
+        [WS_METHODS.forkCompatibilityConfigure]: ({ sourceDirectory, repair }) =>
           observeRpcEffect(
             WS_METHODS.forkCompatibilityConfigure,
             Effect.gen(function* () {
               const path = yield* Path.Path;
+              const existing = yield* serverSettings.getSettings;
               const normalizedSource = sourceDirectory?.trim() || null;
               if (normalizedSource !== null && !path.isAbsolute(normalizedSource)) {
                 return yield* new ForkCompatibilityRpcError({
                   message: "Source directory must be an absolute path.",
                 });
               }
+              const nextRepair = repair ?? existing.forkCompatibility.repair;
+              if (
+                nextRepair.enabled &&
+                !existing.forkCompatibility.repair.enabled &&
+                normalizedSource === null
+              )
+                return yield* new ForkCompatibilityRpcError({
+                  message: "Configure a source checkout before enabling repair.",
+                });
+              if (nextRepair.enabled && normalizedSource !== null) {
+                if (!nextRepair.preservedIntent.trim())
+                  return yield* new ForkCompatibilityRpcError({
+                    message: "Enabled repair requires preserved fork intent.",
+                  });
+                const allowedPaths = validateAllowedRepairPaths(nextRepair.allowedPaths);
+                if (!allowedPaths.valid)
+                  return yield* new ForkCompatibilityRpcError({ message: allowedPaths.reason });
+                const projectOption = yield* projectionSnapshotQuery
+                  .getActiveProjectByWorkspaceRoot(normalizedSource)
+                  .pipe(
+                    Effect.mapError(
+                      (error) => new ForkCompatibilityRpcError({ message: error.message }),
+                    ),
+                  );
+                const project = Option.getOrNull(projectOption);
+                const modelSelection =
+                  project?.defaultModelSelection ?? existing.defaultModelSelection;
+                if (!modelSelection?.instanceId || !modelSelection.model)
+                  return yield* new ForkCompatibilityRpcError({
+                    message:
+                      "Select an explicit provider and model for this project or server before enabling repair.",
+                  });
+              }
               const settings = yield* serverSettings.updateSettings({
                 forkCompatibility: {
                   sourceDirectory: normalizedSource,
                   validationProfileId: "t3-server-default",
+                  repair: nextRepair,
                 },
               });
               return { configured: settings.forkCompatibility.sourceDirectory !== null };
@@ -2568,8 +2604,22 @@ const makeWsRpcLayer = (
                   message: "Configure a source checkout before requesting validation.",
                 });
               }
+              const projectOption =
+                yield* projectionSnapshotQuery.getActiveProjectByWorkspaceRoot(sourceDirectory);
+              const project = Option.getOrNull(projectOption);
+              const modelSelection =
+                project?.defaultModelSelection ?? settings.defaultModelSelection;
+              const repair = settings.forkCompatibility.repair;
               const accepted = yield* forkCompatibility
-                .accept({ idempotencyKey, repositoryRoot: sourceDirectory })
+                .accept({
+                  idempotencyKey,
+                  repositoryRoot: sourceDirectory,
+                  repairPolicy: {
+                    ...repair,
+                    projectId: project?.id ?? null,
+                    modelSelection,
+                  },
+                })
                 .pipe(
                   Effect.mapError(
                     (error) => new ForkCompatibilityRpcError({ message: error.message }),
@@ -2590,7 +2640,7 @@ const makeWsRpcLayer = (
             WS_METHODS.forkCompatibilityStatus,
             forkCompatibility.get(requestId).pipe(
               Effect.mapError((error) => new ForkCompatibilityRpcError({ message: error.message })),
-              Effect.map(({ request, run, usable }) => ({
+              Effect.map(({ request, run, usable, repair }) => ({
                 summary: request
                   ? {
                       requestId: request.requestId,
@@ -2603,6 +2653,7 @@ const makeWsRpcLayer = (
                       candidateSha: run?.candidateSha ?? null,
                       usable,
                       error: run?.error ?? request.error,
+                      repair,
                     }
                   : null,
                 ...(includeEvidence && run?.evidence ? { evidence: run.evidence } : {}),

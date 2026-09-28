@@ -13,6 +13,15 @@ import * as Native from "./ForkCompatibilityNativeService.ts";
 import { forkCompatibilityError } from "./ForkCompatibilityError.ts";
 import type { ForkCompatibilityRun } from "./model.ts";
 
+const disabledRepairPolicy = {
+  enabled: false,
+  preservedIntent: "",
+  maxAttempts: 1,
+  allowedPaths: [],
+  projectId: null,
+  modelSelection: null,
+} as const;
+
 it("uses frozen workspace preparation and full server typecheck/build commands", () => {
   assert.equal(Native.SERVER_VALIDATION_PROFILE.revision, "3");
   assert.deepEqual(
@@ -48,6 +57,7 @@ it.effect(
             get: () => Effect.succeed(null),
             getUsable: () => Effect.succeed(null),
             awaitRun: () => Effect.succeed(null),
+            validateRepairedCandidate: () => Effect.fail(forkCompatibilityError("unused")),
           }),
         );
         const requestRepository = Requests.ForkCompatibilityRequestRepositoryLive.pipe(
@@ -103,6 +113,7 @@ it.effect("reconciles a linked terminal run after restart without starting anoth
         upstreamRemote: "https://github.com/pingdotgg/t3code.git",
         profile: Native.SERVER_VALIDATION_PROFILE,
         profileRevision: Native.SERVER_VALIDATION_PROFILE.revision,
+        repairPolicy: disabledRepairPolicy,
         status: "running",
         runId,
         ownerPid: 999999999,
@@ -166,6 +177,7 @@ it.effect("reconciles a linked terminal run after restart without starting anoth
           get: () => Effect.succeed(readyRun),
           getUsable: () => Effect.succeed(readyRun),
           awaitRun: () => Effect.succeed(readyRun),
+          validateRepairedCandidate: () => Effect.fail(forkCompatibilityError("unused")),
         }),
       );
       const serviceLayer = Native.ForkCompatibilityNativeServiceLive.pipe(
@@ -203,6 +215,7 @@ it.effect(
                 upstreamRemote: "https://github.com/pingdotgg/t3code.git",
                 profile: Native.SERVER_VALIDATION_PROFILE,
                 profileRevision: Native.SERVER_VALIDATION_PROFILE.revision,
+                repairPolicy: disabledRepairPolicy,
                 status: count === 1 ? "queued" : "completed",
                 runId: null,
                 ownerPid: null,
@@ -229,6 +242,7 @@ it.effect(
             get: () => Effect.succeed(null),
             getUsable: () => Effect.succeed(null),
             awaitRun: () => Effect.succeed(null),
+            validateRepairedCandidate: () => Effect.fail(forkCompatibilityError("unused")),
           }),
         );
         const serviceLayer = Native.ForkCompatibilityNativeServiceLive.pipe(
@@ -265,6 +279,7 @@ it.effect("atomically caps concurrent completion waiters and frees capacity on c
         upstreamRemote: "https://github.com/pingdotgg/t3code.git",
         profile: Native.SERVER_VALIDATION_PROFILE,
         profileRevision: Native.SERVER_VALIDATION_PROFILE.revision,
+        repairPolicy: disabledRepairPolicy,
         status,
         runId: null,
         ownerPid: null,
@@ -307,6 +322,7 @@ it.effect("atomically caps concurrent completion waiters and frees capacity on c
           get: () => Effect.succeed(null),
           getUsable: () => Effect.succeed(null),
           awaitRun: () => Effect.succeed(null),
+          validateRepairedCandidate: () => Effect.fail(forkCompatibilityError("unused")),
         }),
       );
       const serviceLayer = Native.ForkCompatibilityNativeServiceLive.pipe(
@@ -380,6 +396,7 @@ it.effect("keeps a shared completion receipt alive when one waiter is cancelled"
             Effect.gen(function* () {
               const request: Requests.ForkCompatibilityRequest = {
                 ...input,
+                repairPolicy: input.repairPolicy ?? disabledRepairPolicy,
                 profileRevision: input.profile.revision,
                 status: "queued",
                 runId: null,
@@ -442,6 +459,7 @@ it.effect("keeps a shared completion receipt alive when one waiter is cancelled"
           get: () => Effect.succeed(run),
           getUsable: () => Effect.succeed(run),
           awaitRun: () => Effect.succeed(run),
+          validateRepairedCandidate: () => Effect.fail(forkCompatibilityError("unused")),
         }),
       );
       const serviceLayer = Native.ForkCompatibilityNativeServiceLive.pipe(
@@ -484,6 +502,7 @@ it.effect(
           upstreamRemote: "https://github.com/pingdotgg/t3code.git",
           profile: Native.SERVER_VALIDATION_PROFILE,
           profileRevision: Native.SERVER_VALIDATION_PROFILE.revision,
+          repairPolicy: disabledRepairPolicy,
           status: "queued",
           runId: null,
           ownerPid: null,
@@ -558,6 +577,7 @@ it.effect(
             get: () => Effect.succeed(run),
             getUsable: () => Effect.succeed(run),
             awaitRun: () => Effect.succeed(run),
+            validateRepairedCandidate: () => Effect.fail(forkCompatibilityError("unused")),
           }),
         );
         const serviceLayer = Native.ForkCompatibilityNativeServiceLive.pipe(

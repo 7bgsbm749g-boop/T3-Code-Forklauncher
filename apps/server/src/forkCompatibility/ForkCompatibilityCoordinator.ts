@@ -92,6 +92,14 @@ export interface ForkCompatibilityCoordinatorShape {
   readonly awaitRun: (
     runId: string,
   ) => Effect.Effect<ForkCompatibilityRun | null, SqlError.SqlError>;
+  /** Re-run the captured profile against a clean worktree of a native repair commit. */
+  readonly validateRepairedCandidate: (input: {
+    readonly baseRunId: string;
+    readonly repairedSha: string;
+    readonly onValidationRunLinked?: (
+      run: ForkCompatibilityRun,
+    ) => Effect.Effect<void, CoordinatorError>;
+  }) => Effect.Effect<ForkCompatibilityRun, CoordinatorError>;
 }
 
 export class ForkCompatibilityCoordinator extends Context.Service<
@@ -164,6 +172,28 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
           treeSha256: NodeCrypto.createHash("sha256").update(status).digest("hex"),
           dirty: status.trim() !== "",
         };
+      });
+
+    const readBranch = (cwd: string) =>
+      Effect.gen(function* () {
+        const result = yield* execGit("ForkCompatibilityCoordinator.branch", cwd, [
+          "symbolic-ref",
+          "--quiet",
+          "--short",
+          "HEAD",
+        ]);
+        yield* expectExit("git symbolic-ref candidate branch", result);
+        return result.stdout.trim();
+      });
+
+    const readTreeSha = (cwd: string, revision: string) =>
+      Effect.gen(function* () {
+        const result = yield* execGit("ForkCompatibilityCoordinator.tree", cwd, [
+          "rev-parse",
+          `${revision}^{tree}`,
+        ]);
+        yield* expectExit("git rev-parse tree", result);
+        return result.stdout.trim();
       });
 
     const mark = (
@@ -451,18 +481,41 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
     const verifyCapturedInputs = (run: ForkCompatibilityRun) =>
       Effect.gen(function* () {
         const cwd = yield* canonicalCandidate(run);
-        const [sourceIdentity, latestTag, latestTargetSha, candidateHead, candidateStatus] =
-          yield* Effect.all([
-            readSourceIdentity(run.repositoryRoot),
-            source.latestStableTag({ repositoryRoot: run.repositoryRoot }),
-            source.resolveStableTagCommit({
-              repositoryRoot: run.repositoryRoot,
-              remote: run.upstreamRemote,
-              tag: run.targetTag,
-            }),
-            readHead(cwd),
-            gitStatus(cwd),
-          ]);
+        const [
+          sourceIdentity,
+          latestTag,
+          latestTargetSha,
+          candidateHead,
+          candidateBranch,
+          candidateStatus,
+          sourceAncestor,
+          targetAncestor,
+          mergeHead,
+        ] = yield* Effect.all([
+          readSourceIdentity(run.repositoryRoot),
+          source.latestStableTag({ repositoryRoot: run.repositoryRoot }),
+          source.resolveStableTagCommit({
+            repositoryRoot: run.repositoryRoot,
+            remote: run.upstreamRemote,
+            tag: run.targetTag,
+          }),
+          readHead(cwd),
+          readBranch(cwd),
+          gitStatus(cwd),
+          isAncestor(
+            cwd,
+            run.sourceSha,
+            "HEAD",
+            "ForkCompatibilityCoordinator.verifySourceAncestor",
+          ),
+          isAncestor(
+            cwd,
+            run.targetSha,
+            "HEAD",
+            "ForkCompatibilityCoordinator.verifyTargetAncestor",
+          ),
+          hasMergeHead(cwd),
+        ]);
         const matches =
           !sourceIdentity.dirty &&
           sourceIdentity.head === run.sourceSha &&
@@ -471,7 +524,11 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
           latestTag === run.targetTag &&
           latestTargetSha === run.targetSha &&
           candidateHead === run.candidateSha &&
-          candidateStatus.trim() === "";
+          candidateBranch === run.candidateBranch &&
+          candidateStatus.trim() === "" &&
+          sourceAncestor &&
+          targetAncestor &&
+          !mergeHead;
         if (!matches) {
           if (run.status === "ready")
             return yield* recordFailure(
@@ -610,10 +667,9 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
         ),
       );
 
-    const runOwned = (
+    const withRunOwner = <A, E>(
       run: ForkCompatibilityRun,
-      recovering: boolean,
-      beforeDrive?: (run: ForkCompatibilityRun) => Effect.Effect<void, CoordinatorError>,
+      action: (ownerToken: string) => Effect.Effect<A, E>,
     ) => {
       const ownerToken = run.ownerToken;
       if (!ownerToken)
@@ -646,16 +702,20 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
             );
           }
         });
-      return Effect.acquireUseRelease(
-        acquire,
-        () =>
-          Effect.gen(function* () {
-            if (beforeDrive) yield* beforeDrive(run);
-            return yield* drive(run, recovering);
-          }),
-        release,
-      );
+      return Effect.acquireUseRelease(acquire, () => action(ownerToken), release);
     };
+
+    const runOwned = (
+      run: ForkCompatibilityRun,
+      recovering: boolean,
+      beforeDrive?: (run: ForkCompatibilityRun) => Effect.Effect<void, CoordinatorError>,
+    ) =>
+      withRunOwner(run, () =>
+        Effect.gen(function* () {
+          if (beforeDrive) yield* beforeDrive(run);
+          return yield* drive(run, recovering);
+        }),
+      );
 
     const refreshReady = (run: ForkCompatibilityRun) =>
       run.status === "ready" ? verifyCapturedInputs(run) : Effect.succeed(run);
@@ -809,6 +869,193 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
       );
     });
 
+    const validateRepairedCandidate: ForkCompatibilityCoordinatorShape["validateRepairedCandidate"] =
+      Effect.fn("ForkCompatibilityCoordinator.validateRepairedCandidate")(function* (input) {
+        if (!isGitSha(input.repairedSha))
+          return yield* forkCompatibilityError("Repair did not produce an exact commit SHA.");
+        const base = yield* repository.get(input.baseRunId);
+        if (!base || !["failed", "merge-conflict"].includes(base.status))
+          return yield* forkCompatibilityError(
+            "Repair validation requires a failed or conflicted captured base run.",
+          );
+        const basePath = yield* canonicalCandidate(base);
+        const [repairedHead, repairedBranch, repairedStatus, repairedMergeHead] = yield* Effect.all(
+          [readHead(basePath), readBranch(basePath), gitStatus(basePath), hasMergeHead(basePath)],
+        );
+        if (
+          repairedHead !== input.repairedSha ||
+          repairedBranch !== base.candidateBranch ||
+          repairedStatus.trim() !== "" ||
+          repairedMergeHead
+        )
+          return yield* forkCompatibilityError(
+            "Repair commit must be HEAD on its original isolated candidate branch with a clean worktree.",
+          );
+        if (base.candidateSha === input.repairedSha)
+          return yield* forkCompatibilityError("Repair produced no new candidate commit.");
+        const [originalTree, repairedTree] = yield* Effect.all([
+          readTreeSha(basePath, base.candidateSha ?? base.sourceSha),
+          readTreeSha(basePath, input.repairedSha),
+        ]);
+        if (originalTree === repairedTree)
+          return yield* forkCompatibilityError("Repair commit contains no candidate tree changes.");
+        const [sourceIdentity, latestTag, latestTargetSha, sourceAncestor, targetAncestor] =
+          yield* Effect.all([
+            readSourceIdentity(base.repositoryRoot),
+            source.latestStableTag({ repositoryRoot: base.repositoryRoot }),
+            source.resolveStableTagCommit({
+              repositoryRoot: base.repositoryRoot,
+              remote: base.upstreamRemote,
+              tag: base.targetTag,
+            }),
+            isAncestor(
+              basePath,
+              base.sourceSha,
+              "HEAD",
+              "ForkCompatibilityCoordinator.repairSourceAncestor",
+            ),
+            isAncestor(
+              basePath,
+              base.targetSha,
+              "HEAD",
+              "ForkCompatibilityCoordinator.repairTargetAncestor",
+            ),
+          ]);
+        if (
+          sourceIdentity.dirty ||
+          sourceIdentity.head !== base.sourceSha ||
+          sourceIdentity.branch !== base.sourceBranch ||
+          sourceIdentity.treeSha256 !== base.sourceTreeSha256 ||
+          latestTag !== base.targetTag ||
+          latestTargetSha !== base.targetSha ||
+          !sourceAncestor ||
+          !targetAncestor
+        )
+          return yield* forkCompatibilityError(
+            "Source, stable target, or repair ancestry changed; repaired candidate is stale.",
+          );
+
+        const latest = yield* repository.latestForIdentity(base);
+        if (latest && latest.runId !== base.runId && latest.candidateSha === input.repairedSha) {
+          // Duplicate native completion callback or a crash after the
+          // validation row was claimed: the same exact repair commit already
+          // owns fresh validation evidence, so never create another candidate.
+          if (input.onValidationRunLinked) yield* input.onValidationRunLinked(latest);
+          if (latest.status === "ready") return (yield* getUsable(latest.runId)) ?? latest;
+          if (["claimed", "merging", "validating"].includes(latest.status)) {
+            if (activeRunOwners.get(latest.runId)?.token === latest.ownerToken)
+              return (yield* awaitRun(latest.runId)) ?? latest;
+            const ownership = yield* acquireOrJoin(latest);
+            if (!ownership.acquired) return ownership.run;
+            const worktreeExists = yield* fs.exists(latest.candidatePath);
+            if (!worktreeExists) {
+              // The durable row pins the exact repair SHA before the Git side
+              // effect. If the process died before creating the owned path,
+              // recovery can safely create that same candidate once.
+              return yield* withRunOwner(ownership.run, () =>
+                Effect.gen(function* () {
+                  const created = yield* git.createWorktree({
+                    cwd: base.repositoryRoot,
+                    refName: input.repairedSha,
+                    newRefName: latest.candidateBranch,
+                    path: latest.candidatePath,
+                  });
+                  if (created.worktree.path !== latest.candidatePath)
+                    return yield* recordFailure(
+                      ownership.run,
+                      "failed",
+                      "Git created repaired validation candidate at an unexpected path.",
+                      undefined,
+                      undefined,
+                      ownership.run.ownerToken ?? undefined,
+                    );
+                  return yield* runChecks(ownership.run);
+                }),
+              );
+            }
+            // A prior owner may have started checks before a crash. Replaying
+            // commands would duplicate potentially destructive validation.
+            return yield* withRunOwner(ownership.run, () =>
+              recordFailure(
+                ownership.run,
+                "failed",
+                "Repaired validation was interrupted; commands were not replayed.",
+                undefined,
+                undefined,
+                ownership.run.ownerToken ?? undefined,
+              ),
+            );
+          }
+          return latest;
+        }
+
+        const root = yield* fs.realPath(candidateRoot);
+        const runId = NodeCrypto.randomUUID();
+        const candidatePath = path.join(root, runId);
+        const candidateBranch = `t3code-fork-compat-${runId}`;
+        const claim = yield* repository.claim({
+          repositoryRoot: base.repositoryRoot,
+          sourceSha: base.sourceSha,
+          sourceBranch: base.sourceBranch,
+          sourceTreeSha256: base.sourceTreeSha256,
+          targetTag: base.targetTag,
+          targetSha: base.targetSha,
+          profileId: base.profileId,
+          profileRevision: base.profileRevision,
+          profileSha256: base.profileSha256,
+          runId,
+          upstreamRemote: base.upstreamRemote,
+          profile: base.profile,
+          candidatePath,
+          candidateBranch,
+          attempt: (latest?.attempt ?? base.attempt) + 1,
+          ownerPid: NodeProcess.pid,
+          ownerToken: NodeCrypto.randomUUID(),
+          initialStatus: "validating",
+          candidateSha: input.repairedSha,
+          now: yield* now,
+        });
+        if (input.onValidationRunLinked) yield* input.onValidationRunLinked(claim.run);
+        if (!claim.created) {
+          if (["claimed", "merging", "validating"].includes(claim.run.status)) {
+            const ownership = yield* acquireOrJoin(claim.run);
+            return ownership.acquired
+              ? yield* withRunOwner(ownership.run, () =>
+                  recordFailure(
+                    ownership.run,
+                    "failed",
+                    "Repaired validation was interrupted; commands were not replayed.",
+                    undefined,
+                    undefined,
+                    ownership.run.ownerToken ?? undefined,
+                  ),
+                )
+              : ownership.run;
+          }
+          return claim.run;
+        }
+        return yield* withRunOwner(claim.run, () =>
+          Effect.gen(function* () {
+            const created = yield* git.createWorktree({
+              cwd: base.repositoryRoot,
+              refName: input.repairedSha,
+              newRefName: candidateBranch,
+              path: candidatePath,
+            });
+            if (created.worktree.path !== candidatePath)
+              return yield* recordFailure(
+                claim.run,
+                "failed",
+                "Git created repaired validation candidate at an unexpected path.",
+                undefined,
+                undefined,
+                claim.run.ownerToken ?? undefined,
+              );
+            return yield* runChecks(claim.run);
+          }),
+        );
+      });
+
     const reconcile: ForkCompatibilityCoordinatorShape["reconcile"] = Effect.fn(
       "ForkCompatibilityCoordinator.reconcile",
     )(function* () {
@@ -876,6 +1123,7 @@ export const makeForkCompatibilityCoordinator = (options: { readonly candidateRo
       get: repository.get,
       getUsable,
       awaitRun,
+      validateRepairedCandidate,
     } satisfies ForkCompatibilityCoordinatorShape;
   });
 

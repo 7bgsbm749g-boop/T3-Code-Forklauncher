@@ -4,11 +4,18 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlError from "effect/unstable/sql/SqlError";
+import {
+  ForkCompatibilityRepairPolicy,
+  type ForkCompatibilityRepairPolicy as RepairPolicy,
+} from "@t3tools/contracts";
 import { ForkCompatibilityError, forkCompatibilityError } from "./ForkCompatibilityError.ts";
 import { ValidationProfileSchema, type ValidationProfile } from "./model.ts";
 
 const encodeProfile = Schema.encodeEffect(Schema.fromJsonString(ValidationProfileSchema));
 const decodeProfile = Schema.decodeUnknownSync(Schema.fromJsonString(ValidationProfileSchema));
+const repairPolicyJson = Schema.fromJsonString(ForkCompatibilityRepairPolicy);
+const encodeRepairPolicy = Schema.encodeEffect(repairPolicyJson);
+const decodeRepairPolicy = Schema.decodeUnknownSync(repairPolicyJson);
 
 export interface ForkCompatibilityRequest {
   readonly requestId: string;
@@ -18,6 +25,7 @@ export interface ForkCompatibilityRequest {
   readonly upstreamRemote: string;
   readonly profile: ValidationProfile;
   readonly profileRevision: string;
+  readonly repairPolicy: RepairPolicy;
   readonly status: "queued" | "running" | "completed" | "failed" | "stale";
   readonly runId: string | null;
   readonly ownerPid: number | null;
@@ -26,7 +34,10 @@ export interface ForkCompatibilityRequest {
   readonly createdAt: string;
   readonly updatedAt: string;
 }
-type Row = Omit<ForkCompatibilityRequest, "profile"> & { readonly profileJson: string };
+type Row = Omit<ForkCompatibilityRequest, "profile" | "repairPolicy"> & {
+  readonly profileJson: string;
+  readonly repairPolicyJson: string;
+};
 export interface AcceptInput {
   readonly requestId: string;
   readonly idempotencyKey: string;
@@ -34,6 +45,7 @@ export interface AcceptInput {
   readonly repositoryRoot: string;
   readonly upstreamRemote: string;
   readonly profile: ValidationProfile;
+  readonly repairPolicy?: RepairPolicy;
   readonly now: string;
 }
 export interface ForkCompatibilityRequestRepositoryShape {
@@ -87,8 +99,9 @@ export class ForkCompatibilityRequestRepository extends Context.Service<
 const decode = (row: Row): ForkCompatibilityRequest => ({
   ...row,
   profile: decodeProfile(row.profileJson),
+  repairPolicy: decodeRepairPolicy(row.repairPolicyJson),
 });
-const columns = `request_id AS "requestId", idempotency_key AS "idempotencyKey", payload_sha256 AS "payloadSha256", repository_root AS "repositoryRoot", upstream_remote AS "upstreamRemote", profile_json AS "profileJson", profile_revision AS "profileRevision", status, run_id AS "runId", owner_pid AS "ownerPid", owner_token AS "ownerToken", error, created_at AS "createdAt", updated_at AS "updatedAt"`;
+const columns = `request_id AS "requestId", idempotency_key AS "idempotencyKey", payload_sha256 AS "payloadSha256", repository_root AS "repositoryRoot", upstream_remote AS "upstreamRemote", profile_json AS "profileJson", profile_revision AS "profileRevision", repair_policy_json AS "repairPolicyJson", status, run_id AS "runId", owner_pid AS "ownerPid", owner_token AS "ownerToken", error, created_at AS "createdAt", updated_at AS "updatedAt"`;
 /** @public Service construction is part of the canonical Effect module API. */
 export const makeForkCompatibilityRequestRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -117,7 +130,17 @@ export const makeForkCompatibilityRequestRepository = Effect.gen(function* () {
     "ForkCompatibilityRequestRepository.accept",
   )(function* (input) {
     const profileJson = yield* encodeProfile(input.profile);
-    yield* sql`INSERT INTO fork_compatibility_requests (request_id,idempotency_key,payload_sha256,repository_root,upstream_remote,profile_json,profile_revision,status,created_at,updated_at) VALUES (${input.requestId},${input.idempotencyKey},${input.payloadSha256},${input.repositoryRoot},${input.upstreamRemote},${profileJson},${input.profile.revision},'queued',${input.now},${input.now}) ON CONFLICT(idempotency_key) DO NOTHING`;
+    const encodedRepairPolicy = yield* encodeRepairPolicy(
+      input.repairPolicy ?? {
+        enabled: false,
+        preservedIntent: "",
+        maxAttempts: 1,
+        allowedPaths: [],
+        projectId: null,
+        modelSelection: null,
+      },
+    );
+    yield* sql`INSERT INTO fork_compatibility_requests (request_id,idempotency_key,payload_sha256,repository_root,upstream_remote,profile_json,profile_revision,repair_policy_json,status,created_at,updated_at) VALUES (${input.requestId},${input.idempotencyKey},${input.payloadSha256},${input.repositoryRoot},${input.upstreamRemote},${profileJson},${input.profile.revision},${encodedRepairPolicy},'queued',${input.now},${input.now}) ON CONFLICT(idempotency_key) DO NOTHING`;
     const request = yield* getByKey(input.idempotencyKey);
     if (!request) return yield* forkCompatibilityError("Accepted request could not be read.");
     if (request.payloadSha256 !== input.payloadSha256)
@@ -144,7 +167,7 @@ export const makeForkCompatibilityRequestRepository = Effect.gen(function* () {
     "ForkCompatibilityRequestRepository.markStale",
   )(function* (requestId, now) {
     const rows =
-      yield* sql`UPDATE fork_compatibility_requests SET status='stale',error='Candidate evidence is no longer fresh.',updated_at=${now} WHERE request_id=${requestId} AND status='completed' RETURNING request_id`;
+      yield* sql`UPDATE fork_compatibility_requests SET status='stale',error='Candidate evidence is no longer fresh.',updated_at=${now} WHERE request_id=${requestId} AND status IN ('completed','failed') RETURNING request_id`;
     return rows.length > 0;
   });
   const listRecoverable: ForkCompatibilityRequestRepositoryShape["listRecoverable"] = Effect.fn(
