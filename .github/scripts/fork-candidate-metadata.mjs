@@ -1,9 +1,104 @@
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
 
 const fullShaPattern = /^[0-9a-f]{40}$/i;
 const stableTagPattern = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const versionPattern =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?$/;
+export const candidateWorkflowSourcePaths = [
+  ".github/actions/setup-apt-mirrors/action.yml",
+  ".github/scripts/fork-candidate-metadata.mjs",
+  ".github/scripts/fork-candidate-versions.mjs",
+  ".github/workflows/fork-candidate.yml",
+  ".github/workflows/release-desktop.yml",
+  "scripts/smoke-cli-archive.ts",
+  "scripts/update-release-package-versions.ts",
+].sort();
+
+export async function candidateWorkflowDefinitionSha256(root) {
+  const entries = [];
+  for (const path of candidateWorkflowSourcePaths) {
+    const bytes = await NodeFSP.readFile(NodePath.join(root, path));
+    entries.push(`${path}\n${NodeCrypto.createHash("sha256").update(bytes).digest("hex")}`);
+  }
+  return NodeCrypto.createHash("sha256").update(entries.join("\n")).digest("hex");
+}
+
+async function hashFile(path) {
+  const hash = NodeCrypto.createHash("sha256");
+  let size = 0;
+  for await (const chunk of NodeFS.createReadStream(path)) {
+    size += chunk.length;
+    hash.update(chunk);
+  }
+  return { size, sha256: hash.digest("hex") };
+}
+
+export async function stageCandidateReleaseAssets(workRoot, releaseRoot, candidateVersion) {
+  if (typeof candidateVersion !== "string" || !versionPattern.test(candidateVersion))
+    throw new Error("candidate asset staging requires an explicit semantic version");
+  const required = [
+    {
+      directory: "builds/linux-cli",
+      group: "linux-cli-server",
+      match: (name) => name === `t3-${candidateVersion}-linux-x64.tar.gz`,
+    },
+    {
+      directory: "builds/windows",
+      group: "windows-desktop",
+      match: (name) =>
+        name === `T3-Code-${candidateVersion}-x64.exe` ||
+        name === `T3-Code-${candidateVersion}-x64.exe.blockmap` ||
+        name === "latest-win-x64.yml",
+    },
+  ];
+  const selected = [];
+  for (const spec of required) {
+    const directory = NodePath.join(workRoot, spec.directory);
+    const names = await NodeFSP.readdir(directory);
+    const matches = names.filter(spec.match);
+    if (spec.directory.endsWith("linux-cli") && matches.length !== 1)
+      throw new Error("candidate must contain exactly one x64 Linux CLI archive");
+    if (spec.directory.endsWith("windows")) {
+      const installers = matches.filter((name) => name.endsWith(".exe"));
+      if (
+        installers.length !== 1 ||
+        !matches.includes(`${installers[0]}.blockmap`) ||
+        !matches.includes("latest-win-x64.yml") ||
+        matches.length !== 3
+      )
+        throw new Error(
+          "candidate must contain the Windows installer, blockmap and update manifest",
+        );
+    }
+    for (const name of matches) {
+      const source = NodePath.join(directory, name);
+      const stat = await NodeFSP.lstat(source);
+      if (!stat.isFile() || stat.isSymbolicLink())
+        throw new Error(`candidate asset is not a regular file: ${name}`);
+      selected.push({ source, path: `${spec.directory}/${name}`, group: spec.group });
+    }
+  }
+  const serverBundle = "builds/js-bundle/server-dist.tar.gz";
+  const serverPath = NodePath.join(workRoot, serverBundle);
+  const serverStat = await NodeFSP.lstat(serverPath);
+  if (!serverStat.isFile() || serverStat.isSymbolicLink())
+    throw new Error("candidate server distribution archive is missing or unsafe");
+  selected.push({ source: serverPath, path: serverBundle, group: "linux-cli-server" });
+  await NodeFSP.mkdir(releaseRoot, { recursive: true });
+  const assets = [];
+  for (const item of selected.sort((left, right) => left.path.localeCompare(right.path))) {
+    const destination = NodePath.join(releaseRoot, item.path);
+    await NodeFSP.mkdir(NodePath.dirname(destination), { recursive: true });
+    await NodeFSP.copyFile(item.source, destination, NodeFS.constants.COPYFILE_EXCL);
+    const { size, sha256 } = await hashFile(destination);
+    assets.push({ group: item.group, path: item.path, size, sha256 });
+  }
+  return assets;
+}
 
 export function validateCandidateMetadata(input) {
   const sha = (value, label) => {
@@ -130,7 +225,13 @@ export async function fetchOfficialLatestStableRelease(expectedTag) {
   return release;
 }
 
-export function createCandidateManifest(input, officialRelease, gitEvidence, versionAlignment) {
+export function createCandidateManifest(
+  input,
+  officialRelease,
+  gitEvidence,
+  versionAlignment,
+  build = {},
+) {
   const metadata = validateCandidateMetadata(input);
   const release = validateOfficialStableRelease(officialRelease, metadata.officialStableTag);
   for (const [key, expected] of [
@@ -159,6 +260,26 @@ export function createCandidateManifest(input, officialRelease, gitEvidence, ver
   ) {
     throw new Error("candidate version/feed build inputs were not verified");
   }
+  if (
+    !/^[1-9]\d*$/.test(String(build.workflowRunId ?? "")) ||
+    build.workflowRef !== "refs/heads/forklauncher" ||
+    !/^[0-9a-f]{64}$/i.test(build.validationProfileSha256 ?? "") ||
+    !fullShaPattern.test(build.workflowCommitSha ?? "") ||
+    !/^[0-9a-f]{64}$/i.test(build.workflowDefinitionSha256 ?? "") ||
+    !Array.isArray(build.assets) ||
+    !build.assets.some((asset) => asset.group === "linux-cli-server") ||
+    !build.assets.some((asset) => asset.group === "windows-desktop") ||
+    build.assets.some(
+      (asset) =>
+        typeof asset.path !== "string" ||
+        !/^[0-9a-f]{64}$/i.test(asset.sha256 ?? "") ||
+        !Number.isSafeInteger(asset.size) ||
+        asset.size < 1 ||
+        !["linux-cli-server", "windows-desktop"].includes(asset.group),
+    )
+  ) {
+    throw new Error("candidate workflow provenance or required build assets are incomplete");
+  }
   return {
     schemaVersion: 2,
     ...metadata,
@@ -166,6 +287,14 @@ export function createCandidateManifest(input, officialRelease, gitEvidence, ver
     officialRelease: release,
     gitEvidence,
     versionAlignment,
+    build: {
+      workflowRunId: String(build.workflowRunId),
+      workflowRef: build.workflowRef,
+      workflowCommitSha: build.workflowCommitSha.toLowerCase(),
+      workflowDefinitionSha256: build.workflowDefinitionSha256.toLowerCase(),
+      validationProfileSha256: build.validationProfileSha256.toLowerCase(),
+      assets: build.assets,
+    },
     acceptanceStatus: "artifact-only; not accepted for merge or release",
     freshness: "official latest stable at artifact validation time; revalidate before promotion",
   };

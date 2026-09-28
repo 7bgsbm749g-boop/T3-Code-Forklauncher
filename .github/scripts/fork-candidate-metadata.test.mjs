@@ -6,6 +6,9 @@ import * as NodePath from "node:path";
 import * as NodeTest from "node:test";
 import {
   createCandidateManifest,
+  candidateWorkflowDefinitionSha256,
+  candidateWorkflowSourcePaths,
+  stageCandidateReleaseAssets,
   validateCandidateMetadata,
   validateOfficialStableRelease,
   verifyCandidateGit,
@@ -66,6 +69,100 @@ function validAlignment(input) {
     substitution: "scripts/update-release-package-versions.ts",
   };
 }
+function validBuild() {
+  return {
+    workflowRunId: "12345",
+    workflowRef: "refs/heads/forklauncher",
+    workflowCommitSha: "e".repeat(40),
+    workflowDefinitionSha256: "f".repeat(64),
+    validationProfileSha256: "a".repeat(64),
+    assets: [
+      {
+        group: "linux-cli-server",
+        path: "builds/linux-cli/t3.tar.gz",
+        size: 1,
+        sha256: "b".repeat(64),
+      },
+      { group: "windows-desktop", path: "builds/windows/t3.exe", size: 1, sha256: "c".repeat(64) },
+    ],
+  };
+}
+
+NodeTest.test(
+  "stages only the exact distributable files from the measured 4,464-file legacy package layout",
+  async (t) => {
+    const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "candidate-layout-"));
+    t.after(() => NodeFSP.rm(root, { recursive: true, force: true }));
+    const work = NodePath.join(root, "candidate-work");
+    const output = NodePath.join(root, "candidate-artifacts");
+    const write = async (relative, content = "x") => {
+      const path = NodePath.join(work, relative);
+      await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true });
+      await NodeFSP.writeFile(path, content);
+    };
+    await write("builds/linux-cli/t3-0.0.43-fork.1-linux-x64.tar.gz", "cli");
+    await write("builds/linux-desktop/T3-Code-0.0.43-fork.1-x86_64.AppImage");
+    await write("builds/linux-desktop/latest-linux.yml");
+    await write("builds/linux-desktop/builder-debug.yml");
+    await write("builds/linux-resource-monitor/t3-resource-monitor");
+    await write("builds/js-bundle/server/dist/bin.mjs");
+    await write("builds/js-bundle/server/dist/client/index.html");
+    await write("builds/js-bundle/server/dist/client/manifest.webmanifest");
+    const assetDir = "builds/js-bundle/server/dist/client/assets";
+    for (let batch = 0; batch < 44; batch++) {
+      await Promise.all(
+        Array.from({ length: 100 }, (_, item) =>
+          write(`${assetDir}/chunk-${batch * 100 + item}.js.map`),
+        ),
+      );
+    }
+    for (let item = 0; item < 27; item++) await write(`${assetDir}/chunk-tail-${item}.js.map`);
+    await write("builds/js-bundle/server-dist.tar.gz", "server-dist");
+    for (let item = 0; item < 21; item++)
+      await write(`builds/js-bundle/desktop/dist-electron/part-${item}.cjs`);
+    const installer = "T3-Code-0.0.43-fork.1-x64.exe";
+    await write(`builds/windows/${installer}`, "installer");
+    await write(`builds/windows/${installer}.blockmap`, "blockmap");
+    await write("builds/windows/latest-win-x64.yml", "version: 0.0.43-fork.1\n");
+    await write("builds/windows/builder-debug.yml");
+    await write("builds/windows-resource-monitor/t3-resource-monitor.exe");
+    await write("verified-candidate-identity.json", "{}");
+    await write("metadata/version-alignment.json", "{}");
+    const oldLayoutCount = await (async function list(dir) {
+      let count = 0;
+      for (const entry of await NodeFSP.readdir(dir, { withFileTypes: true })) {
+        const child = NodePath.join(dir, entry.name);
+        count += entry.isDirectory() ? await list(child) : 1;
+      }
+      return count;
+    })(work);
+    NodeAssert.equal(oldLayoutCount, 4464);
+    const assets = await stageCandidateReleaseAssets(work, output, candidateVersion);
+    NodeAssert.deepEqual(
+      assets.map((asset) => asset.path),
+      [
+        "builds/js-bundle/server-dist.tar.gz",
+        "builds/linux-cli/t3-0.0.43-fork.1-linux-x64.tar.gz",
+        "builds/windows/latest-win-x64.yml",
+        `builds/windows/${installer}`,
+        `builds/windows/${installer}.blockmap`,
+      ],
+    );
+    NodeAssert.equal((await NodeFSP.readdir(NodePath.join(output, "builds/js-bundle"))).length, 1);
+    await NodeAssert.rejects(
+      stageCandidateReleaseAssets(work, NodePath.join(root, "wrong-version"), "0.0.42"),
+      /exactly one x64 Linux CLI archive/,
+    );
+    const trustedRoot = NodePath.join(root, "trusted-control");
+    for (const path of candidateWorkflowSourcePaths) {
+      const file = NodePath.join(trustedRoot, path);
+      await NodeFSP.mkdir(NodePath.dirname(file), { recursive: true });
+      await NodeFSP.writeFile(file, `pinned:${path}\n`);
+    }
+    const definitionDigest = await candidateWorkflowDefinitionSha256(trustedRoot);
+    NodeAssert.match(definitionDigest, /^[0-9a-f]{64}$/);
+  },
+);
 
 NodeTest.test("validates full identities and exact official latest stable release metadata", () => {
   const input = {
@@ -117,6 +214,7 @@ NodeTest.test(
       release,
       evidence,
       validAlignment(fixture.input),
+      validBuild(),
     );
     NodeAssert.equal(manifest.gitEvidence.candidateCommitSha, fixture.input.candidateSha);
     NodeAssert.equal(manifest.targetSha, fixture.input.targetSha);

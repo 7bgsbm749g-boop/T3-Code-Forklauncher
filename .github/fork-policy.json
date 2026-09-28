@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "repository": "7bgsbm749g-boop/T3-Code-Forklauncher",
+  "targetBranch": "forklauncher",
+  "directPushBypass": false,
+  "directPushActorId": null,
+  "nativeIntegration": {
+    "appId": null
+  },
+  "aggregateCheck": {
+    "name": "T3 Fork Compatibility",
+    "appId": null
+  },
+  "compatibilityEvidence": {
+    "checkName": "T3 Fork Compatibility",
+    "trustedAppId": null,
+    "profileId": "t3-server-default",
+    "profileRevision": "3",
+    "profileSha256": "084c6c871325d2f9d2fb5a38b70bca36aa72d7c2f77d7a2a4dd580d8b1745b97",
+    "commands": [
+      { "command": "vp", "args": ["i", "--frozen-lockfile"] },
+      { "command": "vp", "args": ["run", "--filter", "t3", "typecheck"] },
+      { "command": "vp", "args": ["run", "--filter", "t3", "build:bundle"] }
+    ]
+  },
+  "pullRequestWorkflows": [
+    { "file": "ci.yml", "name": "CI" },
+    { "file": "fork-validation.yml", "name": "Fork release feed checks" }
+  ]
+}

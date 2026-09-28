@@ -37,7 +37,15 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { Command, Flag } from "effect/unstable/cli";
 
-import { migrationManifest, runMigrations } from "../src/persistence/Migrations.ts";
+import {
+  FORK_MIGRATIONS_TABLE,
+  UPSTREAM_MIGRATIONS_TABLE,
+  currentUpstreamMigrationManifest,
+  forkMigrationManifest,
+  migrationManifest,
+  runMigrations,
+  upstreamMigrationManifest,
+} from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 export class MigrateDevDbNotInWorktreeError extends Schema.TaggedError<MigrateDevDbNotInWorktreeError>()(
@@ -332,18 +340,65 @@ const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigra
   };
 });
 
-/** Compare this checkout's migration registry against what the cloned
- * database recorded: same slot under a different name means the migration
- * was skipped, not applied. */
-const verifyMigrationSlots = Effect.fn("verifyMigrationSlots")(function* () {
+/** Check legacy common slots before migration can fail closed with its
+ * lineage error. Keep this early diagnostic compatible with the CLI's
+ * actionable slot-collision message. */
+const verifyLegacyMigrationSlots = Effect.fn("verifyLegacyMigrationSlots")(function* () {
   const sql = yield* SqlClient.SqlClient;
   const applied = yield* sql<{ migration_id: number; name: string }>`
     SELECT migration_id, name FROM effect_sql_migrations`;
   const appliedById = new Map(applied.map((row) => [Number(row.migration_id), row.name]));
-  for (const [slot, codeName] of migrationManifest) {
+  for (const [slot, codeName] of migrationManifest.filter(([id]) => id <= 52)) {
     const appliedName = appliedById.get(slot);
     if (appliedName !== undefined && appliedName !== codeName) {
       return yield* new MigrateDevDbSlotCollisionError({ slot, codeName, appliedName });
+    }
+  }
+});
+
+/** Verify the independently tracked histories after startup migration. The
+ * old effect ledger may legitimately contain either nightly 53/54 or the
+ * historical fork 53-59; those names are reconciled by runMigrations and are
+ * deliberately not compared to the fork registry here. */
+const verifyMigrationSlots = Effect.fn("verifyMigrationSlots")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const tables = [
+    {
+      table: UPSTREAM_MIGRATIONS_TABLE,
+      manifest: upstreamMigrationManifest,
+      required: currentUpstreamMigrationManifest,
+    },
+    {
+      table: FORK_MIGRATIONS_TABLE,
+      manifest: forkMigrationManifest,
+      required: forkMigrationManifest,
+    },
+  ] as const;
+  for (const { table, manifest, required } of tables) {
+    const rows = yield* sql<{ migration_id: number; name: string }>`
+      SELECT migration_id, name FROM ${sql(table)} ORDER BY migration_id`;
+    const appliedById = new Map(rows.map((row) => [Number(row.migration_id), row.name]));
+    for (const [slot, codeName] of required) {
+      const appliedName = appliedById.get(slot);
+      if (appliedName !== undefined && appliedName !== codeName) {
+        return yield* new MigrateDevDbSlotCollisionError({ slot, codeName, appliedName });
+      }
+      if (appliedName === undefined) {
+        return yield* new MigrateDevDbSlotCollisionError({
+          slot,
+          codeName,
+          appliedName: "<missing>",
+        });
+      }
+    }
+    for (const row of rows) {
+      if (!manifest.some(([slot]) => slot === Number(row.migration_id))) {
+        return yield* new MigrateDevDbSlotCollisionError({
+          slot: Number(row.migration_id),
+          codeName: "<unregistered>",
+          appliedName: row.name,
+        });
+      }
     }
   }
 });
@@ -424,6 +479,18 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
     }).pipe(
       Effect.provide(NodeSqliteClient.layer({ filename: sourcePath, readonly: true })),
       wrapPhase("snapshot", sourcePath),
+    );
+
+    // Preserve the long-standing actionable diagnostic for a common
+    // upstream slot collision before the lineage-aware runner rejects it.
+    yield* verifyLegacyMigrationSlots().pipe(
+      Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new MigrateDevDbPhaseError({ phase: "verify", databasePath: snapshotPath, cause }),
+          ),
+      }),
     );
 
     // Migrate before pruning: a source older than this checkout would

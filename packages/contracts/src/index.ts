@@ -33,6 +33,7 @@ export * from "./editor.ts";
 export * from "./project.ts";
 export * from "./filesystem.ts";
 export * from "./forkCompatibility.ts";
+export * from "./forkGithub.ts";
 export * from "./agentSessions.ts";
 export * from "./assets.ts";
 export * from "./review.ts";

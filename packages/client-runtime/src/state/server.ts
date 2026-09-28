@@ -1123,6 +1123,30 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:fork-compatibility-schedule-status",
       tag: WS_METHODS.forkCompatibilityScheduleStatus,
     }),
+    forkGithubConfigure: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-configure",
+      tag: WS_METHODS.forkGithubConfigure,
+    }),
+    forkGithubRead: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-read",
+      tag: WS_METHODS.forkGithubRead,
+    }),
+    forkGithubSubmitPromotion: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-submit-promotion",
+      tag: WS_METHODS.forkGithubSubmitPromotion,
+    }),
+    forkGithubSubmitDraft: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-submit-draft",
+      tag: WS_METHODS.forkGithubSubmitDraft,
+    }),
+    forkGithubStatus: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-status",
+      tag: WS_METHODS.forkGithubStatus,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.operationId]),
+      },
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

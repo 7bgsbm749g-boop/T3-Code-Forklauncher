@@ -23,6 +23,10 @@ on:
         description: Candidate semver used for package metadata, for example 0.0.43-fork.1
         required: true
         type: string
+      validation_profile_sha256:
+        description: Digest of the native validation profile whose run permits promotion
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -37,6 +41,9 @@ jobs:
       candidate_sha: ${{ steps.verify.outputs.candidate_sha }}
       candidate_version: ${{ steps.verify.outputs.candidate_version }}
     steps:
+      - name: Require the trusted fork workflow ref
+        if: github.ref != 'refs/heads/forklauncher'
+        run: exit 1
       # Keep the validator sourced from the workflow revision. Candidate source
       # is checked out separately only after scalar input validation succeeds.
       - name: Checkout trusted workflow tools without credentials
@@ -58,6 +65,7 @@ jobs:
           TARGET_SHA: ${{ inputs.target_sha }}
           OFFICIAL_STABLE_TAG: ${{ inputs.official_stable_tag }}
           CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+          VALIDATION_PROFILE_SHA256: ${{ inputs.validation_profile_sha256 }}
         run: |
           node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
           import { validateCandidateMetadata } from './.github/scripts/fork-candidate-metadata.mjs';
@@ -68,6 +76,7 @@ jobs:
             officialStableTag: process.env.OFFICIAL_STABLE_TAG,
             candidateVersion: process.env.CANDIDATE_VERSION,
           });
+          if (!/^[0-9a-f]{64}$/i.test(process.env.VALIDATION_PROFILE_SHA256 ?? '')) throw new Error('validation_profile_sha256 must be a full SHA-256');
           for (const [key, value] of Object.entries(result)) console.log(`${key}=${value}`);
           NODE
       - name: Checkout exact candidate commit without credentials
@@ -180,8 +189,22 @@ jobs:
           run-install: false
       - name: Install bundle dependencies
         run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Checkout pinned workflow control source
+        shell: bash
+        env:
+          WORKFLOW_CONTROL_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir workflow-control
+          cd workflow-control
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_CONTROL_REF"
+          test "$(git rev-parse FETCH_HEAD)" = "$WORKFLOW_CONTROL_REF"
+          git sparse-checkout set --no-cone '/.github/actions/setup-apt-mirrors/action.yml'
+          git checkout --detach FETCH_HEAD
       - name: Configure Linux build dependencies
-        uses: ./.github/actions/setup-apt-mirrors
+        uses: ./workflow-control/.github/actions/setup-apt-mirrors
       - name: Install desktop secret store dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - name: Capture, align, and verify package versions
@@ -299,38 +322,38 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: candidate-identity
-          path: candidate-artifacts
+          path: candidate-work
       - name: Download version alignment evidence
         uses: actions/download-artifact@v8
         with:
           name: candidate-version-alignment
-          path: candidate-artifacts/metadata
+          path: candidate-work/metadata
       - name: Download Linux outputs
         uses: actions/download-artifact@v8
         with:
           name: cli-linux-x64
-          path: candidate-artifacts/builds/linux-cli
+          path: candidate-work/builds/linux-cli
       - uses: actions/download-artifact@v8
         with:
           name: desktop-linux-x64
-          path: candidate-artifacts/builds/linux-desktop
+          path: candidate-work/builds/linux-desktop
       - uses: actions/download-artifact@v8
         with:
           name: resource-monitor-linux-x64
-          path: candidate-artifacts/builds/linux-resource-monitor
+          path: candidate-work/builds/linux-resource-monitor
       - uses: actions/download-artifact@v8
         with:
           name: js-bundle
-          path: candidate-artifacts/builds/js-bundle
+          path: candidate-work/builds/js-bundle
       - name: Download Windows outputs
         uses: actions/download-artifact@v8
         with:
           name: desktop-win-x64
-          path: candidate-artifacts/builds/windows
+          path: candidate-work/builds/windows
       - uses: actions/download-artifact@v8
         with:
           name: resource-monitor-win32-x64
-          path: candidate-artifacts/builds/windows-resource-monitor
+          path: candidate-work/builds/windows-resource-monitor
       - name: Checkout trusted manifest helper without credentials
         shell: bash
         env:
@@ -348,15 +371,30 @@ jobs:
         env:
           CANDIDATE_VERSION: ${{ needs.validate.outputs.candidate_version }}
           WINDOWS_FEED_TESTS: ${{ needs.windows_feed_tests.result }}
+          VALIDATION_PROFILE_SHA256: ${{ inputs.validation_profile_sha256 }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_CONTROL_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -czf candidate-work/builds/js-bundle/server-dist.tar.gz \
+            -C candidate-work/builds/js-bundle/server dist
           node --input-type=module <<'NODE'
           import { readFile, writeFile } from 'node:fs/promises';
-          import { createCandidateManifest } from './workflow-tools/.github/scripts/fork-candidate-metadata.mjs';
-          const identity = JSON.parse(await readFile('candidate-artifacts/verified-candidate-identity.json', 'utf8'));
-          const versions = JSON.parse(await readFile('candidate-artifacts/metadata/version-alignment.json', 'utf8'));
+          import { createCandidateManifest, candidateWorkflowDefinitionSha256, stageCandidateReleaseAssets } from './workflow-tools/.github/scripts/fork-candidate-metadata.mjs';
+          const identity = JSON.parse(await readFile('candidate-work/verified-candidate-identity.json', 'utf8'));
+          const versions = JSON.parse(await readFile('candidate-work/metadata/version-alignment.json', 'utf8'));
           if (versions.candidateVersion !== process.env.CANDIDATE_VERSION) throw new Error('version provenance does not match tested candidate');
-          const manifest = createCandidateManifest(identity.input, identity.release, identity.evidence, versions);
+          const assets = await stageCandidateReleaseAssets('candidate-work', 'candidate-artifacts', process.env.CANDIDATE_VERSION);
+          const manifest = createCandidateManifest(identity.input, identity.release, identity.evidence, versions, {
+            workflowRunId: process.env.WORKFLOW_RUN_ID,
+            workflowRef: process.env.WORKFLOW_REF,
+            workflowCommitSha: process.env.WORKFLOW_CONTROL_SHA,
+            workflowDefinitionSha256: await candidateWorkflowDefinitionSha256('workflow-tools'),
+            validationProfileSha256: process.env.VALIDATION_PROFILE_SHA256,
+            assets,
+          });
           await writeFile('candidate-artifacts/candidate-manifest.json', `${JSON.stringify(manifest, null, 2)}\n`);
           await writeFile('candidate-artifacts/checks.json', `${JSON.stringify({ serverTests: 'success', bundleVersionSmoke: 'release CLI archive --expect-version', linuxPackaging: 'success', windowsPackaging: 'success', windowsFeedTests: process.env.WINDOWS_FEED_TESTS }, null, 2)}\n`);
           NODE

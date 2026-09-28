@@ -8,6 +8,14 @@ import {
   ForkCompatibilityRepairSettings,
   ForkCompatibilityRepairSummary,
 } from "./forkCompatibility.ts";
+import {
+  ForkGithubConfigurationCommand,
+  ForkGithubConfigurationStatus,
+  ForkGithubDraftCommand,
+  ForkGithubNativeError,
+  ForkGithubOperation,
+  ForkGithubPromotionCommand,
+} from "./forkGithub.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   ProviderAuthCancelInput,
@@ -382,6 +390,11 @@ export const WS_METHODS = {
   forkCompatibilityCheck: "forkCompatibility.check",
   forkCompatibilityStatus: "forkCompatibility.status",
   forkCompatibilityScheduleStatus: "forkCompatibility.scheduleStatus",
+  forkGithubConfigure: "forkGithub.configure",
+  forkGithubRead: "forkGithub.read",
+  forkGithubSubmitPromotion: "forkGithub.submitPromotion",
+  forkGithubSubmitDraft: "forkGithub.submitDraft",
+  forkGithubStatus: "forkGithub.status",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
@@ -653,6 +666,33 @@ const WsForkCompatibilityStatusRpc = Rpc.make(WS_METHODS.forkCompatibilityStatus
     evidence: Schema.optional(ForkCompatibilityEvidence),
   }),
   error: Schema.Union([ForkCompatibilityRpcError, EnvironmentAuthorizationError]),
+});
+
+const ForkGithubRpcError = Schema.Union([ForkGithubNativeError, EnvironmentAuthorizationError]);
+const WsForkGithubConfigureRpc = Rpc.make(WS_METHODS.forkGithubConfigure, {
+  payload: ForkGithubConfigurationCommand,
+  success: ForkGithubConfigurationStatus,
+  error: ForkGithubRpcError,
+});
+const WsForkGithubReadRpc = Rpc.make(WS_METHODS.forkGithubRead, {
+  payload: Schema.Struct({}),
+  success: ForkGithubConfigurationStatus,
+  error: ForkGithubRpcError,
+});
+const WsForkGithubSubmitPromotionRpc = Rpc.make(WS_METHODS.forkGithubSubmitPromotion, {
+  payload: ForkGithubPromotionCommand,
+  success: ForkGithubOperation,
+  error: ForkGithubRpcError,
+});
+const WsForkGithubSubmitDraftRpc = Rpc.make(WS_METHODS.forkGithubSubmitDraft, {
+  payload: ForkGithubDraftCommand,
+  success: ForkGithubOperation,
+  error: ForkGithubRpcError,
+});
+const WsForkGithubStatusRpc = Rpc.make(WS_METHODS.forkGithubStatus, {
+  payload: Schema.Struct({ operationId: Schema.String }),
+  success: Schema.NullOr(ForkGithubOperation),
+  error: ForkGithubRpcError,
 });
 
 const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
@@ -1460,6 +1500,11 @@ export const WsRpcGroup = RpcGroup.make(
   WsForkCompatibilityCheckRpc,
   WsForkCompatibilityStatusRpc,
   WsForkCompatibilityScheduleStatusRpc,
+  WsForkGithubConfigureRpc,
+  WsForkGithubReadRpc,
+  WsForkGithubSubmitPromotionRpc,
+  WsForkGithubSubmitDraftRpc,
+  WsForkGithubStatusRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,

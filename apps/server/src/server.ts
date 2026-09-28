@@ -98,6 +98,7 @@ import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatib
 import * as ForkCompatibilityRepairRepository from "./forkCompatibility/ForkCompatibilityRepairRepository.ts";
 import * as ForkCompatibilityRepair from "./forkCompatibility/ForkCompatibilityRepair.ts";
 import * as ForkCompatibilityScheduleRepository from "./forkCompatibility/ForkCompatibilityScheduleRepository.ts";
+import * as ForkGithubNativeLayer from "./forkGithub/ForkGithubNativeLayer.ts";
 import * as Path from "effect/Path";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
@@ -600,7 +601,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(httpCompressionLayer),
 );
 
-const makeServerLayer = Layer.unwrap(
+export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     const activation = yield* Deferred.make<void>();
@@ -805,7 +806,22 @@ const makeServerLayer = Layer.unwrap(
           Layer.provideMerge(persistence),
           Layer.provideMerge(coordinator),
         );
-        return native;
+        const github = ForkGithubNativeLayer.makeForkGithubNativeServiceFromOperatorConfig(
+          config.forkGithubConfigPath,
+        ).pipe(
+          Layer.provideMerge(
+            Layer.mergeAll(
+              persistence,
+              stableSource,
+              coordinator,
+              repair,
+              GitVcsDriver.layer,
+              ProcessRunner.layer,
+              FetchHttpClient.layer,
+            ),
+          ),
+        );
+        return Layer.mergeAll(native, github);
       }),
     );
 

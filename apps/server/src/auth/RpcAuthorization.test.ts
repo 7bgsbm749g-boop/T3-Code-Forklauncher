@@ -47,6 +47,35 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("uses operate scope for GitHub configuration/submissions and read scope for status", () => {
+    for (const method of [
+      WS_METHODS.forkGithubConfigure,
+      WS_METHODS.forkGithubSubmitPromotion,
+      WS_METHODS.forkGithubSubmitDraft,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+    for (const method of [WS_METHODS.forkGithubRead, WS_METHODS.forkGithubStatus]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+  });
+
+  it.effect("rejects GitHub configuration and submissions without operate scope", () =>
+    Effect.gen(function* () {
+      for (const method of [
+        WS_METHODS.forkGithubConfigure,
+        WS_METHODS.forkGithubSubmitPromotion,
+        WS_METHODS.forkGithubSubmitDraft,
+      ]) {
+        const error = yield* Effect.flip(
+          authorizeRpcEffect([], requiredScopeForRpcMethod(method), Effect.succeed("must not run")),
+        );
+        expect(error._tag).toBe("EnvironmentAuthorizationError");
+        expect(error.requiredScope).toBe(AuthOrchestrationOperateScope);
+      }
+    }),
+  );
+
   it.effect(
     "rejects compatibility writes and reads when the authenticated session lacks their scope",
     () =>

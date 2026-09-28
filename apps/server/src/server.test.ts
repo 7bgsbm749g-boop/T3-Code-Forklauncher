@@ -63,6 +63,7 @@ import { RELAY_HEALTH_REQUEST_TYP, RELAY_MINT_REQUEST_TYP } from "@t3tools/share
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { assert, it } from "@effect/vitest";
 import { assertFailure, assertInclude, assertTrue } from "@effect/vitest/utils";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Deferred from "effect/Deferred";
@@ -118,7 +119,7 @@ const encodeTestJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unk
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as ServerConfig from "./config.ts";
 import * as DeviceService from "./device/DeviceService.ts";
-import { HTTP_ROUTER_CONFIG, makeRoutesLayer } from "./server.ts";
+import { HTTP_ROUTER_CONFIG, makeRoutesLayer, makeServerLayer } from "./server.ts";
 import {
   isThreadDetailEvent,
   resolveAvailableEditorsForConfig,
@@ -161,11 +162,13 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ForkCompatibilityNativeService from "./forkCompatibility/ForkCompatibilityNativeService.ts";
+import * as ForkGithubNativeService from "./forkGithub/ForkGithubNativeService.ts";
 import * as ForkCompatibilityCoordinator from "./forkCompatibility/ForkCompatibilityCoordinator.ts";
 import * as ForkCompatibilityRunRepository from "./forkCompatibility/ForkCompatibilityRunRepository.ts";
 import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCompatibilityRequestRepository.ts";
 import * as ForkCompatibilityScheduleRepository from "./forkCompatibility/ForkCompatibilityScheduleRepository.ts";
 import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
+import * as ForkGithubCandidateArtifactSource from "./forkGithub/ForkGithubCandidateArtifactSource.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import { forkCompatibilityError } from "./forkCompatibility/ForkCompatibilityError.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
@@ -544,6 +547,7 @@ const buildAppUnderTest = (options?: {
     antigravityInstallation?: Partial<AntigravityInstallation["Service"]>;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
     forkCompatibilityNativeService?: Layer.Layer<ForkCompatibilityNativeService.ForkCompatibilityNativeService>;
+    forkGithubNativeService?: Layer.Layer<ForkGithubNativeService.ForkGithubNativeService>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
     vcsDriverRegistry?: Partial<VcsDriverRegistry.VcsDriverRegistry["Service"]>;
@@ -872,6 +876,8 @@ const buildAppUnderTest = (options?: {
               get: () => Effect.succeed({ request: null, run: null, usable: false, repair: null }),
               awaitCompletion: () => Effect.void,
             }),
+          options?.layers?.forkGithubNativeService ??
+            ForkGithubNativeService.ForkGithubNativeServiceInert,
           Layer.mock(ExternalLauncher.ExternalLauncher)({
             resolveAvailableEditors: () => Effect.succeed([]),
             resolveFileManagerRevealKind: () => Effect.sync((): undefined => undefined),
@@ -1334,6 +1340,114 @@ const getHttpServerUrl = (pathname = "") =>
     const server = yield* HttpServer.HttpServer;
     const address = server.address as HttpServer.TcpAddress;
     return `http://127.0.0.1:${address.port}${pathname}`;
+  });
+
+const productionServerTestConfig = (baseDir: string, forkGithubConfigPath?: string) =>
+  Effect.gen(function* () {
+    const derivedPaths = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+    return {
+      logLevel: "Error" as const,
+      traceMinLevel: "Error" as const,
+      traceTimingEnabled: false,
+      traceBatchWindowMs: 200,
+      traceMaxBytes: 1024 * 1024,
+      traceMaxFiles: 2,
+      otlpTracesUrl: undefined,
+      otlpMetricsUrl: undefined,
+      otlpExportIntervalMs: 10_000,
+      otlpServiceName: "t3-server-test",
+      otlpHeaders: undefined,
+      otlpProtocol: "http/json" as const,
+      mode: "desktop" as const,
+      port: 0,
+      host: "127.0.0.1",
+      cwd: process.cwd(),
+      baseDir,
+      ...derivedPaths,
+      staticDir: undefined,
+      devUrl: undefined,
+      devAllowedOrigins: [],
+      noBrowser: true,
+      startupPresentation: "headless" as const,
+      desktopBootstrapToken: defaultDesktopBootstrapToken,
+      ...(forkGithubConfigPath === undefined ? {} : { forkGithubConfigPath }),
+      autoBootstrapProjectFromCwd: false,
+      logWebSocketEvents: false,
+      tailscaleServeEnabled: false,
+      tailscaleServePort: 443,
+    } satisfies ServerConfig.ServerConfig["Service"];
+  });
+
+const makeOperatorGithubConfigForServerTest = () => ({
+  schemaVersion: 1,
+  target: {
+    repository: "fixture-owner/fixture-fork",
+    repositoryId: 987_654_321,
+    branch: "forklauncher",
+  },
+  nativeAppId: 123_456,
+  directPushBypass: false,
+  validationProfile: {
+    id: "fixture-profile",
+    revision: "1",
+    commands: [{ command: "node", args: ["--version"], timeoutMs: 30_000 }],
+  },
+  requiredChecks: [{ name: "T3 Fork Compatibility", appId: 123_456 }],
+  candidateWorkflow: {
+    repository: "fixture-owner/fixture-fork",
+    repositoryId: 987_654_321,
+    workflowId: 246_810,
+    workflowPath: ".github/workflows/fork-candidate.yml",
+    workflowRef: "refs/heads/forklauncher",
+    workflowCommitSha: "a".repeat(40),
+    workflowFiles: ForkGithubCandidateArtifactSource.trustedCandidateWorkflowPaths.map(
+      (path, index) => ({ path, sha256: String(index + 1).repeat(64) }),
+    ),
+  },
+});
+
+const withProductionGithubRpc = <A, E, R>(input: {
+  readonly baseDir: string;
+  readonly operatorConfigPath?: string;
+  readonly run: (client: WsRpcClient) => Effect.Effect<A, E, R>;
+}) =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.make();
+    return yield* Effect.ensuring(
+      Effect.gen(function* () {
+        const config = yield* productionServerTestConfig(input.baseDir, input.operatorConfigPath);
+        const context = yield* Layer.buildWithScope(
+          makeServerLayer.pipe(Layer.provide(ServerConfig.layer(config))),
+          scope,
+        );
+        const server = Context.get(context, HttpServer.HttpServer);
+        const address = server.address as HttpServer.TcpAddress;
+        const session = yield* HttpClient.execute(
+          HttpClientRequest.make("POST")(
+            `http://127.0.0.1:${address.port}/api/auth/browser-session`,
+            { headers: { "content-type": "application/json" } },
+          ).pipe(
+            HttpClientRequest.bodyText(
+              jsonRequestBody({ credential: defaultDesktopBootstrapToken }),
+              "application/json",
+            ),
+          ),
+        );
+        assert.equal(session.status, 200);
+        const cookie = session.headers["set-cookie"];
+        if (typeof cookie !== "string") return yield* Effect.die("Missing session cookie");
+        const wsUrl = appendSessionCookieToWsUrl(
+          `ws://127.0.0.1:${address.port}/ws`,
+          cookie.split(";")[0]!,
+        );
+        return yield* Effect.scoped(withWsRpcClient(wsUrl, input.run));
+      }),
+      Scope.close(scope, Exit.void).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.failCause(cause),
+        ),
+      ),
+    );
   });
 
 const bootstrapBrowserSession = (
@@ -4965,6 +5079,239 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.isUndefined(response.shellRevealInFileManagerKind);
       assert.equal(response.threadResumeCompletionMarker, true);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "routes authenticated GitHub RPC through an inert native service and enforces scopes",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const fullScopeResult = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              const initial = yield* client[WS_METHODS.forkGithubRead]({});
+              assert.equal(initial.enabled, false);
+              assert.equal(initial.state, "disabled");
+
+              const configure = yield* client[WS_METHODS.forkGithubConfigure]({ enabled: true });
+              assert.equal(configure.enabled, false);
+              assert.equal(configure.state, "unavailable");
+              assert.isNotEmpty(configure.missing);
+
+              const promotionError = yield* client[WS_METHODS.forkGithubSubmitPromotion]({
+                operationId: "unprovisioned-promotion",
+                requestId: "request-1",
+                runId: "run-1",
+              }).pipe(Effect.flip);
+              assert.equal(promotionError._tag, "ForkGithubNativeError");
+              assert.equal(
+                yield* client[WS_METHODS.forkGithubStatus]({
+                  operationId: "unprovisioned-promotion",
+                }),
+                null,
+              );
+            }),
+          ),
+        );
+        assert.isUndefined(fullScopeResult);
+
+        const token = yield* exchangeAccessToken(defaultDesktopBootstrapToken, {
+          scope: "orchestration:read",
+        });
+        const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+          headers: { authorization: `Bearer ${token.body.access_token ?? ""}` },
+        });
+        const { ticket } = yield* responseJsonEffect<{ readonly ticket: string }>(ticketResponse);
+        const readOnlyWsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(ticket)}`;
+        yield* Effect.scoped(
+          withWsRpcClient(readOnlyWsUrl, (client) =>
+            Effect.gen(function* () {
+              assert.equal((yield* client[WS_METHODS.forkGithubRead]({})).state, "disabled");
+              const configureError = yield* client[WS_METHODS.forkGithubConfigure]({
+                enabled: true,
+              }).pipe(Effect.flip);
+              assert.equal(configureError._tag, "EnvironmentAuthorizationError");
+              if (configureError._tag === "EnvironmentAuthorizationError")
+                assert.equal(configureError.requiredScope, "orchestration:operate");
+              const submitError = yield* client[WS_METHODS.forkGithubSubmitDraft]({
+                operationId: "read-only-draft",
+                requestId: "request-1",
+                runId: "run-1",
+                workflowRunId: "123",
+                artifactId: "456",
+              }).pipe(Effect.flip);
+              assert.equal(submitError._tag, "EnvironmentAuthorizationError");
+              if (submitError._tag === "EnvironmentAuthorizationError")
+                assert.equal(submitError.requiredScope, "orchestration:operate");
+            }),
+          ),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("starts the production GitHub graph safely and persists it across a disk restart", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-github-startup-" });
+      const isolatedEnvironment = { ...process.env };
+      delete isolatedEnvironment.T3_SERVICE_LAUNCHER_CONTEXT;
+      const exerciseServer = (reopened: boolean) =>
+        withProductionGithubRpc({
+          baseDir,
+          run: (client) =>
+            Effect.gen(function* () {
+              const read = yield* client[WS_METHODS.forkGithubRead]({});
+              assert.equal(read.enabled, reopened);
+              assert.equal(read.state, reopened ? "unavailable" : "disabled");
+              if (!reopened) {
+                const configured = yield* client[WS_METHODS.forkGithubConfigure]({
+                  enabled: true,
+                });
+                assert.equal(configured.enabled, true);
+                assert.equal(configured.state, "unavailable");
+                assert.isNotEmpty(configured.missing);
+              }
+              const promotion = yield* client[WS_METHODS.forkGithubSubmitPromotion]({
+                operationId: "production-unavailable-promotion",
+                requestId: "request-1",
+                runId: "run-1",
+              }).pipe(Effect.flip);
+              assert.equal(promotion._tag, "ForkGithubNativeError");
+              const draft = yield* client[WS_METHODS.forkGithubSubmitDraft]({
+                operationId: "production-unavailable-draft",
+                requestId: "request-2",
+                runId: "run-2",
+                workflowRunId: "123",
+                artifactId: "456",
+              }).pipe(Effect.flip);
+              assert.equal(draft._tag, "ForkGithubNativeError");
+              assert.isNull(
+                yield* client[WS_METHODS.forkGithubStatus]({
+                  operationId: "production-unavailable-promotion",
+                }),
+              );
+            }),
+        }).pipe(
+          Effect.provide(FetchHttpClient.layer),
+          Effect.provideService(HostProcessEnvironment, isolatedEnvironment),
+        );
+      yield* exerciseServer(false);
+      yield* exerciseServer(true);
+    }),
+  );
+
+  it.effect(
+    "loads operator GitHub trust only at startup and remains unavailable without App secrets",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const baseDir = yield* fs.makeTempDirectoryScoped({
+          prefix: "t3-github-operator-startup-",
+        });
+        const configPath = NodePath.join(baseDir, "operator-github.json");
+        const isolatedEnvironment = { ...process.env };
+        delete isolatedEnvironment.T3_SERVICE_LAUNCHER_CONTEXT;
+        NodeFS.writeFileSync(configPath, encodeTestJson(makeOperatorGithubConfigForServerTest()));
+
+        yield* withProductionGithubRpc({
+          baseDir,
+          operatorConfigPath: configPath,
+          run: (client) =>
+            Effect.gen(function* () {
+              const initiallyDisabled = yield* client[WS_METHODS.forkGithubRead]({});
+              assert.equal(initiallyDisabled.state, "disabled");
+              const enabled = yield* client[WS_METHODS.forkGithubConfigure]({ enabled: true });
+              assert.equal(enabled.enabled, true);
+              assert.equal(enabled.state, "unavailable");
+              assert.isNotEmpty(enabled.missing);
+              assert.include(
+                enabled.missing.join(" "),
+                "GitHub App credentials in ServerSecretStore",
+              );
+              const publicResult = encodeTestJson(enabled);
+              assert.notInclude(publicResult, configPath);
+              assert.notInclude(publicResult, "fixture-owner/fixture-fork");
+              assert.notInclude(publicResult, "123456");
+
+              // The layer owns an immutable startup snapshot: changing the selected file
+              // cannot hot-swap trust into a server that is already accepting RPCs.
+              NodeFS.writeFileSync(configPath, "{ malformed operator policy");
+              assert.deepEqual(yield* client[WS_METHODS.forkGithubRead]({}), enabled);
+
+              const promotion = yield* client[WS_METHODS.forkGithubSubmitPromotion]({
+                operationId: "operator-without-secrets-promotion",
+                requestId: "operator-request-1",
+                runId: "operator-run-1",
+              }).pipe(Effect.flip);
+              assert.equal(promotion._tag, "ForkGithubNativeError");
+              const draft = yield* client[WS_METHODS.forkGithubSubmitDraft]({
+                operationId: "operator-without-secrets-draft",
+                requestId: "operator-request-2",
+                runId: "operator-run-2",
+                workflowRunId: "123",
+                artifactId: "456",
+              }).pipe(Effect.flip);
+              assert.equal(draft._tag, "ForkGithubNativeError");
+              assert.isNull(
+                yield* client[WS_METHODS.forkGithubStatus]({
+                  operationId: "operator-without-secrets-promotion",
+                }),
+              );
+            }),
+        }).pipe(
+          Effect.provide(FetchHttpClient.layer),
+          Effect.provideService(HostProcessEnvironment, isolatedEnvironment),
+        );
+
+        // The same selected path is reread only after reconstructing the production server.
+        yield* withProductionGithubRpc({
+          baseDir,
+          operatorConfigPath: configPath,
+          run: (client) =>
+            Effect.gen(function* () {
+              const afterRestart = yield* client[WS_METHODS.forkGithubRead]({});
+              assert.equal(afterRestart.enabled, true);
+              assert.equal(afterRestart.state, "unavailable");
+              assert.include(
+                afterRestart.missing.join(" "),
+                "Selected fork GitHub config JSON/schema is invalid",
+              );
+              assert.notInclude(encodeTestJson(afterRestart), configPath);
+            }),
+        }).pipe(
+          Effect.provide(FetchHttpClient.layer),
+          Effect.provideService(HostProcessEnvironment, isolatedEnvironment),
+        );
+      }),
+  );
+
+  it.effect("starts unavailable when the selected operator GitHub file is missing", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-github-missing-config-" });
+      const configPath = NodePath.join(baseDir, "does-not-exist.json");
+      const isolatedEnvironment = { ...process.env };
+      delete isolatedEnvironment.T3_SERVICE_LAUNCHER_CONTEXT;
+      yield* withProductionGithubRpc({
+        baseDir,
+        operatorConfigPath: configPath,
+        run: (client) =>
+          Effect.gen(function* () {
+            const configured = yield* client[WS_METHODS.forkGithubConfigure]({ enabled: true });
+            assert.equal(configured.enabled, true);
+            assert.equal(configured.state, "unavailable");
+            const status = yield* client[WS_METHODS.forkGithubRead]({});
+            assert.equal(status.enabled, true);
+            assert.equal(status.state, "unavailable");
+            assert.isNotEmpty(status.missing);
+            assert.notInclude(encodeTestJson(status), configPath);
+          }),
+      }).pipe(
+        Effect.provide(FetchHttpClient.layer),
+        Effect.provideService(HostProcessEnvironment, isolatedEnvironment),
+      );
+    }),
   );
 
   it.effect("runs authenticated compatibility RPCs through a durable real Git candidate", () => {

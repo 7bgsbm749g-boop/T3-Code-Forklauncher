@@ -208,6 +208,24 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: node scripts/update-release-package-versions.ts "$RELEASE_VERSION"
 
+      # Local actions are loaded from the checkout, which is the candidate ref.
+      # Fetch this action from the immutable workflow-control commit instead.
+      - name: Checkout pinned workflow control action
+        if: inputs.platform == 'linux'
+        shell: bash
+        env:
+          WORKFLOW_CONTROL_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir workflow-control
+          cd workflow-control
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_CONTROL_REF"
+          test "$(git rev-parse FETCH_HEAD)" = "$WORKFLOW_CONTROL_REF"
+          git sparse-checkout set --no-cone '/.github/actions/setup-apt-mirrors/action.yml'
+          git checkout --detach FETCH_HEAD
+
       # The artifact root is `apps/` (upload-artifact keeps the least common
       # ancestor of its paths), so extracting into `apps` restores
       # apps/server/dist and apps/desktop/dist-electron at their build paths.
@@ -246,7 +264,7 @@ jobs:
             exit $code
           }
 
-      - uses: ./.github/actions/setup-apt-mirrors
+      - uses: ./workflow-control/.github/actions/setup-apt-mirrors
         if: inputs.platform == 'linux'
 
       - name: Install Linux desktop build libraries

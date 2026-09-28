@@ -1,0 +1,102 @@
+import * as Schema from "effect/Schema";
+
+/** Native fork release controls. Secrets are referenced by the server and are never sent over RPC. */
+export const ForkGithubConfigurationCommand = Schema.Struct({ enabled: Schema.Boolean });
+export type ForkGithubConfigurationCommand = typeof ForkGithubConfigurationCommand.Type;
+
+export const ForkGithubPromotionCommand = Schema.Struct({
+  operationId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  requestId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  runId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+});
+export type ForkGithubPromotionCommand = typeof ForkGithubPromotionCommand.Type;
+
+export const ForkGithubDraftCommand = Schema.Struct({
+  operationId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  requestId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  runId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  workflowRunId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+  artifactId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+});
+export type ForkGithubDraftCommand = typeof ForkGithubDraftCommand.Type;
+
+export const ForkGithubOperationStatus = Schema.Literals([
+  "pending",
+  "applied",
+  "draft-prepared",
+  "failed",
+  "unavailable",
+]);
+export type ForkGithubOperationStatus = typeof ForkGithubOperationStatus.Type;
+export const ForkGithubOperationKind = Schema.Literals(["promotion", "draft"]);
+export type ForkGithubOperationKind = typeof ForkGithubOperationKind.Type;
+export const ForkGithubPromotionResult = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("applied"),
+    actionId: Schema.String,
+    sha: Schema.String,
+    alreadyApplied: Schema.Boolean,
+  }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
+]);
+export const ForkGithubDraftAsset = Schema.Struct({
+  name: Schema.String,
+  sha256: Schema.String,
+  size: Schema.Finite,
+});
+export const ForkGithubDraftResult = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("draft-prepared"),
+    actionId: Schema.String,
+    releaseId: Schema.Finite,
+    tag: Schema.String,
+    alreadyPrepared: Schema.Boolean,
+    assets: Schema.Array(ForkGithubDraftAsset),
+  }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
+]);
+export const ForkGithubPromotionOperation = Schema.Struct({
+  operationId: Schema.String,
+  kind: Schema.Literal("promotion"),
+  status: Schema.Literals(["pending", "applied", "failed", "unavailable"]),
+  requestId: Schema.String,
+  runId: Schema.String,
+  result: Schema.NullOr(ForkGithubPromotionResult),
+  error: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+export const ForkGithubDraftOperation = Schema.Struct({
+  operationId: Schema.String,
+  kind: Schema.Literal("draft"),
+  status: Schema.Literals(["pending", "draft-prepared", "failed", "unavailable"]),
+  requestId: Schema.String,
+  runId: Schema.String,
+  result: Schema.NullOr(ForkGithubDraftResult),
+  error: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+export const ForkGithubOperation = Schema.Union([
+  ForkGithubPromotionOperation,
+  ForkGithubDraftOperation,
+]);
+export type ForkGithubOperation = typeof ForkGithubOperation.Type;
+
+export const ForkGithubConfigurationStatus = Schema.Struct({
+  enabled: Schema.Boolean,
+  state: Schema.Literals(["disabled", "ready", "unavailable"]),
+  missing: Schema.Array(Schema.String),
+});
+export type ForkGithubConfigurationStatus = typeof ForkGithubConfigurationStatus.Type;
+
+export class ForkGithubNativeError extends Schema.TaggedError<ForkGithubNativeError>()(
+  "ForkGithubNativeError",
+  { reason: Schema.String },
+) {}
+
+/** These scopes are enforced by the server RPC router when this handler factory is wired. */
+export const ForkGithubNativeScopes = {
+  read: "orchestration:read",
+  operate: "orchestration:operate",
+} as const;

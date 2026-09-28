@@ -199,6 +199,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
                   T3CODE_PORT: "4001",
                   T3CODE_HOST: "0.0.0.0",
                   T3CODE_HOME: baseDir,
+                  T3CODE_FORK_GITHUB_CONFIG: "/tmp/operator-fork-github.json",
                   VITE_DEV_SERVER_URL: "http://127.0.0.1:5173",
                   T3CODE_DEV_ALLOWED_ORIGINS:
                     "https://host.example.ts.net, https://phone.example.ts.net ",
@@ -228,6 +229,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         noBrowser: true,
         startupPresentation: "browser",
         desktopBootstrapToken: undefined,
+        forkGithubConfigPath: "/tmp/operator-fork-github.json",
         autoBootstrapProjectFromCwd: false,
         logWebSocketEvents: true,
         tailscaleServeEnabled: false,

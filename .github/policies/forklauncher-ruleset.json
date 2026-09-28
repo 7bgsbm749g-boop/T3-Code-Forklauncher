@@ -1,0 +1,13 @@
+{
+  "name": "T3 Fork Compatibility",
+  "target": "branch",
+  "enforcement": "disabled",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/forklauncher"],
+      "exclude": []
+    }
+  },
+  "rules": []
+}

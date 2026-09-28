@@ -69,6 +69,7 @@ import {
   RpcClientId,
   EnvironmentAuthorizationError,
   ForkCompatibilityRpcError,
+  ForkGithubNativeError,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -120,6 +121,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ForkCompatibilityNative from "./forkCompatibility/ForkCompatibilityNativeService.ts";
+import * as ForkGithubNative from "./forkGithub/ForkGithubNativeService.ts";
 import { validateAllowedRepairPaths } from "./forkCompatibility/ForkCompatibilityRepairEligibility.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
@@ -574,6 +576,7 @@ const makeWsRpcLayer = (
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const forkCompatibility = yield* ForkCompatibilityNative.ForkCompatibilityNativeService;
+      const forkGithub = yield* ForkGithubNative.ForkGithubNativeService;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -2723,6 +2726,76 @@ const makeWsRpcLayer = (
                     },
               ),
             ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkGithubConfigure]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubConfigure,
+            forkGithub
+              .configure(input)
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkGithubRead]: () =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubRead,
+            forkGithub
+              .read()
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkGithubSubmitPromotion]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubSubmitPromotion,
+            forkGithub
+              .submitPromotion(input)
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkGithubSubmitDraft]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubSubmitDraft,
+            forkGithub
+              .submitDraft(input)
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkGithubStatus]: ({ operationId }) =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubStatus,
+            forkGithub
+              .status(operationId)
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>
