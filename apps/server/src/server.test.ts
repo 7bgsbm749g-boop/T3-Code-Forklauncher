@@ -164,6 +164,7 @@ import * as ForkCompatibilityNativeService from "./forkCompatibility/ForkCompati
 import * as ForkCompatibilityCoordinator from "./forkCompatibility/ForkCompatibilityCoordinator.ts";
 import * as ForkCompatibilityRunRepository from "./forkCompatibility/ForkCompatibilityRunRepository.ts";
 import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCompatibilityRequestRepository.ts";
+import * as ForkCompatibilityScheduleRepository from "./forkCompatibility/ForkCompatibilityScheduleRepository.ts";
 import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import { forkCompatibilityError } from "./forkCompatibility/ForkCompatibilityError.ts";
@@ -5025,6 +5026,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const repositories = Layer.mergeAll(
         ForkCompatibilityRunRepository.ForkCompatibilityRunRepositoryLive,
         ForkCompatibilityRequestRepository.ForkCompatibilityRequestRepositoryLive,
+        ForkCompatibilityScheduleRepository.ForkCompatibilityScheduleRepositoryLive,
       ).pipe(Layer.provideMerge(persistence));
       const vcsProcess = VcsProcess.layer.pipe(Layer.provide(node));
       const gitLayer = Layer.mergeAll(GitVcsDriver.vcsLayer, GitVcsDriver.layer).pipe(
