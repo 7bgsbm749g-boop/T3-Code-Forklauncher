@@ -83,6 +83,53 @@ export const ForkGithubOperation = Schema.Union([
 ]);
 export type ForkGithubOperation = typeof ForkGithubOperation.Type;
 
+/** A PR check is addressed only by an idempotency key and PR number. Repository and commands
+ * are selected by the server's verified operator configuration. */
+export const ForkGithubPullRequestEvidenceSubmit = Schema.Struct({
+  requestId: Schema.String.check(
+    Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+  ),
+  number: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(2_147_483_647)),
+});
+export type ForkGithubPullRequestEvidenceSubmit = typeof ForkGithubPullRequestEvidenceSubmit.Type;
+
+export const ForkGithubPullRequestEvidenceStatus = Schema.Struct({
+  requestId: Schema.String,
+  status: Schema.Literals(["accepted", "validating", "ready", "failed", "stale", "unavailable"]),
+  usable: Schema.Boolean,
+  publication: Schema.Literals([
+    "not-eligible",
+    "queued",
+    "publishing",
+    "published",
+    "uncertain",
+    "failed",
+    "stale",
+    "unavailable",
+  ]),
+  owner: Schema.NullOr(Schema.String),
+  repository: Schema.NullOr(Schema.String),
+  number: Schema.NullOr(Schema.Int),
+  state: Schema.NullOr(Schema.Literals(["open", "closed"])),
+  headSha: Schema.NullOr(Schema.String),
+  baseRef: Schema.NullOr(Schema.String),
+  targetBranch: Schema.NullOr(Schema.String),
+  baseSha: Schema.NullOr(Schema.String),
+  mergeCandidateSha: Schema.NullOr(Schema.String),
+  mergeTreeSha: Schema.NullOr(Schema.String),
+  profileId: Schema.String,
+  profileRevision: Schema.String,
+  profileSha256: Schema.String,
+  toolchainSha256: Schema.NullOr(Schema.String),
+  storageIdentitySha256: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+  diagnostic: Schema.NullOr(
+    Schema.Literals(["pending", "validation-failed", "stale", "unavailable"]),
+  ),
+});
+export type ForkGithubPullRequestEvidenceStatus = typeof ForkGithubPullRequestEvidenceStatus.Type;
+
 /** Read-only scheduled pipeline summary. Diagnostics are fixed codes, never raw logs/errors. */
 export const ForkGithubPipelineStatus = Schema.Struct({
   status: Schema.Literals([

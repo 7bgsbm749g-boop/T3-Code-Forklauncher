@@ -1147,6 +1147,22 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => JSON.stringify([environmentId, input.operationId]),
       },
     }),
+    forkGithubSubmitPullRequestEvidence: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-submit-pull-request-evidence",
+      tag: WS_METHODS.forkGithubSubmitPullRequestEvidence,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.requestId]),
+      },
+    }),
+    forkGithubPullRequestEvidenceStatus: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-pull-request-evidence-status",
+      tag: WS_METHODS.forkGithubPullRequestEvidenceStatus,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.requestId]),
+      },
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

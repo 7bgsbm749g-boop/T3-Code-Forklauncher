@@ -125,6 +125,7 @@ it.effect(
         published.push(identity);
         return Effect.succeed({ checkRunId: 1, appId: 1, externalId: "stable-check" });
       },
+      publishPullRequestCompatibilityCheck: () => Effect.die("unused"),
       advancePullRequestBase: () => Effect.die("stable promotion never uses a PR merge"),
       advanceStableRef: ({ actionId, identity, candidateSha }) => {
         advanced.push({ actionId, identity });

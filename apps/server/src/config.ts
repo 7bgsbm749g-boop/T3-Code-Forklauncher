@@ -90,6 +90,10 @@ export class ServerConfig extends Context.Service<
     readonly desktopBootstrapToken: string | undefined;
     /** Absolute operator-owned fork GitHub policy path; absent keeps trust providers inert. */
     readonly forkGithubConfigPath?: string | undefined;
+    /** Absolute verified host-tool manifest for isolated custom PR candidate storage. */
+    readonly forkGithubCandidateStorageManifestPath?: string | undefined;
+    /** Absolute immutable offline candidate toolchain snapshot manifest. */
+    readonly forkGithubOfflineSnapshotPath?: string | undefined;
     readonly desktopTelemetryFd?: number | undefined;
     readonly desktopTelemetryControlFd?: number | undefined;
     readonly resourceMonitorPath?: string | undefined;

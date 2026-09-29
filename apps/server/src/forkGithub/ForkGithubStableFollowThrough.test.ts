@@ -366,6 +366,8 @@ const makeRuntime = (
         submitScheduledPromotion,
         submitDraft: () => Effect.die("draft not used in follow-through fixture"),
         submitScheduledDraft: () => Effect.die("automatic draft not used in this fixture"),
+        submitPullRequestEvidence: () => Effect.die("PR evidence is not used in this fixture"),
+        pullRequestEvidenceStatus: () => Effect.succeed(null),
         wakePending: () => Effect.void,
       } satisfies Native.ForkGithubNativeServiceShape;
     }),

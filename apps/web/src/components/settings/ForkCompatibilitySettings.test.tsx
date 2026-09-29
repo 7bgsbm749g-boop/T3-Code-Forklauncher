@@ -23,6 +23,10 @@ const state = vi.hoisted(() => ({
   scheduleWaiters: new Map<string, () => Promise<unknown>>(),
   configureWaiter: null as (() => Promise<unknown>) | null,
   checkHandler: null as ((input: { idempotencyKey: string }) => Promise<unknown>) | null,
+  pullRequestSubmitHandler: null as
+    | ((input: { number: number; requestId: string }) => Promise<unknown>)
+    | null,
+  pullRequestStatusWaiters: new Map<string, () => Promise<unknown>>(),
   idCounter: 0,
 }));
 
@@ -50,13 +54,17 @@ vi.mock("../../hooks/useLocalStorage", async () => {
     },
   };
 });
-vi.mock("../../lib/utils", () => ({ randomUUID: () => `idempotency-${++state.idCounter}` }));
+vi.mock("../../lib/utils", () => ({
+  randomUUID: () => `00000000-0000-4000-8000-${String(++state.idCounter).padStart(12, "0")}`,
+}));
 vi.mock("../../state/server", () => ({
   serverEnvironment: {
     forkCompatibilityConfigure: "configure",
     forkCompatibilityCheck: "check",
     forkCompatibilityStatus: "status",
     forkCompatibilityScheduleStatus: "schedule-status",
+    forkGithubSubmitPullRequestEvidence: "pr-submit",
+    forkGithubPullRequestEvidenceStatus: "pr-status",
   },
 }));
 vi.mock("../../state/use-atom-command", async () => {
@@ -92,6 +100,23 @@ vi.mock("../../state/use-atom-command", async () => {
                 ...(input.includeEvidence ? { evidence: { checks: [{ stdout: "passed" }] } } : {}),
               },
             };
+          }
+          if (command === "pr-status") {
+            const input = target.input as { requestId: string };
+            const waiter = state.pullRequestStatusWaiters.get(
+              `${target.environmentId}:${input.requestId}`,
+            );
+            return waiter
+              ? await waiter()
+              : {
+                  _tag: "Success",
+                  value: pullRequestStatus(input.requestId),
+                };
+          }
+          if (command === "pr-submit" && state.pullRequestSubmitHandler) {
+            return await state.pullRequestSubmitHandler(
+              target.input as { number: number; requestId: string },
+            );
           }
           if (command === "schedule-status") {
             const waiter = state.scheduleWaiters.get(target.environmentId);
@@ -225,6 +250,33 @@ function statusResult(requestId: string, sourceSha: string, runStatus = "ready",
   };
 }
 
+function pullRequestStatus(requestId: string, status = "ready", usable = true) {
+  return {
+    requestId,
+    status,
+    usable,
+    publication: "not-eligible",
+    owner: "7bgsbm749g-boop",
+    repository: "T3-Code-Forklauncher",
+    number: 42,
+    state: "open",
+    headSha: "a".repeat(40),
+    baseRef: "forklauncher",
+    targetBranch: "forklauncher",
+    baseSha: "b".repeat(40),
+    mergeCandidateSha: "c".repeat(40),
+    mergeTreeSha: "d".repeat(40),
+    profileId: "server-validation",
+    profileRevision: "1",
+    profileSha256: "e".repeat(64),
+    toolchainSha256: null,
+    storageIdentitySha256: null,
+    createdAt: "2026-09-29T00:00:00.000Z",
+    updatedAt: "2026-09-29T00:00:00.000Z",
+    diagnostic: null,
+  };
+}
+
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   state.connected = true;
@@ -242,6 +294,8 @@ beforeEach(() => {
   state.scheduleWaiters.clear();
   state.configureWaiter = null;
   state.checkHandler = null;
+  state.pullRequestSubmitHandler = null;
+  state.pullRequestStatusWaiters.clear();
   state.idCounter = 0;
 });
 
@@ -446,7 +500,7 @@ describe("ForkCompatibilitySettings", () => {
     ) as StoredPending;
     expect(pending?.[0]).toEqual({
       sourceDirectory: "/srv/fork-1",
-      idempotencyKey: "idempotency-1",
+      idempotencyKey: "00000000-0000-4000-8000-000000000001",
     });
     act(() => renderer!.unmount());
     renderer = null;
@@ -459,9 +513,12 @@ describe("ForkCompatibilitySettings", () => {
     const keys = state.commands
       .filter((entry) => entry.command === "check")
       .map((entry) => (entry.input as { idempotencyKey: string }).idempotencyKey);
-    expect(keys).toEqual(["idempotency-1", "idempotency-1"]);
+    expect(keys).toEqual([
+      "00000000-0000-4000-8000-000000000001",
+      "00000000-0000-4000-8000-000000000001",
+    ]);
     expect(state.storage.get("fork-compatibility:last-request:server-1")).toBe(
-      "request-for-idempotency-1",
+      "request-for-00000000-0000-4000-8000-000000000001",
     );
     expect(state.storage.has("fork-compatibility:pending-checks:server-1")).toBe(false);
   });
@@ -593,5 +650,131 @@ describe("ForkCompatibilitySettings", () => {
     ).toBe(true);
     expect(paragraphs.some((text) => text.includes("eligibility review-required"))).toBe(true);
     expect(paragraphs.some((text) => text.includes("stale evidence"))).toBe(false);
+  });
+
+  it("persists PR identity before submit and retries an uncertain response with the same UUID", async () => {
+    const submitted: Array<{ number: number; requestId: string }> = [];
+    state.pullRequestSubmitHandler = async (input) => {
+      submitted.push(input);
+      expect(state.storage.get("fork-compatibility:pull-request-evidence:server-1")).toMatchObject({
+        number: 42,
+        requestId: input.requestId,
+        state: "uncertain",
+      });
+      return submitted.length === 1
+        ? { _tag: "Failure", failure: new Error("connection dropped") }
+        : { _tag: "Success", value: pullRequestStatus(input.requestId, "accepted", false) };
+    };
+    state.pullRequestStatusWaiters.set(
+      "server-1:00000000-0000-4000-8000-000000000001",
+      async () => ({ _tag: "Success", value: null }),
+    );
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    await act(async () => {
+      renderer!.root.findByProps({ "aria-label": "Pull request number" }).props.onChange({
+        target: { value: "42" },
+      });
+    });
+    await act(async () => button("Validate PR").props.onClick());
+    expect(submitted).toHaveLength(1);
+    expect(
+      renderer!.root
+        .findAllByType("p")
+        .some((node) => node.children.join("").includes("may have accepted this request")),
+    ).toBe(true);
+    await act(async () => button("Retry validation").props.onClick());
+    expect(submitted).toHaveLength(2);
+    expect(submitted[1]).toEqual(submitted[0]);
+    expect(
+      renderer!.root.findAllByType("span").some((node) => node.children.includes("Accepted")),
+    ).toBe(true);
+    expect(state.storage.get("fork-compatibility:pull-request-evidence:server-1")).toMatchObject({
+      state: "active",
+      requestId: submitted[0]?.requestId,
+    });
+    await act(async () => button("Run again").props.onClick());
+    expect(submitted).toHaveLength(3);
+    expect(submitted[2]?.requestId).not.toBe(submitted[0]?.requestId);
+  });
+
+  it("shows exact PR freshness without trust hashes and ignores a previous environment response", async () => {
+    const previous = deferred<unknown>();
+    state.storage.set("fork-compatibility:pull-request-evidence:server-1", {
+      number: 42,
+      requestId: "00000000-0000-4000-8000-000000000001",
+      state: "active",
+    });
+    state.storage.set("fork-compatibility:pull-request-evidence:server-2", {
+      number: 51,
+      requestId: "00000000-0000-4000-8000-000000000002",
+      state: "active",
+    });
+    state.pullRequestStatusWaiters.set(
+      "server-1:00000000-0000-4000-8000-000000000001",
+      () => previous.promise,
+    );
+    state.pullRequestStatusWaiters.set(
+      "server-2:00000000-0000-4000-8000-000000000002",
+      async () => ({
+        _tag: "Success",
+        value: {
+          ...pullRequestStatus("00000000-0000-4000-8000-000000000002"),
+          publication: "published",
+          number: 51,
+        },
+      }),
+    );
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    state.selectedEnvironment = "server-2";
+    await act(async () => renderer!.update(<ForkCompatibilitySettings />));
+    await act(async () => {
+      previous.resolve({
+        _tag: "Success",
+        value: pullRequestStatus("00000000-0000-4000-8000-000000000001"),
+      });
+      await previous.promise;
+    });
+    const text = renderer!.root
+      .findAll((node) => node.type === "p" || node.type === "span")
+      .map((node) => node.children.join(""))
+      .join(" ");
+    expect(text).toContain("#51");
+    expect(text).toContain("head");
+    expect(text).not.toContain("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    expect(text).not.toContain("#42");
+    expect(text).toContain("Required Check Run: Published.");
+    expect(text).toContain("does not establish merge eligibility");
+  });
+
+  it("does not describe an uncertain publication as success", async () => {
+    state.storage.set("fork-compatibility:pull-request-evidence:server-1", {
+      number: 42,
+      requestId: "00000000-0000-4000-8000-000000000001",
+      state: "active",
+    });
+    state.pullRequestStatusWaiters.set(
+      "server-1:00000000-0000-4000-8000-000000000001",
+      async () => ({
+        _tag: "Success",
+        value: {
+          ...pullRequestStatus("00000000-0000-4000-8000-000000000001"),
+          publication: "uncertain",
+        },
+      }),
+    );
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    const text = renderer!.root
+      .findAll((node) => node.type === "p" || node.type === "span")
+      .map((node) => node.children.join(""))
+      .join(" ");
+    expect(text).toContain("Required Check Run: Uncertain.");
+    expect(text).toContain("not confirmed published");
+    expect(text).not.toContain("Required Check Run: Published.");
   });
 });

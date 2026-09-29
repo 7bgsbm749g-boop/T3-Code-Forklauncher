@@ -30,7 +30,7 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 const REF_PREFIX = "refs/t3/fork-github-pr";
 const isCandidateExecutionError = Schema.is(Sandbox.ForkGithubCandidateExecutionError);
 
-export class ForkGithubPullRequestEvidenceError extends Schema.TaggedError<ForkGithubPullRequestEvidenceError>()(
+class ForkGithubPullRequestEvidenceError extends Schema.TaggedError<ForkGithubPullRequestEvidenceError>()(
   "ForkGithubPullRequestEvidenceError",
   { reason: Schema.String },
 ) {
@@ -66,6 +66,7 @@ export interface PullRequestValidationEvidence extends Github.CompatibilityEvide
   readonly mergeCandidateSha: string;
   readonly mergeTreeSha: string;
   readonly toolchainSha256: string | null;
+  readonly storageIdentitySha256?: string;
   readonly createdAt: string;
 }
 export interface PullRequestEvidenceRecord {
@@ -75,7 +76,13 @@ export interface PullRequestEvidenceRecord {
   readonly status: PullRequestEvidenceStatus;
   /** True only for an explicitly rechecked, current PR/profile/toolchain identity. */
   readonly usable: boolean;
-  readonly snapshot: CapturedPullRequestSnapshot;
+  /** Null only while an accepted request is waiting for server-side PR resolution. */
+  readonly snapshot: CapturedPullRequestSnapshot | null;
+  readonly submission: {
+    readonly owner: string;
+    readonly repository: string;
+    readonly number: number;
+  } | null;
   readonly profileId: string;
   readonly profileRevision: string;
   readonly profileSha256: string;
@@ -98,6 +105,7 @@ const makeEvidence = (
   candidateSha: string,
   profile: Github.TrustedValidationProfileWithHash,
   toolchainSha256: string | null,
+  storageIdentitySha256: string,
   results: ReadonlyArray<PullRequestValidationResult>,
   createdAt: string,
 ): PullRequestValidationEvidence => ({
@@ -111,6 +119,7 @@ const makeEvidence = (
   profileRevision: profile.revision,
   profileSha256: profile.sha256,
   toolchainSha256,
+  storageIdentitySha256,
   owner: snapshot.owner,
   repository: snapshot.repository,
   number: snapshot.number,
@@ -152,6 +161,46 @@ export class ForkGithubPullRequestRemote extends Context.Service<
   PullRequestRemote
 >()("t3/forkGithub/ForkGithubPullRequestEvidence/ForkGithubPullRequestRemote") {}
 export interface ForkGithubPullRequestEvidenceShape {
+  readonly accept: (input: {
+    readonly requestId: string;
+    readonly number: number;
+  }) => Effect.Effect<
+    PullRequestEvidenceRecord,
+    | Github.ForkGithubAdapterFailure
+    | CandidateStorage.ForkGithubCandidateStorageError
+    | SqlError.SqlError
+    | ForkGithubPullRequestEvidenceError
+  >;
+  readonly pending: () => Effect.Effect<
+    ReadonlyArray<{
+      readonly requestId: string;
+      readonly owner: string;
+      readonly repository: string;
+      readonly number: number;
+    }>,
+    SqlError.SqlError | ForkGithubPullRequestEvidenceError
+  >;
+  readonly pendingPublications: () => Effect.Effect<ReadonlyArray<string>, SqlError.SqlError>;
+  readonly publishCheck: (
+    requestId: string,
+  ) => Effect.Effect<
+    void,
+    Github.ForkGithubAdapterFailure | SqlError.SqlError | ForkGithubPullRequestEvidenceError
+  >;
+  readonly publicationStatus: (
+    requestId: string,
+  ) => Effect.Effect<
+    | "not-eligible"
+    | "queued"
+    | "publishing"
+    | "published"
+    | "uncertain"
+    | "failed"
+    | "stale"
+    | "unavailable",
+    SqlError.SqlError | Github.ForkGithubAdapterError | ForkGithubPullRequestEvidenceError
+  >;
+  readonly failAccepted: (requestId: string) => Effect.Effect<void, SqlError.SqlError>;
   readonly validate: (input: {
     /** Caller-generated idempotency key; a new key explicitly requests another attempt. */
     readonly requestId: string;
@@ -161,6 +210,7 @@ export interface ForkGithubPullRequestEvidenceShape {
   }) => Effect.Effect<
     PullRequestEvidenceRecord,
     | Github.ForkGithubAdapterFailure
+    | CandidateStorage.ForkGithubCandidateStorageError
     | SqlError.SqlError
     | GitCommandError
     | ForkGithubPullRequestEvidenceError
@@ -288,6 +338,13 @@ const snapshotSchema = Schema.Struct({
   mergeCandidateSha: Schema.String,
   mergeTreeSha: Schema.String,
 });
+const submissionSchema = Schema.Struct({
+  kind: Schema.Literal("submitted"),
+  owner: Schema.String,
+  repository: Schema.String,
+  number: Schema.Int,
+  targetBranch: Schema.String,
+});
 const profileSchema = Schema.Struct({
   id: Schema.String,
   revision: Schema.String,
@@ -322,6 +379,7 @@ const evidenceSchema = Schema.Struct({
   profileRevision: Schema.String,
   profileSha256: Schema.String,
   toolchainSha256: Schema.NullOr(Schema.String),
+  storageIdentitySha256: Schema.optionalKey(Schema.String),
   owner: Schema.String,
   repository: Schema.String,
   number: Schema.Int,
@@ -338,7 +396,10 @@ const evidenceSchema = Schema.Struct({
 const decodeSnapshot = Schema.decodeSync(Schema.fromJsonString(snapshotSchema));
 const decodeProfile = Schema.decodeSync(Schema.fromJsonString(profileSchema));
 const decodeEvidence = Schema.decodeSync(Schema.fromJsonString(evidenceSchema));
+const decodeUnknownJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const encodeSnapshot = Schema.encodeSync(Schema.fromJsonString(snapshotSchema));
+const encodeSubmission = Schema.encodeSync(Schema.fromJsonString(submissionSchema));
 const encodeProfile = Schema.encodeSync(Schema.fromJsonString(profileSchema));
 const encodeEvidence = Schema.encodeSync(Schema.fromJsonString(evidenceSchema));
 const rowSelect = `request_id AS "requestId", evidence_fingerprint AS "evidenceFingerprint", snapshot_json AS "snapshotJson", profile_json AS "profileJson", profile_sha256 AS "profileSha256", toolchain_sha256 AS "toolchainSha256", status, owner_id AS "ownerId", owner_pid AS "ownerPid", lease_expires_at AS "leaseExpiresAt", candidate_path AS "candidatePath", evidence_json AS "evidenceJson", error, created_at AS "createdAt", updated_at AS "updatedAt"`;
@@ -350,22 +411,29 @@ const publicRecord = (
     readonly usable?: boolean;
     readonly error?: string | null;
   } = {},
-): PullRequestEvidenceRecord => ({
-  requestId: row.requestId,
-  evidenceFingerprint: row.evidenceFingerprint,
-  status: overrides.status ?? row.status,
-  usable: overrides.usable ?? false,
-  snapshot: decodeSnapshot(row.snapshotJson),
-  profileId: decodeProfile(row.profileJson).id,
-  profileRevision: decodeProfile(row.profileJson).revision,
-  profileSha256: row.profileSha256,
-  toolchainSha256: row.toolchainSha256,
-  candidatePath: row.candidatePath,
-  evidence: row.evidenceJson === null ? null : decodeEvidence(row.evidenceJson),
-  error: overrides.error === undefined ? row.error : overrides.error,
-  createdAt: row.createdAt,
-  updatedAt: row.updatedAt,
-});
+): PullRequestEvidenceRecord => {
+  const submission = decodeUnknownJson(row.snapshotJson);
+  const isSubmission = Schema.is(submissionSchema)(submission);
+  return {
+    requestId: row.requestId,
+    evidenceFingerprint: row.evidenceFingerprint,
+    status: overrides.status ?? row.status,
+    usable: overrides.usable ?? false,
+    snapshot: isSubmission ? null : decodeSnapshot(row.snapshotJson),
+    submission: isSubmission
+      ? { owner: submission.owner, repository: submission.repository, number: submission.number }
+      : null,
+    profileId: decodeProfile(row.profileJson).id,
+    profileRevision: decodeProfile(row.profileJson).revision,
+    profileSha256: row.profileSha256,
+    toolchainSha256: row.toolchainSha256,
+    candidatePath: row.candidatePath,
+    evidence: row.evidenceJson === null ? null : decodeEvidence(row.evidenceJson),
+    error: overrides.error === undefined ? row.error : overrides.error,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+};
 
 const failure = (reason: string) => new ForkGithubPullRequestEvidenceError({ reason });
 const processIsAlive = (pid: number): boolean => {
@@ -425,6 +493,7 @@ const makeEvidenceFingerprint = (
   snapshot: CapturedPullRequestSnapshot,
   profileSha256: string,
   toolchainIdentity: Sandbox.CandidateToolchainIdentity,
+  storageIdentitySha256: string,
 ) =>
   hash(
     [
@@ -440,6 +509,7 @@ const makeEvidenceFingerprint = (
       toolchainIdentity.snapshotSha256 ?? "unavailable",
       toolchainIdentity.lockfileSha256 ?? "unavailable",
       toolchainIdentity.profileSha256 ?? "unavailable",
+      storageIdentitySha256,
     ].join("\n"),
   );
 
@@ -465,6 +535,9 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const adapter = yield* Github.ForkGithubAdapter;
+      const actionStore = yield* Github.ForkGithubDurableActionStore;
+      const credentials = yield* Github.ForkGithubCredentialResolver;
+      const gatePolicy = yield* Github.ForkGithubGatePolicy;
       const profileService = yield* Github.ForkGithubValidationProfile;
       const targetService = yield* Promotion.ForkGithubStablePromotionTarget;
       const remote = yield* ForkGithubPullRequestRemote;
@@ -479,6 +552,193 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
             yield* sql<StoredRow>`SELECT ${sql.unsafe(rowSelect)} FROM fork_github_pr_evidence WHERE request_id=${requestId} LIMIT 1`;
           return rows[0] ?? null;
         });
+      const submitted = (snapshotJson: string) => {
+        try {
+          const value: unknown = decodeUnknownJson(snapshotJson);
+          return Schema.is(submissionSchema)(value) ? value : null;
+        } catch {
+          return null;
+        }
+      };
+      const submissionFingerprint = (input: {
+        readonly requestId: string;
+        readonly submission: {
+          readonly kind: "submitted";
+          readonly owner: string;
+          readonly repository: string;
+          readonly number: number;
+          readonly targetBranch: string;
+        };
+        readonly profileJson: string;
+        readonly profileSha256: string;
+        readonly storageIdentitySha256: string;
+      }) =>
+        hash(
+          [
+            input.requestId,
+            encodeSubmission(input.submission),
+            input.profileJson,
+            input.profileSha256,
+            toolchainIdentity.snapshotSha256,
+            toolchainIdentity.lockfileSha256,
+            toolchainIdentity.profileSha256,
+            input.storageIdentitySha256,
+          ].join("\n"),
+        );
+      const accept: ForkGithubPullRequestEvidenceShape["accept"] = Effect.fn(
+        "ForkGithubPullRequestEvidence.accept",
+      )(function* (input) {
+        if (
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            input.requestId,
+          ) ||
+          !Number.isSafeInteger(input.number) ||
+          input.number < 1
+        )
+          return yield* failure("PR evidence requires a UUID request id and positive PR number.");
+        const target = yield* targetService.get();
+        if (!target) return yield* failure("Trusted PR repository and target are not configured.");
+        const profile = yield* profileService.get();
+        if (
+          !profile ||
+          profile.commands.length === 0 ||
+          profile.commands.length > MAX_COMMANDS ||
+          profile.commands.some(
+            (command) =>
+              !Number.isSafeInteger(command.timeoutMs) ||
+              command.timeoutMs < 1 ||
+              command.timeoutMs > MAX_TIMEOUT_MS,
+          ) ||
+          profile.sha256.toLowerCase() !== Github.validationProfileSha256(profile).toLowerCase()
+        )
+          return yield* failure("Trusted PR validation profile is unavailable or invalid.");
+        const storageIdentitySha256 = candidateStorage.configurationIdentitySha256;
+        if (!storageIdentitySha256)
+          return yield* failure("Verified candidate storage is not configured.");
+        yield* candidateStorage.verifyConfiguration();
+        if (
+          toolchainIdentity.snapshotSha256 === null ||
+          toolchainIdentity.lockfileSha256 === null ||
+          toolchainIdentity.profileSha256 === null ||
+          toolchainIdentity.profileSha256.toLowerCase() !== profile.sha256.toLowerCase()
+        )
+          return yield* failure("Verified offline toolchain/profile snapshot is unavailable.");
+        yield* candidateExecutor
+          .verifySnapshot()
+          .pipe(
+            Effect.mapError(() =>
+              failure("Verified offline toolchain snapshot failed verification."),
+            ),
+          );
+
+        const requestId = input.requestId.toLowerCase();
+        const capturedProfile = {
+          id: profile.id,
+          revision: profile.revision,
+          commands: profile.commands,
+        };
+        const profileJson = encodeProfile(capturedProfile);
+        const submissionValue = {
+          kind: "submitted" as const,
+          owner: target.owner.toLowerCase(),
+          repository: target.repository.toLowerCase(),
+          number: input.number,
+          targetBranch: target.branch,
+        };
+        const snapshotJson = encodeSubmission(submissionValue);
+        const requestFingerprint = submissionFingerprint({
+          requestId,
+          submission: submissionValue,
+          profileJson,
+          profileSha256: profile.sha256,
+          storageIdentitySha256,
+        });
+        const timestamp = yield* now;
+        yield* sql`INSERT INTO fork_github_pr_evidence(request_id,evidence_fingerprint,snapshot_json,profile_json,profile_sha256,toolchain_sha256,status,owner_id,owner_pid,lease_expires_at,candidate_path,evidence_json,error,created_at,updated_at)
+          VALUES(${requestId},${requestFingerprint},${snapshotJson},${profileJson},${profile.sha256},${toolchainIdentity.snapshotSha256},'accepted',NULL,NULL,NULL,NULL,NULL,NULL,${timestamp},${timestamp}) ON CONFLICT(request_id) DO NOTHING`;
+        const row = yield* read(requestId);
+        if (!row)
+          return yield* failure("Accepted PR evidence request could not be read after insert.");
+        const existingSubmission = submitted(row.snapshotJson);
+        const matchesSubmission =
+          existingSubmission !== null &&
+          encodeSubmission(existingSubmission) === snapshotJson &&
+          row.profileJson === profileJson &&
+          row.profileSha256 === profile.sha256 &&
+          row.toolchainSha256 === toolchainIdentity.snapshotSha256 &&
+          row.evidenceFingerprint === requestFingerprint;
+        const matchesResolved = (() => {
+          try {
+            const snapshot = decodeSnapshot(row.snapshotJson);
+            return (
+              snapshot.owner.toLowerCase() === submissionValue.owner &&
+              snapshot.repository.toLowerCase() === submissionValue.repository &&
+              snapshot.number === input.number &&
+              snapshot.targetBranch === target.branch &&
+              row.profileJson === profileJson &&
+              row.profileSha256 === profile.sha256 &&
+              row.toolchainSha256 === toolchainIdentity.snapshotSha256 &&
+              makeEvidenceFingerprint(
+                snapshot,
+                profile.sha256,
+                toolchainIdentity,
+                storageIdentitySha256,
+              ) === row.evidenceFingerprint
+            );
+          } catch {
+            return false;
+          }
+        })();
+        if (!matchesSubmission && !matchesResolved)
+          return yield* failure(
+            "Request id was already accepted for different PR or trust inputs.",
+          );
+        if (row.status === "ready" || (row.status === "unavailable" && row.evidenceJson !== null))
+          return yield* readyRecord(row, true);
+        return publicRecord(row);
+      });
+      const pending: ForkGithubPullRequestEvidenceShape["pending"] = Effect.fn(
+        "ForkGithubPullRequestEvidence.pending",
+      )(function* () {
+        const rows =
+          yield* sql<StoredRow>`SELECT ${sql.unsafe(rowSelect)} FROM fork_github_pr_evidence WHERE status='accepted' ORDER BY created_at,request_id`;
+        const result: Array<{
+          requestId: string;
+          owner: string;
+          repository: string;
+          number: number;
+        }> = [];
+        for (const row of rows) {
+          const submission = submitted(row.snapshotJson);
+          if (submission) {
+            result.push({
+              requestId: row.requestId,
+              owner: submission.owner,
+              repository: submission.repository,
+              number: submission.number,
+            });
+            continue;
+          }
+          try {
+            const snapshot = decodeSnapshot(row.snapshotJson);
+            result.push({
+              requestId: row.requestId,
+              owner: snapshot.owner,
+              repository: snapshot.repository,
+              number: snapshot.number,
+            });
+          } catch {
+            // Unknown accepted rows are left visible and untouched; never infer a PR identity.
+          }
+        }
+        return result;
+      });
+      const failAccepted: ForkGithubPullRequestEvidenceShape["failAccepted"] = Effect.fn(
+        "ForkGithubPullRequestEvidence.failAccepted",
+      )(function* (requestId) {
+        const timestamp = yield* now;
+        yield* sql`UPDATE fork_github_pr_evidence SET status='failed',error='PR validation could not complete; submit a new request to retry.',updated_at=${timestamp} WHERE request_id=${requestId} AND status='accepted'`;
+      });
       const capturedSnapshot = (
         snapshot: Github.PullRequestSnapshot,
         branch: string,
@@ -502,6 +762,13 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
               status: "stale" as const,
               reason: "Configured repository or target branch changed after validation.",
             };
+          const storageIdentitySha256 = candidateStorage.configurationIdentitySha256;
+          if (!storageIdentitySha256)
+            return {
+              status: "unavailable" as const,
+              reason: "Trusted candidate storage configuration is not provisioned.",
+            };
+          yield* candidateStorage.verifyConfiguration();
           if (!profile)
             return {
               status: "unavailable" as const,
@@ -558,6 +825,7 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
               capturedSnapshot(current, captured.targetBranch),
               profile.sha256,
               toolchainIdentity,
+              storageIdentitySha256,
             ) !== row.evidenceFingerprint
           )
             return {
@@ -581,6 +849,7 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
             evidence.profileRevision !== profile.revision ||
             evidence.profileSha256 !== profile.sha256 ||
             evidence.toolchainSha256 !== toolchainIdentity.snapshotSha256 ||
+            evidence.storageIdentitySha256 !== storageIdentitySha256 ||
             evidence.owner.toLowerCase() !== captured.owner.toLowerCase() ||
             evidence.repository.toLowerCase() !== captured.repository.toLowerCase() ||
             evidence.number !== captured.number ||
@@ -607,13 +876,14 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
               reason:
                 "Persisted validation evidence does not bind to the current candidate/profile.",
             };
-          return {
-            status: "unavailable" as const,
-            reason:
-              "Host candidate-storage helper and runtime-library digests are not enforced; PR evidence remains historical and unusable.",
-          };
+          return null;
         });
-      const readyRecord = (row: StoredRow) =>
+      const persistStale = (row: StoredRow, reason: string) =>
+        Effect.gen(function* () {
+          const timestamp = yield* now;
+          yield* sql`UPDATE fork_github_pr_evidence SET status='stale',error=${reason},updated_at=${timestamp} WHERE request_id=${row.requestId} AND evidence_fingerprint=${row.evidenceFingerprint} AND status IN ('ready','unavailable')`;
+        });
+      const readyRecord = (row: StoredRow, persistStaleResult = false) =>
         Effect.gen(function* () {
           const result = yield* Effect.exit(checkReadyFreshness(row));
           if (Exit.isFailure(result))
@@ -629,18 +899,209 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
               usable: false,
               error: result.value.reason,
             });
-          const timestamp = yield* now;
-          const stale =
-            yield* sql<StoredRow>`UPDATE fork_github_pr_evidence SET status='stale',error=${result.value.reason},updated_at=${timestamp} WHERE request_id=${row.requestId} AND evidence_fingerprint=${row.evidenceFingerprint} AND status='ready' RETURNING ${sql.unsafe(rowSelect)}`;
-          return publicRecord(stale[0] ?? (yield* read(row.requestId)) ?? row);
+          if (persistStaleResult) yield* persistStale(row, result.value.reason);
+          return publicRecord(row, {
+            status: "stale",
+            usable: false,
+            error: result.value.reason,
+          });
         });
       const get: ForkGithubPullRequestEvidenceShape["get"] = Effect.fn(
         "ForkGithubPullRequestEvidence.get",
       )(function* (requestId) {
         const row = yield* read(requestId);
         if (!row) return null;
-        if (row.status !== "ready") return publicRecord(row);
+        if (row.status !== "ready" && !(row.status === "unavailable" && row.evidenceJson !== null))
+          return publicRecord(row);
         return yield* readyRecord(row);
+      });
+      const pendingPublications: ForkGithubPullRequestEvidenceShape["pendingPublications"] = () =>
+        Effect.gen(function* () {
+          const rows = yield* sql<{
+            readonly requestId: string;
+          }>`SELECT request_id AS "requestId" FROM fork_github_pr_evidence WHERE status='ready' ORDER BY created_at,request_id`;
+          return rows.map((row) => row.requestId);
+        });
+      const publicationInputs = (requestId: string, persistStaleResult = false) =>
+        Effect.gen(function* () {
+          const record = yield* get(requestId);
+          if (
+            !record ||
+            record.status !== "ready" ||
+            !record.usable ||
+            !record.snapshot ||
+            !record.evidence
+          ) {
+            if (persistStaleResult && record?.status === "stale") {
+              const row = yield* read(requestId);
+              if (row) yield* persistStale(row, record.error ?? "PR evidence is stale.");
+            }
+            return null;
+          }
+          const [profile, target, policy, app] = yield* Effect.all(
+            [profileService.get(), targetService.get(), gatePolicy.get(), credentials.resolve()],
+            { concurrency: 1 },
+          );
+          const storageIdentitySha256 = candidateStorage.configurationIdentitySha256;
+          if (
+            !profile ||
+            !targetMatches(record.snapshot, target) ||
+            !policy ||
+            !app ||
+            !storageIdentitySha256 ||
+            profile.sha256 !== record.profileSha256 ||
+            profile.sha256 !== record.evidence.profileSha256 ||
+            record.evidence.toolchainSha256 !== toolchainIdentity.snapshotSha256 ||
+            record.evidence.storageIdentitySha256 !== storageIdentitySha256 ||
+            !Github.validateEvidence(record.evidence, profile)
+          )
+            return null;
+          const policyIdentity = Github.canonicalGatePolicyJson(policy);
+          const identity = {
+            requestId: record.requestId,
+            evidenceFingerprint: record.evidenceFingerprint,
+            snapshot: record.snapshot,
+            profileSha256: profile.sha256,
+            toolchain: toolchainIdentity,
+            storageIdentitySha256,
+            policy: policyIdentity,
+            appId: app.appId,
+            installationId: app.installationId,
+          };
+          const policySnapshot = encodeUnknownJson(identity);
+          const fingerprint = hash(policySnapshot);
+          return {
+            record,
+            snapshot: record.snapshot,
+            evidence: record.evidence,
+            identitySha256: fingerprint,
+            fingerprint,
+            policySnapshot,
+            actionId: `fork-pr-check-v2:${hash(`${record.requestId}\n${fingerprint}`)}`,
+          };
+        });
+      const publicationStatus: ForkGithubPullRequestEvidenceShape["publicationStatus"] = Effect.fn(
+        "ForkGithubPullRequestEvidence.publicationStatus",
+      )(function* (requestId) {
+        const record = yield* get(requestId);
+        if (!record) return "not-eligible";
+        if (record.status === "stale") return "stale";
+        if (record.status === "unavailable") return "unavailable";
+        if (record.status !== "ready" || !record.usable) return "not-eligible";
+        const inputs = yield* publicationInputs(requestId);
+        if (!inputs) return "unavailable";
+        const action = yield* actionStore.get(inputs.actionId);
+        if (!action) return "queued";
+        if (action.fingerprint !== inputs.fingerprint) return "unavailable";
+        switch (action.state) {
+          case "reserved":
+            return "queued";
+          case "pushing":
+            return "uncertain";
+          case "applied":
+            return action.resultSha?.toLowerCase() === inputs.evidence.candidateSha.toLowerCase()
+              ? "published"
+              : "unavailable";
+          case "failed":
+            return "failed";
+          case "cancelled":
+            return "stale";
+        }
+      });
+      const publishCheck: ForkGithubPullRequestEvidenceShape["publishCheck"] = Effect.fn(
+        "ForkGithubPullRequestEvidence.publishCheck",
+      )(function* (requestId) {
+        const initial = yield* publicationInputs(requestId, true);
+        if (!initial)
+          return yield* failure("Only freshly rechecked ready PR evidence can publish a check.");
+        const ownerId = NodeCrypto.randomUUID();
+        const timestamp = yield* now;
+        const expires = DateTime.formatIso(
+          DateTime.add(DateTime.makeUnsafe(timestamp), { minutes: 10 }),
+        );
+        const reservation = yield* actionStore.reserve({
+          actionId: initial.actionId,
+          fingerprint: initial.fingerprint,
+          policySnapshot: initial.policySnapshot,
+          ownerId,
+          leaseExpiresAt: expires,
+          state: "reserved",
+          preservePushingOnRecovery: true,
+          now: timestamp,
+        });
+        const action = reservation.action;
+        if (
+          action.fingerprint !== initial.fingerprint ||
+          action.policySnapshot !== initial.policySnapshot
+        )
+          return yield* failure("PR check action conflicts with its immutable evidence identity.");
+        if (action.state === "applied") return;
+        const publish = (reconcileOnly: boolean) =>
+          adapter.publishPullRequestCompatibilityCheck({
+            snapshot: initial.snapshot,
+            evidence: initial.evidence,
+            identitySha256: initial.identitySha256,
+            reconcileOnly,
+          });
+        if (reservation.role !== "owner" || action.ownerId !== ownerId) {
+          // Pushing actions can only be reconciled by GET; a joined worker never repeats POST.
+          if (action.state === "pushing" && action.ownerId) {
+            const reconciled = yield* publish(true);
+            if (reconciled)
+              yield* actionStore.markApplied({
+                actionId: initial.actionId,
+                fingerprint: initial.fingerprint,
+                ownerId: action.ownerId,
+                resultSha: initial.evidence.candidateSha,
+                now: yield* now,
+              });
+          }
+          return;
+        }
+        if (action.state === "pushing") {
+          const reconciled = yield* publish(true);
+          if (reconciled)
+            yield* actionStore.markApplied({
+              actionId: initial.actionId,
+              fingerprint: initial.fingerprint,
+              ownerId,
+              resultSha: initial.evidence.candidateSha,
+              now: yield* now,
+            });
+          return;
+        }
+        if (action.state !== "reserved") return;
+        const current = yield* publicationInputs(requestId, true);
+        if (!current || current.fingerprint !== initial.fingerprint)
+          return yield* failure("PR evidence or trusted policy changed before check publication.");
+        yield* actionStore.beginPush({
+          actionId: initial.actionId,
+          fingerprint: initial.fingerprint,
+          ownerId,
+          now: yield* now,
+        });
+        const posted = yield* Effect.exit(publish(false));
+        if (Exit.isSuccess(posted) && posted.value) {
+          yield* actionStore.markApplied({
+            actionId: initial.actionId,
+            fingerprint: initial.fingerprint,
+            ownerId,
+            resultSha: initial.evidence.candidateSha,
+            now: yield* now,
+          });
+          return;
+        }
+        // The POST may have committed even when its response was lost. Reconcile by immutable
+        // external_id and App/candidate identity; never issue another POST for `pushing`.
+        const reconciled = yield* Effect.exit(publish(true));
+        if (Exit.isSuccess(reconciled) && reconciled.value)
+          yield* actionStore.markApplied({
+            actionId: initial.actionId,
+            fingerprint: initial.fingerprint,
+            ownerId,
+            resultSha: initial.evidence.candidateSha,
+            now: yield* now,
+          });
       });
       const expectZero = (
         name: string,
@@ -672,15 +1133,8 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
             return yield* failure(
               "Pull request validation ownership was lost before recording its result.",
             );
-          return publicRecord(updated[0], {
-            usable: false,
-            ...(status === "ready"
-              ? {
-                  error:
-                    "Commands passed, but host candidate-storage helper and runtime-library digests are not enforced; this result is not usable PR evidence.",
-                }
-              : {}),
-          });
+          if (status === "ready") return yield* readyRecord(updated[0], true);
+          return publicRecord(updated[0]);
         });
 
       const validate: ForkGithubPullRequestEvidenceShape["validate"] = Effect.fn(
@@ -723,6 +1177,10 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
           return yield* failure(
             "Trusted validation profile digest does not match its captured commands.",
           );
+        yield* candidateStorage.verifyConfiguration();
+        const storageIdentitySha256 = candidateStorage.configurationIdentitySha256;
+        if (!storageIdentitySha256)
+          return yield* failure("Trusted candidate storage configuration is not provisioned.");
         const first = yield* adapter.inspectPullRequest(requested);
         if (
           first.owner.toLowerCase() !== requested.owner.toLowerCase() ||
@@ -755,11 +1213,39 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
           captured,
           profile.sha256,
           toolchainIdentity,
+          storageIdentitySha256,
         );
         const requestId = requested.requestId.toLowerCase();
         const timestamp = yield* now;
-        yield* sql`INSERT INTO fork_github_pr_evidence(request_id,evidence_fingerprint,snapshot_json,profile_json,profile_sha256,toolchain_sha256,status,owner_id,owner_pid,lease_expires_at,candidate_path,evidence_json,error,created_at,updated_at)
-          VALUES(${requestId},${evidenceFingerprint},${snapshotJson},${profileJson},${profile.sha256},${toolchainIdentity.snapshotSha256},'accepted',NULL,NULL,NULL,NULL,NULL,NULL,${timestamp},${timestamp}) ON CONFLICT(request_id) DO NOTHING`;
+        const previous = yield* read(requestId);
+        if (!previous) {
+          yield* sql`INSERT INTO fork_github_pr_evidence(request_id,evidence_fingerprint,snapshot_json,profile_json,profile_sha256,toolchain_sha256,status,owner_id,owner_pid,lease_expires_at,candidate_path,evidence_json,error,created_at,updated_at)
+            VALUES(${requestId},${evidenceFingerprint},${snapshotJson},${profileJson},${profile.sha256},${toolchainIdentity.snapshotSha256},'accepted',NULL,NULL,NULL,NULL,NULL,NULL,${timestamp},${timestamp}) ON CONFLICT(request_id) DO NOTHING`;
+        } else if (submitted(previous.snapshotJson)) {
+          const accepted = submitted(previous.snapshotJson)!;
+          const acceptanceFingerprint = submissionFingerprint({
+            requestId,
+            submission: accepted,
+            profileJson,
+            profileSha256: profile.sha256,
+            storageIdentitySha256,
+          });
+          if (
+            accepted.owner !== target.owner.toLowerCase() ||
+            accepted.repository !== target.repository.toLowerCase() ||
+            accepted.number !== requested.number ||
+            accepted.targetBranch !== target.branch ||
+            previous.profileJson !== profileJson ||
+            previous.profileSha256 !== profile.sha256 ||
+            previous.toolchainSha256 !== toolchainIdentity.snapshotSha256 ||
+            previous.evidenceFingerprint !== acceptanceFingerprint ||
+            previous.status !== "accepted"
+          )
+            return yield* failure(
+              "Accepted PR request no longer matches its captured trust inputs.",
+            );
+          yield* sql`UPDATE fork_github_pr_evidence SET evidence_fingerprint=${evidenceFingerprint},snapshot_json=${snapshotJson},profile_json=${profileJson},profile_sha256=${profile.sha256},toolchain_sha256=${toolchainIdentity.snapshotSha256},updated_at=${timestamp} WHERE request_id=${requestId} AND evidence_fingerprint=${previous.evidenceFingerprint} AND snapshot_json=${previous.snapshotJson} AND status='accepted'`;
+        }
         let row = yield* read(requestId);
         if (
           !row ||
@@ -772,7 +1258,11 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
           return yield* failure(
             "This request id was already accepted with different immutable PR or profile inputs.",
           );
-        if (row.status === "ready") return yield* readyRecord(row);
+        if (candidateStorage.configurationIdentitySha256 !== storageIdentitySha256)
+          return yield* failure(
+            "Candidate storage configuration changed during request acceptance.",
+          );
+        if (row.status === "ready") return yield* readyRecord(row, true);
         if (["failed", "stale"].includes(row.status)) return publicRecord(row);
         if (row.status === "validating") {
           const ownerAlive =
@@ -824,6 +1314,10 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                         error: leaseResult.failure.reason.slice(0, 4000),
                       });
                     const lease = leaseResult.success;
+                    if (lease.storageIdentitySha256 !== storageIdentitySha256)
+                      return yield* finish(claimed, ownerId, "stale", {
+                        error: "Candidate storage identity changed before validation began.",
+                      });
                     const ownedRow = claimed;
                     const candidateRoot = lease.rootPath;
                     const candidatePath = lease.candidatePath;
@@ -887,7 +1381,10 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                           | {
                               readonly pid: number;
                               readonly processGroup: number;
+                              readonly sessionId: number;
                               readonly startTicks: string;
+                              readonly bootId: string;
+                              readonly pidNamespace: string;
                             }
                           | undefined;
                         let processFiber:
@@ -919,12 +1416,18 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                                   event.phase !== "preflight" &&
                                   event.pid !== undefined &&
                                   event.processGroup === event.pid &&
-                                  event.processStartTicks !== undefined
+                                  event.sessionId === event.pid &&
+                                  event.processStartTicks !== undefined &&
+                                  event.processBootId !== undefined &&
+                                  event.processPidNamespace !== undefined
                                 ) {
                                   processIdentity = {
                                     pid: event.pid,
                                     processGroup: event.processGroup,
+                                    sessionId: event.sessionId,
                                     startTicks: event.processStartTicks,
+                                    bootId: event.processBootId,
+                                    pidNamespace: event.processPidNamespace,
                                   };
                                   Deferred.doneUnsafe(spawned, Effect.void);
                                 }
@@ -939,7 +1442,10 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                             yield* Effect.uninterruptible(
                               lease.markCandidateStarted(processIdentity.pid, {
                                 processGroup: processIdentity.processGroup,
+                                sessionId: processIdentity.sessionId,
                                 startTicks: processIdentity.startTicks,
+                                bootId: processIdentity.bootId,
+                                pidNamespace: processIdentity.pidNamespace,
                               }),
                             );
                             startedRecorded = true;
@@ -960,7 +1466,10 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                                 if (!startedRecorded)
                                   yield* lease.markCandidateStarted(processIdentity.pid, {
                                     processGroup: processIdentity.processGroup,
+                                    sessionId: processIdentity.sessionId,
                                     startTicks: processIdentity.startTicks,
+                                    bootId: processIdentity.bootId,
+                                    pidNamespace: processIdentity.pidNamespace,
                                   });
                                 yield* lease.markCandidateStopped(processIdentity.pid);
                               } else {
@@ -1153,6 +1662,7 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                             first.mergeCandidateSha,
                             profile,
                             toolchainIdentity.snapshotSha256,
+                            storageIdentitySha256,
                             results,
                             timestamp,
                           );
@@ -1205,6 +1715,7 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                             first.mergeCandidateSha,
                             profile,
                             toolchainIdentity.snapshotSha256,
+                            storageIdentitySha256,
                             results,
                             timestamp,
                           );
@@ -1272,11 +1783,22 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                         first.mergeCandidateSha,
                         profile,
                         toolchainIdentity.snapshotSha256,
+                        storageIdentitySha256,
                         results,
                         timestamp,
                       );
                       if (toolchainIdentity.snapshotSha256 !== null)
                         yield* candidateExecutor.verifySnapshot();
+                      yield* candidateStorage.verifyConfiguration();
+                      if (
+                        lease.storageIdentitySha256 !== storageIdentitySha256 ||
+                        candidateStorage.configurationIdentitySha256 !== storageIdentitySha256
+                      )
+                        return yield* failTerminal(
+                          "stale",
+                          "Candidate storage runtime identity changed while commands were running.",
+                          worktreePath,
+                        );
                       return yield* finish(ownedRow, ownerId, "ready", {
                         candidatePath: null,
                         evidence,
@@ -1329,7 +1851,16 @@ export const ForkGithubPullRequestEvidenceLive = (input: {
                 ),
         );
       });
-      return ForkGithubPullRequestEvidence.of({ validate, get });
+      return ForkGithubPullRequestEvidence.of({
+        accept,
+        pending,
+        failAccepted,
+        validate,
+        get,
+        pendingPublications,
+        publishCheck,
+        publicationStatus,
+      });
     }),
   );
   return serviceLayer.pipe(

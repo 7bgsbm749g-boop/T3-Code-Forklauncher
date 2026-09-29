@@ -13,6 +13,10 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Sandbox from "./ForkGithubCandidateSandbox.ts";
 import * as CandidateStorage from "./ForkGithubCandidateStorage.ts";
+import {
+  configuredStorageManifestPath,
+  makeCandidateStorageTestConfig,
+} from "./ForkGithubCandidateStorageTestUtils.ts";
 import { SERVER_VALIDATION_PROFILE } from "../forkCompatibility/ForkCompatibilityNativeService.ts";
 
 const SandboxProbeOutputSchema = Schema.Struct({
@@ -53,22 +57,7 @@ const encodeProfileResult = Schema.encodeSync(
 );
 
 const linuxX64 = NodeProcess.platform === "linux" && NodeProcess.arch === "x64";
-const storageTools = (() => {
-  const raw = NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_TOOLS;
-  if (!raw) return undefined;
-  try {
-    const value: unknown = JSON.parse(raw);
-    if (typeof value !== "object" || value === null) return undefined;
-    const record = value as Record<string, unknown>;
-    const keys = ["fuse2fs", "fallocate", "mke2fs", "debugfs", "dumpe2fs", "fusermount3"] as const;
-    if (keys.some((key) => typeof record[key] !== "string")) return undefined;
-    return Object.fromEntries(
-      keys.map((key) => [key, record[key]]),
-    ) as CandidateStorage.ForkGithubCandidateStorageConfig["tools"];
-  } catch {
-    return undefined;
-  }
-})();
+const storageTools = configuredStorageManifestPath();
 const bwrapPath = "/usr/bin/bwrap";
 const toolchain = {
   bubblewrapPath: bwrapPath,
@@ -520,15 +509,13 @@ it.effect.skipIf(
   const source = `const fs=require('node:fs');const original=Buffer.from(process.argv[1],'base64');const patched=Buffer.from(process.argv[2],'base64');fs.writeFileSync('/candidate/package.json',original);fs.writeFileSync('/candidate/package.json',patched);const bytes=fs.readFileSync('/candidate/package.json');let parsed;try{parsed=JSON.parse(bytes.toString('utf8'))}catch(error){console.log(JSON.stringify({size:bytes.length,expected:patched.length,error:String(error)}));process.exit(81)}console.log(JSON.stringify({size:bytes.length,optionalDependencies:parsed.optionalDependencies??{}}));if(bytes.length!==patched.length||parsed.name!=='dbus-next')process.exit(82);`;
   const layer = Layer.mergeAll(
     Sandbox.ForkGithubCandidateExecutorFromSnapshotManifest(manifestPath!),
-    CandidateStorage.ForkGithubCandidateStorageLayer({
-      rootDirectory: storageRoot,
-      imageBytes: 64 * 1024 * 1024,
-      inodeLimit: 512,
-      hostFreeReserveBytes: CandidateStorage.MIN_HOST_FREE_RESERVE_BYTES,
-      fuseRuntimeLibraryDirectory:
-        NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_LD_LIBRARY_PATH ?? "/usr/lib/x86_64-linux-gnu",
-      tools: storageTools!,
-    }),
+    CandidateStorage.ForkGithubCandidateStorageLayer(
+      makeCandidateStorageTestConfig(storageRoot, {
+        imageBytes: 64 * 1024 * 1024,
+        inodeLimit: 512,
+        hostFreeReserveBytes: CandidateStorage.MIN_HOST_FREE_RESERVE_BYTES,
+      }),
+    ),
   );
   return Effect.scoped(
     Effect.gen(function* () {
@@ -537,7 +524,14 @@ it.effect.skipIf(
       const executor = yield* Sandbox.ForkGithubCandidateExecutor;
       yield* lease.markCandidateStarting();
       let identity:
-        | { readonly pid: number; readonly processGroup: number; readonly startTicks: string }
+        | {
+            readonly pid: number;
+            readonly processGroup: number;
+            readonly sessionId: number;
+            readonly startTicks: string;
+            readonly bootId: string;
+            readonly pidNamespace: string;
+          }
         | undefined;
       const result = yield* Effect.onExit(
         executor.run({
@@ -559,12 +553,18 @@ it.effect.skipIf(
               event.phase !== "preflight" &&
               event.pid !== undefined &&
               event.processGroup === event.pid &&
-              event.processStartTicks !== undefined
+              event.sessionId === event.pid &&
+              event.processStartTicks !== undefined &&
+              event.processBootId !== undefined &&
+              event.processPidNamespace !== undefined
             )
               identity = {
                 pid: event.pid,
                 processGroup: event.processGroup,
+                sessionId: event.sessionId,
                 startTicks: event.processStartTicks,
+                bootId: event.processBootId,
+                pidNamespace: event.processPidNamespace,
               };
           },
         }),
@@ -574,7 +574,10 @@ it.effect.skipIf(
               ? lease
                   .markCandidateStarted(identity.pid, {
                     processGroup: identity.processGroup,
+                    sessionId: identity.sessionId,
                     startTicks: identity.startTicks,
+                    bootId: identity.bootId,
+                    pidNamespace: identity.pidNamespace,
                   })
                   .pipe(Effect.andThen(lease.markCandidateStopped(identity.pid)))
               : lease.markCandidateLaunchFailed(),
@@ -1118,13 +1121,13 @@ it.effect.skipIf(!linuxX64 || !manifestPath || !productSource || !NodeFS.existsS
     assert.isString(storageRoot);
     NodeFS.mkdirSync(storageRoot!, { recursive: true, mode: 0o700 });
     NodeFS.chmodSync(storageRoot!, 0o700);
-    const storageLayer = CandidateStorage.ForkGithubCandidateStorageLayer({
-      rootDirectory: storageRoot!,
-      hostFreeReserveBytes: CandidateStorage.MIN_HOST_FREE_RESERVE_BYTES,
-      tools: storageTools!,
-      fuseRuntimeLibraryDirectory:
-        NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_LD_LIBRARY_PATH ?? "/usr/lib/x86_64-linux-gnu",
-    });
+    const storageLayer = CandidateStorage.ForkGithubCandidateStorageLayer(
+      makeCandidateStorageTestConfig(storageRoot!, {
+        imageBytes: 8 * 1024 ** 3,
+        inodeLimit: 500_000,
+        hostFreeReserveBytes: CandidateStorage.MIN_HOST_FREE_RESERVE_BYTES,
+      }),
+    );
     const layer = Sandbox.ForkGithubCandidateExecutorFromSnapshotManifest(manifestPath!);
     return Effect.scoped(
       Effect.gen(function* () {
@@ -1148,7 +1151,16 @@ it.effect.skipIf(!linuxX64 || !manifestPath || !productSource || !NodeFS.existsS
         const runLeased = (input: Parameters<typeof executor.run>[0]) =>
           Effect.gen(function* () {
             yield* lease.markCandidateStarting();
-            let identity: { pid: number; processGroup: number; startTicks: string } | undefined;
+            let identity:
+              | {
+                  pid: number;
+                  processGroup: number;
+                  sessionId: number;
+                  startTicks: string;
+                  bootId: string;
+                  pidNamespace: string;
+                }
+              | undefined;
             let processFiber:
               | Fiber.Fiber<
                   Sandbox.ForkGithubCandidateExecutionOutput,
@@ -1169,12 +1181,18 @@ it.effect.skipIf(!linuxX64 || !manifestPath || !productSource || !NodeFS.existsS
                       event.phase !== "preflight" &&
                       event.pid !== undefined &&
                       event.processGroup === event.pid &&
-                      event.processStartTicks !== undefined
+                      event.sessionId === event.pid &&
+                      event.processStartTicks !== undefined &&
+                      event.processBootId !== undefined &&
+                      event.processPidNamespace !== undefined
                     ) {
                       identity = {
                         pid: event.pid,
                         processGroup: event.processGroup,
+                        sessionId: event.sessionId,
                         startTicks: event.processStartTicks,
+                        bootId: event.processBootId,
+                        pidNamespace: event.processPidNamespace,
                       };
                       Deferred.doneUnsafe(spawned, Effect.void);
                     }
@@ -1190,7 +1208,10 @@ it.effect.skipIf(!linuxX64 || !manifestPath || !productSource || !NodeFS.existsS
                 yield* Effect.uninterruptible(
                   lease.markCandidateStarted(identity.pid, {
                     processGroup: identity.processGroup,
+                    sessionId: identity.sessionId,
                     startTicks: identity.startTicks,
+                    bootId: identity.bootId,
+                    pidNamespace: identity.pidNamespace,
                   }),
                 );
                 startedRecorded = true;
@@ -1205,7 +1226,10 @@ it.effect.skipIf(!linuxX64 || !manifestPath || !productSource || !NodeFS.existsS
                     if (!startedRecorded)
                       yield* lease.markCandidateStarted(identity.pid, {
                         processGroup: identity.processGroup,
+                        sessionId: identity.sessionId,
                         startTicks: identity.startTicks,
+                        bootId: identity.bootId,
+                        pidNamespace: identity.pidNamespace,
                       });
                     yield* lease.markCandidateStopped(identity.pid);
                   } else {

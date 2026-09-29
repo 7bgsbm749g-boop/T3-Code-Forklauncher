@@ -6,7 +6,11 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import type { SidebarProjectGroupingMode } from "@t3tools/contracts";
-import type { PendingForkCheck } from "@t3tools/client-runtime/state/fork-compatibility-ui";
+import {
+  isPendingPullRequestEvidence,
+  type PendingForkCheck,
+  type PendingPullRequestEvidence,
+} from "@t3tools/client-runtime/state/fork-compatibility-ui";
 import type { ComposerEnterBehavior } from "../lib/composerEnterBehavior";
 import { MOBILE_THEME_IDS, type MobileThemeId, type MobileThemeMode } from "../lib/mobileTheme";
 
@@ -54,6 +58,10 @@ export interface Preferences {
   /** Unacknowledged idempotency keys, kept per server and configured source snapshot. */
   readonly forkCompatibilityPendingChecks?: Readonly<
     Record<string, ReadonlyArray<PendingForkCheck>>
+  >;
+  /** PR number and request key are kept per server so a lost response can be retried safely. */
+  readonly forkCompatibilityPullRequestEvidence?: Readonly<
+    Record<string, PendingPullRequestEvidence>
   >;
 }
 
@@ -118,6 +126,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     threadListSnoozedShelfExpanded?: boolean;
     forkCompatibilityRequestIds?: Readonly<Record<string, string>>;
     forkCompatibilityPendingChecks?: Readonly<Record<string, ReadonlyArray<PendingForkCheck>>>;
+    forkCompatibilityPullRequestEvidence?: Readonly<Record<string, PendingPullRequestEvidence>>;
   } = {};
 
   if (typeof parsed.liveActivitiesEnabled === "boolean") {
@@ -228,6 +237,19 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     preferences.forkCompatibilityRequestIds = Object.fromEntries(
       Object.entries(parsed.forkCompatibilityRequestIds).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  }
+  if (
+    parsed.forkCompatibilityPullRequestEvidence !== undefined &&
+    typeof parsed.forkCompatibilityPullRequestEvidence === "object" &&
+    parsed.forkCompatibilityPullRequestEvidence !== null &&
+    !Array.isArray(parsed.forkCompatibilityPullRequestEvidence)
+  ) {
+    preferences.forkCompatibilityPullRequestEvidence = Object.fromEntries(
+      Object.entries(parsed.forkCompatibilityPullRequestEvidence).filter(
+        (entry): entry is [string, PendingPullRequestEvidence] =>
+          isPendingPullRequestEvidence(entry[1]),
       ),
     );
   }

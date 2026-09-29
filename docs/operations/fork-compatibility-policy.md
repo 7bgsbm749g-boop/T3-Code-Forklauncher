@@ -14,52 +14,54 @@ evidence. There is no separate native `T3 Fork Compatibility Evidence` run.
 GitHub documents that only GitHub Apps can create Check Runs; a workflow job
 cannot impersonate this App identity.
 
-The intended PR adapter must read the current PR and fetched
-`merge_commit_sha` object. The object must be the exact API candidate and have
-the current base/head as its two parents. Evidence binds the source SHA, base
-SHA, candidate SHA, candidate tree, candidate parents, target ref, exact pinned
-profile digest, and each exact command/argument tuple with successful exit
-metadata. The policy rejects extra/missing commands, stale profile revisions,
-wrong candidate identities, and check runs with a different deterministic
-external id.
+The native PR adapter reads the current PR and fetched `merge_commit_sha`
+object. The object must be the exact API candidate and have the current
+base/head as its two parents. Evidence binds the source SHA, base SHA, candidate
+SHA, candidate tree, candidate parents, target ref, exact pinned profile digest,
+and each exact command/argument tuple with successful exit metadata. The policy
+rejects extra/missing commands, stale profile revisions, wrong candidate
+identities, and check runs with a different deterministic external id.
 
-Before a future PR producer can publish this check, the trusted adapter must reread
-the PR/base and candidate object and compares the identity tuple. A moved head,
-base, merge SHA, or tree yields no successful check. Check identity includes PR
-number, source, base, candidate, tree and profile revision; reruns cannot
-overwrite a different identity. Ref updates use native Git transport with an
-exact `--force-with-lease=<ref>:<expected-old-sha>` after fast-forward ancestry
+Before publication, the trusted adapter rereads the PR/base and candidate
+object and compares the identity tuple. A moved head, base, merge SHA, or tree
+yields no successful check. Check identity includes PR number, source, base,
+candidate, tree and profile revision; reruns cannot overwrite a different
+identity. Ref updates use native Git transport with an exact
+`--force-with-lease=<ref>:<expected-old-sha>` after fast-forward ancestry
 verification. This rejects any movement of the expected old ref and differs
 from GitHub REST `force:false`, which lacks old-SHA CAS. Windows mutation
 remains unsupported.
 
 Do not treat ordinary Actions workflow success as compatibility acceptance.
 The native coordinator loads its validation profile from server-owned code and
-executes configured arguments against the candidate. A durable custom-PR
-evidence adapter now exists with local Git/SQLite coverage, but it is not wired
-into the production server check-publication path. The `.github` policy
-evaluator is also not authoritative. No custom-PR required check is currently
-produced, and the ruleset helper remains disabled; neither the adapter tests nor
-ordinary workflow success enable a merge gate.
+executes configured arguments against the candidate. Durable Check Run
+publication exists in the native PR evidence path, with local Git/SQLite and
+adapter coverage. It has not been proven in one authenticated production RPC →
+candidate validation → publication flow, and the repository has no configured
+App or active branch gate. The `.github` policy evaluator is not authoritative;
+the ruleset helper remains hard-disabled. No live custom-PR required check is
+currently produced. Neither the publication implementation nor a Published
+state in Settings enables a merge gate.
 
 Candidate artifacts also bind an immutable workflow-control identity. Trusted
 configuration pins the dispatch workflow commit and SHA-256 digests for the
 caller workflow, local reusable desktop workflow, composite apt action, and
 artifact assembly scripts. The Actions run control SHA and each file fetched at
 that SHA must match the pins; the candidate SHA remains a separate package
-input. Artifact preparation stays inert until those pins are provisioned from a
-reviewed workflow revision. GitHub exposes the workflow commit SHA and resolves
-same-repository reusable workflows from the caller's commit; the adapter also
+input. The v1 pins are protected and validated; App-backed build and draft
+operations remain unavailable until the App is configured. GitHub exposes the
+workflow commit SHA and resolves same-repository reusable workflows from the caller's commit; the adapter also
 fetches and hashes each local source file at that pinned commit ([workflow
 contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts),
 [reusable workflow configuration](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)).
 
 ## Ref updates and direct-push policy
 
-The eventual ruleset restricts writes to the dedicated App, the only possible
-bypass actor because GitHub bypass applies to the whole ruleset. Custom-PR merge
-evidence is not implemented. Direct-push bypass is not implemented. No human,
-write-role, or Actions actor is included.
+The reviewed ruleset payload restricts writes to the dedicated App, its only
+bypass actor, because GitHub bypass applies to the whole ruleset. PR evidence
+and Check Run publication code exist, but ruleset activation remains blocked as
+described below. Direct-push bypass is not implemented. No human, write-role,
+or Actions actor is included.
 
 `directPushBypass` is false and the native config rejects `true`; mediated
 custom direct updates are not exposed. Any future bypass must be limited to a
@@ -76,20 +78,52 @@ node .github/scripts/fork-ruleset.mjs --verify
 ```
 
 The checked-in App id is unset, so `--payload` fails closed. With a provisioned
-App ID, the payload requires `T3 Fork Compatibility` from that same App but is
-still disabled; `--apply` is hard-disabled until the native custom-PR evidence
-adapter is wired to trusted check publication and validated in production.
-`--verify` is read-only. Do not enable direct-push
-bypass or branch rules yet.
+App ID, the payload binds `T3 Fork Compatibility` to that App but stays
+disabled. The script hardcodes custom-PR support off, and `--apply` refuses
+regardless of App configuration. `--verify` is read-only. Do not enable
+direct-push bypass or branch rules yet.
 
-The provisioned App needs Actions read for candidate artifact metadata and
-downloads, Checks write for trusted status publication, Pull requests read for
-PR identity inspection, and Contents write for workflow source reads, mediated
-ref updates, and draft releases. Keep its private key in the native
-server's secret store, never GitHub Actions PR workflows. The ruleset setup API
-separately needs repository Administration write; it is an operator credential
-and not a runtime secret. No App, key, installation or remote ruleset mutation
-has been made in this slice.
+The App registration and installation need Actions write (dispatch and run/
+artifact access), Checks write (Check Run API), Contents write (pinned source
+reads, mediated ref updates and draft assets), Pull requests read (PR snapshot
+inspection), and Commit statuses write. GitHub requires the installed App to
+have `statuses:write`, to have recently submitted a Check Run, and to be
+associated with an existing required-check context before it can be selected as
+that ruleset context's expected source. The runtime does not call the commit
+statuses API: its short-lived installation token is repository-scoped and
+explicitly requests only Actions write, Checks write, Contents write and Pull
+requests read. Do not add `statuses:write` to that token unless an implemented
+runtime API call needs it. Keep the App private key in the native server's
+secret store, never in Actions candidate jobs. The ruleset setup API separately
+needs repository Administration write; that remains an operator credential,
+not a runtime permission.
+
+Required-check identity is exactly `T3 Fork Compatibility` from the configured
+App, and the native producer targets the current GitHub PR `merge_commit_sha`
+(the test-merge candidate). The generated ruleset binds that name to the App's
+integration id and sets strict/up-to-date checking, so a moved base requires a
+fresh candidate/check. The ruleset generator still hardcodes custom-PR support
+off: `--apply` refuses and the payload is disabled. The App, recent check-run
+association and active control-tag ruleset do not make a PR gate active. Do
+not interpret an individual Published Check Run or the Settings display as
+merge eligibility; the production authenticated validation-to-publication
+proof and reviewed gate activation are still prerequisites.
+
+The generated branch ruleset grants its sole bypass actor to the dedicated
+Integration App in `always` mode; a ruleset bypass actor can bypass the whole
+ruleset. Keep that App credential server-only and expose updates only through
+the native mediator. Do not add human, repository-role or Actions bypasses.
+`directPushBypass` remains false and unsupported. The current PR evidence path
+has no merge-queue `merge_group` implementation; do not enable a merge queue
+until the producer and required-check identity are extended and verified for
+queue candidates. Its default PR Git fetch uses an unauthenticated
+`https://github.com/{owner}/{repo}.git` remote; private-repository PR fetch is
+not configured or proven. Treat private PR sources as unsupported until a
+short-lived authenticated fetch path is explicitly implemented and tested.
+
+No App key/installation or active branch ruleset was provisioned by this
+revision. The already-applied ruleset protects only the immutable
+`forklauncher-control-v1` tag; it is not a branch merge gate.
 
 ## Downstream repositories
 

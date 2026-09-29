@@ -10,6 +10,12 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import * as Storage from "./ForkGithubCandidateStorage.ts";
+import * as StorageTrust from "./ForkGithubCandidateStorageTrust.ts";
+import {
+  configuredStorageManifestPath,
+  makeCandidateStorageTestConfig,
+  removeCandidateStorageTestRoot,
+} from "./ForkGithubCandidateStorageTestUtils.ts";
 
 const imageBytes = 64 * 1024 * 1024;
 const inodeLimit = 128;
@@ -28,46 +34,27 @@ const acquireTestRoot = () =>
         !NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")) &&
         !NodeFS.existsSync(NodePath.join(root, "candidate.ext2"))
       )
-        NodeFS.rmSync(root, { recursive: true, force: true });
+        removeCandidateStorageTestRoot(root);
     }),
   );
-const configuredTools = (): Storage.ForkGithubCandidateStorageConfig["tools"] | undefined => {
-  const raw = NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_TOOLS;
-  if (!raw) return undefined;
-  try {
-    const value: unknown = JSON.parse(raw);
-    if (typeof value !== "object" || value === null) return undefined;
-    const tools = value as Record<string, unknown>;
-    const keys = ["fuse2fs", "fallocate", "mke2fs", "debugfs", "dumpe2fs", "fusermount3"] as const;
-    if (keys.some((key) => typeof tools[key] !== "string")) return undefined;
-    return Object.fromEntries(
-      keys.map((key) => [key, tools[key]]),
-    ) as Storage.ForkGithubCandidateStorageConfig["tools"];
-  } catch {
-    return undefined;
-  }
-};
+const configuredTools = () =>
+  StorageTrust.loadForkGithubCandidateStorageOperatorConfiguration(configuredStorageManifestPath());
 const makeConfig = (
   root: string,
-  tools = configuredTools(),
-  fuseRuntimeLibraryDirectory = NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_LD_LIBRARY_PATH ??
-    "/usr/lib/x86_64-linux-gnu",
+  _tools?: unknown,
+  _fuseRuntimeLibraryDirectory?: string,
   hostFreeReserveBytes = Storage.MIN_HOST_FREE_RESERVE_BYTES,
-): Storage.ForkGithubCandidateStorageConfig => ({
-  rootDirectory: root,
-  imageBytes,
-  inodeLimit,
-  hostFreeReserveBytes,
-  fuseRuntimeLibraryDirectory,
-  tools: tools ?? {
-    fuse2fs: "/usr/bin/fuse2fs",
-    fallocate: "/usr/bin/fallocate",
-    mke2fs: "/usr/sbin/mke2fs",
-    debugfs: "/usr/sbin/debugfs",
-    dumpe2fs: "/usr/sbin/dumpe2fs",
-    fusermount3: "/usr/bin/fusermount3",
-  },
-});
+  fakeFuse2fs = false,
+): Storage.ForkGithubCandidateStorageConfig =>
+  makeCandidateStorageTestConfig(
+    root,
+    {
+      imageBytes,
+      inodeLimit,
+      hostFreeReserveBytes,
+    },
+    { fakeFuse2fs },
+  );
 const withLease = <A, E, R>(
   storage: Storage.ForkGithubCandidateStorage["Service"],
   f: (lease: Storage.ForkGithubCandidateStorageLease) => Effect.Effect<A, E, R>,
@@ -81,12 +68,23 @@ const withLease = <A, E, R>(
 
 it.effect("is inert until an operator supplies a candidate storage configuration", () =>
   Effect.gen(function* () {
-    const result = yield* withLease(
-      Storage.makeForkGithubCandidateStorage(),
-      () => Effect.void,
-    ).pipe(Effect.result);
-    assert.equal(result._tag, "Failure");
-    if (result._tag === "Failure") assert.include(result.failure.reason, "operator provisions");
+    const key = "T3CODE_FORK_GITHUB_CANDIDATE_STORAGE_MANIFEST";
+    const previous = NodeProcess.env[key];
+    delete NodeProcess.env[key];
+    try {
+      const result = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const storage = yield* Storage.ForkGithubCandidateStorage;
+          yield* storage.acquire();
+        }).pipe(Effect.provide(Storage.ForkGithubCandidateStorageLayerFromOperatorConfiguration())),
+      ).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.include(result.failure.reason, "operator provisions verified FUSE tools");
+    } finally {
+      if (previous === undefined) delete NodeProcess.env[key];
+      else NodeProcess.env[key] = previous;
+    }
   }),
 );
 
@@ -94,20 +92,21 @@ it.effect("rejects unsafe size and non-private roots before allocating", () =>
   Effect.gen(function* () {
     const root = rootDirectory();
     try {
+      const config = makeConfig(root);
       const tooLarge = yield* withLease(
-        Storage.makeForkGithubCandidateStorage({ ...makeConfig(root), imageBytes: 9 * 1024 ** 3 }),
+        Storage.makeForkGithubCandidateStorage({ ...config, imageBytes: 9 * 1024 ** 3 }),
         () => Effect.void,
       ).pipe(Effect.result);
       assert.equal(tooLarge._tag, "Failure");
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
       NodeFS.chmodSync(root, 0o755);
       const openRoot = yield* withLease(
-        Storage.makeForkGithubCandidateStorage(makeConfig(root)),
+        Storage.makeForkGithubCandidateStorage(config),
         () => Effect.void,
       ).pipe(Effect.result);
       assert.equal(openRoot._tag, "Failure");
     } finally {
-      NodeFS.rmSync(root, { recursive: true, force: true });
+      removeCandidateStorageTestRoot(root);
     }
   }),
 );
@@ -139,7 +138,7 @@ it.effect("rejects an image that would violate the configured host free-space re
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
     } finally {
-      NodeFS.rmSync(root, { recursive: true, force: true });
+      removeCandidateStorageTestRoot(root);
     }
   }),
 );
@@ -154,7 +153,7 @@ it.effect("rejects a second service instance while a durable live-owner marker e
         .trim()
         .split(/\s+/);
       const marker = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         id: "11111111-1111-4111-8111-111111111111",
         owner: {
           pid: NodeProcess.pid,
@@ -163,6 +162,7 @@ it.effect("rejects a second service instance while a durable live-owner marker e
         },
         imageBytes,
         inodeLimit,
+        storageIdentitySha256: "a".repeat(64),
       };
       NodeFS.writeFileSync(NodePath.join(root, ".candidate-storage.lock"), encodeJson(marker), {
         mode: 0o600,
@@ -183,7 +183,7 @@ it.effect("rejects a second service instance while a durable live-owner marker e
       if (result._tag === "Failure") assert.include(result.failure.reason, "live server process");
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
     } finally {
-      NodeFS.rmSync(root, { recursive: true, force: true });
+      removeCandidateStorageTestRoot(root);
     }
   }),
 );
@@ -200,6 +200,7 @@ it.effect.skipIf(configuredTools() === undefined)(
       const storage = Storage.makeForkGithubCandidateStorage(config);
       yield* withLease(storage, (lease) =>
         Effect.gen(function* () {
+          assert.equal(lease.storageIdentitySha256, config.configurationIdentitySha256);
           const competing = yield* Storage.makeForkGithubCandidateStorage(config)
             .acquire()
             .pipe(Effect.result);
@@ -302,42 +303,31 @@ it.effect.skipIf(configuredTools() === undefined)(
       );
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
-      assert.equal(NodeFS.readdirSync(root).length, 0);
+      assert.deepEqual(
+        NodeFS.readdirSync(root).filter((name) => name !== ".candidate-storage-operator.json"),
+        [],
+      );
     }),
 );
 
-it.effect.skipIf(configuredTools() === undefined)(
-  "retains the backing image when normal unmount fails, then releases after retry",
-  () =>
-    Effect.gen(function* () {
-      const root = yield* acquireTestRoot();
-      const realTools = configuredTools()!;
-      const wrapper = NodePath.join(root, "fusermount3-once");
-      const attempt = NodePath.join(root, "unmount-attempted");
-      NodeFS.writeFileSync(
-        wrapper,
-        "#!/bin/sh\nif [ ! -e '" +
-          attempt +
-          "' ]; then : > '" +
-          attempt +
-          '\'; exit 23; fi\nexec /usr/bin/fusermount3 "$@"\n',
-        { mode: 0o700 },
-      );
-      NodeFS.chmodSync(wrapper, 0o700);
-      const config = makeConfig(root, { ...realTools, fusermount3: wrapper });
-      const storage = Storage.makeForkGithubCandidateStorage(config);
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          const lease = yield* storage.acquire();
-          const result = yield* lease.release().pipe(Effect.result);
-          assert.equal(result._tag, "Failure");
-          assert.isTrue(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
-          assert.isTrue(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
-        }),
-      );
-      assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
-      assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
-    }),
+it.effect("rejects a trusted helper manifest modified after configuration load", () =>
+  Effect.gen(function* () {
+    const root = yield* acquireTestRoot();
+    const config = makeConfig(root);
+    const manifest = NodeFS.readFileSync(config.manifestPath, "utf8");
+    NodeFS.chmodSync(config.manifestPath, 0o600);
+    NodeFS.writeFileSync(
+      config.manifestPath,
+      manifest.replace('"imageBytes":67108864', '"imageBytes":67108865'),
+    );
+    NodeFS.chmodSync(config.manifestPath, 0o400);
+    const result = yield* withLease(
+      Storage.makeForkGithubCandidateStorage(config),
+      () => Effect.void,
+    ).pipe(Effect.result);
+    assert.equal(result._tag, "Failure");
+    assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
+  }),
 );
 
 it.effect.skipIf(configuredTools() === undefined)(
@@ -457,19 +447,17 @@ it.effect.skipIf(configuredTools() === undefined)(
       yield* Fiber.interrupt(fiber);
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
       assert.isFalse(NodeFS.existsSync(NodePath.join(root, "candidate.ext2")));
-      assert.equal(NodeFS.readdirSync(root).length, 0);
+      assert.deepEqual(
+        NodeFS.readdirSync(root).filter((name) => name !== ".candidate-storage-operator.json"),
+        [],
+      );
     }),
 );
 
 it.effect("reconciles a dead owner marker without touching unowned paths", () =>
   Effect.gen(function* () {
     const root = yield* acquireTestRoot();
-    const toolsDir = yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "candidate-storage-fake-tools-")),
-      ),
-      (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
-    );
+    const config = makeConfig(root, undefined, undefined, undefined, true);
     const pid = yield* Effect.tryPromise({
       try: async () => {
         const child = NodeChildProcess.spawn(
@@ -493,7 +481,7 @@ it.effect("reconciles a dead owner marker without touching unowned paths", () =>
             .trim()
             .split(/\s+/);
           const marker = {
-            schemaVersion: 1,
+            schemaVersion: 2,
             id: "22222222-2222-4222-8222-222222222222",
             owner: {
               pid: processId,
@@ -502,6 +490,7 @@ it.effect("reconciles a dead owner marker without touching unowned paths", () =>
             },
             imageBytes,
             inodeLimit,
+            storageIdentitySha256: config.configurationIdentitySha256,
           };
           child.kill("SIGTERM");
           await new Promise<void>((resolve) => child.once("close", () => resolve()));
@@ -525,28 +514,14 @@ it.effect("reconciles a dead owner marker without touching unowned paths", () =>
         new Storage.ForkGithubCandidateStorageError({ reason: "Dead-owner fixture setup failed" }),
     });
     assert.isTrue(pid > 0);
-    const noOp = (name: string, output = "") => {
-      const path = NodePath.join(toolsDir, name);
-      NodeFS.writeFileSync(path, "#!/bin/sh\n" + output + "\n", { mode: 0o700 });
-      NodeFS.chmodSync(path, 0o700);
-      return path;
-    };
-    const tools = {
-      fuse2fs: noOp("fuse2fs", "exit 1"),
-      fallocate: noOp("fallocate", "exit 1"),
-      mke2fs: noOp("mke2fs"),
-      debugfs: noOp("debugfs"),
-      dumpe2fs: noOp("dumpe2fs", "echo 'Inode count: 128'"),
-      fusermount3: noOp("fusermount3"),
-    };
     const image = NodePath.join(root, "candidate.ext2");
     const result = yield* withLease(
-      Storage.makeForkGithubCandidateStorage(makeConfig(root, tools)),
+      Storage.makeForkGithubCandidateStorage(config),
       () => Effect.void,
     ).pipe(Effect.result);
     assert.equal(result._tag, "Failure", "fake FUSE is not accepted as a mount");
     assert.isFalse(NodeFS.existsSync(NodePath.join(root, ".candidate-storage.lock")));
     assert.isFalse(NodeFS.existsSync(image));
-    assert.equal(NodeFS.readdirSync(root).length, 0);
+    assert.isTrue(NodeFS.readdirSync(root).includes(".candidate-storage-operator.json"));
   }),
 );

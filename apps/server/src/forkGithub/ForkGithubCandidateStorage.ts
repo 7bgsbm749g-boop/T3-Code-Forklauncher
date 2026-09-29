@@ -12,6 +12,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
+import * as StorageTrust from "./ForkGithubCandidateStorageTrust.ts";
 
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
@@ -29,25 +30,8 @@ const MOUNT_NAME = "candidate-mount";
 const TRUNCATE_PROBE_NAME = ".t3-storage-truncate-probe";
 const VALID_LEASE_ID = /^[a-f0-9-]{36}$/;
 
-export interface ForkGithubCandidateStorageConfig {
-  /** Existing, private, server-owned directory. It is never exposed to the candidate. */
-  readonly rootDirectory: string;
-  /** Omit to use the conservative first production budget. Tests may choose a smaller image. */
-  readonly imageBytes?: number;
-  readonly inodeLimit?: number;
-  /** The configured free-space reserve is in addition to the fully allocated image. */
-  readonly hostFreeReserveBytes?: number;
-  /** Pinned, operator-provisioned shared-library directory used by the fuse2fs child only. */
-  readonly fuseRuntimeLibraryDirectory: string;
-  readonly tools: {
-    readonly fuse2fs: string;
-    readonly fallocate: string;
-    readonly mke2fs: string;
-    readonly debugfs: string;
-    readonly dumpe2fs: string;
-    readonly fusermount3: string;
-  };
-}
+export type ForkGithubCandidateStorageConfig =
+  StorageTrust.VerifiedForkGithubCandidateStorageConfiguration;
 
 export class ForkGithubCandidateStorageError extends Schema.TaggedError<ForkGithubCandidateStorageError>()(
   "ForkGithubCandidateStorageError",
@@ -56,6 +40,8 @@ export class ForkGithubCandidateStorageError extends Schema.TaggedError<ForkGith
 
 export interface ForkGithubCandidateStorageLease {
   readonly id: string;
+  /** Hash of the operator manifest and every pinned executable/runtime file. */
+  readonly storageIdentitySha256: string;
   /** The mounted image root; all candidate-controlled writes must stay below this path. */
   readonly rootPath: string;
   readonly gitPath: string;
@@ -68,12 +54,16 @@ export interface ForkGithubCandidateStorageLease {
   readonly markCandidateStarting: () => Effect.Effect<void, ForkGithubCandidateStorageError>;
   readonly markCandidateStarted: (
     pid: number,
-    capturedIdentity?: { readonly processGroup: number; readonly startTicks: string },
+    capturedIdentity?: {
+      readonly processGroup: number;
+      readonly sessionId: number;
+      readonly startTicks: string;
+      readonly bootId: string;
+      readonly pidNamespace: string;
+    },
   ) => Effect.Effect<void, ForkGithubCandidateStorageError>;
   /** Resolve a persisted starting phase after spawn failure or a quiescent interrupted launch. */
-  readonly markCandidateLaunchFailed: (
-    pid?: number,
-  ) => Effect.Effect<void, ForkGithubCandidateStorageError>;
+  readonly markCandidateLaunchFailed: () => Effect.Effect<void, ForkGithubCandidateStorageError>;
   readonly markCandidateStopped: (
     pid: number,
   ) => Effect.Effect<void, ForkGithubCandidateStorageError>;
@@ -88,6 +78,8 @@ export class ForkGithubCandidateStorage extends Context.Service<
       ForkGithubCandidateStorageError,
       Scope.Scope
     >;
+    readonly configurationIdentitySha256: string | null;
+    readonly verifyConfiguration: () => Effect.Effect<void, ForkGithubCandidateStorageError>;
   }
 >()("t3/forkGithub/ForkGithubCandidateStorage") {}
 
@@ -98,11 +90,12 @@ interface OwnerIdentity {
 }
 
 interface LeaseMarker {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly id: string;
   readonly owner: OwnerIdentity;
   readonly imageBytes: number;
   readonly inodeLimit: number;
+  readonly storageIdentitySha256: string;
 }
 
 type LeaseState =
@@ -112,7 +105,10 @@ type LeaseState =
       readonly phase: "candidate-running";
       readonly pid: number;
       readonly processGroup: number;
+      readonly sessionId: number;
       readonly startTicks: string;
+      readonly bootId: string;
+      readonly pidNamespace: string;
     }
   | { readonly phase: "candidate-stopped" };
 
@@ -146,7 +142,16 @@ const parseMountInfo = (text: string) =>
 
 const readProcIdentity = (
   pid: number,
-): { readonly startTicks: string; readonly processGroup: number } | undefined => {
+):
+  | {
+      readonly startTicks: string;
+      readonly processGroup: number;
+      readonly sessionId: number;
+      readonly bootId: string;
+      readonly pidNamespace: string;
+      readonly state: string;
+    }
+  | undefined => {
   try {
     const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
     const close = stat.lastIndexOf(")");
@@ -156,19 +161,30 @@ const readProcIdentity = (
       .trim()
       .split(/\s+/);
     const processGroup = Number(fields[2]); // field 5
+    const sessionId = Number(fields[3]); // field 6
     const startTicks = fields[19]; // field 22
-    if (!Number.isSafeInteger(processGroup) || !startTicks) return undefined;
-    return { processGroup, startTicks };
+    const bootId = NodeFS.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const pidNamespace = NodeFS.readlinkSync(`/proc/${pid}/ns/pid`);
+    if (!Number.isSafeInteger(processGroup) || !Number.isSafeInteger(sessionId) || !startTicks)
+      return undefined;
+    return { processGroup, sessionId, startTicks, bootId, pidNamespace, state: fields[0]! };
   } catch {
     return undefined;
   }
 };
 
-const processGroupExists = (group: number) => {
+const processGroupExists = (group: number, sessionId: number, pidNamespace: string) => {
   try {
     return NodeFS.readdirSync("/proc", { withFileTypes: true }).some((entry) => {
       if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) return false;
-      return readProcIdentity(Number(entry.name))?.processGroup === group;
+      const identity = readProcIdentity(Number(entry.name));
+      return (
+        identity?.processGroup === group &&
+        identity.sessionId === sessionId &&
+        identity.pidNamespace === pidNamespace &&
+        identity.state !== "Z" &&
+        identity.state !== "X"
+      );
     });
   } catch {
     return true; // inability to establish quiescence is fail-closed
@@ -233,18 +249,35 @@ const spawnBounded = (
   command: string,
   args: ReadonlyArray<string>,
   cwd: string,
+  runtimeLibraryDirectory: string,
+  loaderPath: string | null,
+  preserveSetuid: boolean,
   signal?: AbortSignal,
 ): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(failure("Candidate storage command was interrupted"));
     let child: NodeChildProcess.ChildProcessByStdio<null, NodeStream.Readable, NodeStream.Readable>;
     try {
-      child = NodeChildProcess.spawn(command, [...args], {
-        cwd,
-        env: { HOME: cwd, LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      child = NodeChildProcess.spawn(
+        preserveSetuid ? command : (loaderPath ?? command),
+        preserveSetuid
+          ? [...args]
+          : loaderPath
+            ? ["--library-path", runtimeLibraryDirectory, command, ...args]
+            : [...args],
+        {
+          cwd,
+          env: {
+            HOME: cwd,
+            LANG: "C",
+            LC_ALL: "C",
+            PATH: "",
+            LD_LIBRARY_PATH: runtimeLibraryDirectory,
+          },
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
     } catch {
       return reject(failure("Could not start a configured candidate storage tool"));
     }
@@ -311,12 +344,24 @@ const spawnBounded = (
   });
 
 const toolFailure = async (
-  command: string,
+  config: ForkGithubCandidateStorageConfig,
+  name: StorageTrust.ForkGithubCandidateStorageToolName,
   args: ReadonlyArray<string>,
   cwd: string,
   signal?: AbortSignal,
 ) => {
-  const result = await spawnBounded(command, args, cwd, signal);
+  StorageTrust.verifyForkGithubCandidateStorageConfiguration(config);
+  const tool = config.tools[name];
+  const result = await spawnBounded(
+    tool.path,
+    args,
+    cwd,
+    config.runtime.libraryDirectory,
+    config.runtime.loader.path,
+    name === "fusermount3",
+    signal,
+  );
+  StorageTrust.verifyForkGithubCandidateStorageConfiguration(config);
   if (result.code !== 0)
     throw failure("A configured candidate storage command did not complete successfully");
   return result.stdout;
@@ -333,6 +378,7 @@ const waitFor = async (predicate: () => boolean, signal?: AbortSignal) => {
 };
 
 const validateConfig = (config: ForkGithubCandidateStorageConfig) => {
+  StorageTrust.verifyForkGithubCandidateStorageConfiguration(config);
   const rootDirectory = config.rootDirectory;
   const imageBytes = config.imageBytes ?? DEFAULT_CANDIDATE_IMAGE_BYTES;
   const inodeLimit = config.inodeLimit ?? DEFAULT_CANDIDATE_INODE_LIMIT;
@@ -353,16 +399,19 @@ const validateConfig = (config: ForkGithubCandidateStorageConfig) => {
   )
     throw failure("Candidate storage must preserve at least 10 GiB of host free space");
   for (const executable of Object.values(config.tools)) {
-    if (!NodePath.isAbsolute(executable) || NodePath.resolve(executable) !== executable)
+    if (
+      !NodePath.isAbsolute(executable.path) ||
+      NodePath.resolve(executable.path) !== executable.path
+    )
       throw failure("Candidate storage tools must use explicit absolute executable paths");
-    const stat = NodeFS.lstatSync(executable);
+    const stat = NodeFS.lstatSync(executable.path);
     if (!stat.isFile() || stat.isSymbolicLink())
       throw failure("A configured candidate storage tool is not a regular executable");
-    NodeFS.accessSync(executable, NodeFS.constants.X_OK);
-    if (NodeFS.realpathSync(executable) !== executable)
+    NodeFS.accessSync(executable.path, NodeFS.constants.X_OK);
+    if (NodeFS.realpathSync(executable.path) !== executable.path)
       throw failure("Candidate storage tool path must resolve without symlinks");
   }
-  const runtimeDirectory = config.fuseRuntimeLibraryDirectory;
+  const runtimeDirectory = config.runtime.libraryDirectory;
   if (
     !NodePath.isAbsolute(runtimeDirectory) ||
     NodePath.resolve(runtimeDirectory) !== runtimeDirectory
@@ -416,11 +465,13 @@ const isMarker = (value: unknown): value is LeaseMarker => {
   const record = value as Record<string, unknown>;
   const owner = record.owner as Record<string, unknown> | undefined;
   return (
-    record.schemaVersion === 1 &&
+    record.schemaVersion === 2 &&
     typeof record.id === "string" &&
     VALID_LEASE_ID.test(record.id) &&
     Number.isSafeInteger(record.imageBytes) &&
     Number.isSafeInteger(record.inodeLimit) &&
+    typeof record.storageIdentitySha256 === "string" &&
+    /^[a-f0-9]{64}$/.test(record.storageIdentitySha256) &&
     typeof owner === "object" &&
     owner !== null &&
     Number.isSafeInteger(owner.pid) &&
@@ -444,8 +495,13 @@ const isLeaseState = (value: unknown): value is LeaseState => {
     record.phase === "candidate-running" &&
     Number.isSafeInteger(record.pid) &&
     Number.isSafeInteger(record.processGroup) &&
+    Number.isSafeInteger(record.sessionId) &&
     typeof record.startTicks === "string" &&
-    /^[0-9]+$/.test(record.startTicks)
+    /^[0-9]+$/.test(record.startTicks) &&
+    typeof record.bootId === "string" &&
+    /^[a-f0-9-]{36}$/.test(record.bootId) &&
+    typeof record.pidNamespace === "string" &&
+    /^pid:\[[0-9]+\]$/.test(record.pidNamespace)
   );
 };
 
@@ -556,7 +612,7 @@ const runUnmount = async (
   if (entry) {
     if (!entry.fsType.startsWith("fuse") || entry.source !== imagePath)
       throw failure("Recorded candidate mount path is occupied by an unexpected filesystem");
-    await toolFailure(config.tools.fusermount3, ["-u", mountPath], root);
+    await toolFailure(config, "fusermount3", ["-u", mountPath], root);
   }
   await waitFor(() => exactMountedEntry(mountPath) === undefined);
   await waitFor(() => !imageHasOpenReferences(imagePath));
@@ -589,7 +645,12 @@ const removeOwnedLease = async (
     );
   if (state?.phase === "candidate-running") {
     const identity = readProcIdentity(state.pid);
-    if (identity?.startTicks === state.startTicks || processGroupExists(state.processGroup))
+    if (
+      (identity?.startTicks === state.startTicks &&
+        identity.bootId === state.bootId &&
+        identity.pidNamespace === state.pidNamespace) ||
+      processGroupExists(state.processGroup, state.sessionId, state.pidNamespace)
+    )
       throw failure("A prior candidate process may still use the storage; cleanup is retained");
   }
   await runUnmount(config, root, imagePath, mountPath);
@@ -658,6 +719,10 @@ const recoverOrRejectExisting = async (config: ForkGithubCandidateStorageConfig,
   try {
     if (ownerIsAlive(marker.owner))
       throw failure("Candidate storage is already owned by a live server process");
+    if (marker.storageIdentitySha256 !== config.configurationIdentitySha256)
+      throw failure(
+        "Existing candidate storage lease uses a different trusted tool/runtime identity; manual review is required",
+      );
     await removeOwnedLease(config, root, marker, lockContents);
   } finally {
     try {
@@ -689,13 +754,15 @@ const prepareImage = async (
       "Unowned candidate image or mount path already exists; storage acquisition is refused",
     );
   await toolFailure(
-    config.tools.fallocate,
+    config,
+    "fallocate",
     ["-l", String(marker.imageBytes), imagePath],
     root,
     signal,
   );
   await toolFailure(
-    config.tools.mke2fs,
+    config,
+    "mke2fs",
     [
       "-q",
       "-F",
@@ -717,19 +784,22 @@ const prepareImage = async (
   if (uid === undefined || gid === undefined)
     throw failure("Candidate storage requires a Unix server user identity");
   await toolFailure(
-    config.tools.debugfs,
+    config,
+    "debugfs",
     ["-w", "-R", `set_inode_field <2> uid ${uid}`, imagePath],
     root,
     signal,
   );
   await toolFailure(
-    config.tools.debugfs,
+    config,
+    "debugfs",
     ["-w", "-R", `set_inode_field <2> gid ${gid}`, imagePath],
     root,
     signal,
   );
   await toolFailure(
-    config.tools.fallocate,
+    config,
+    "fallocate",
     ["-l", String(marker.imageBytes), imagePath],
     root,
     signal,
@@ -755,7 +825,7 @@ const prepareImage = async (
     throw failure(
       "Preallocating the candidate image violated the configured host free-space reserve",
     );
-  const superblock = await toolFailure(config.tools.dumpe2fs, ["-h", imagePath], root, signal);
+  const superblock = await toolFailure(config, "dumpe2fs", ["-h", imagePath], root, signal);
   const inodeLine = superblock.split("\n").find((line) => line.startsWith("Inode count:"));
   const inodeCount = inodeLine ? Number(inodeLine.slice("Inode count:".length).trim()) : NaN;
   if (!Number.isSafeInteger(inodeCount) || inodeCount < 1 || inodeCount > marker.inodeLimit)
@@ -777,17 +847,27 @@ const createMountedLease = async (
   // The host validator and user-namespace candidate map to different numeric UIDs.
   // The lease is a private image owned by this server, so fuse2fs must let the
   // lease owner operate on ext2 files regardless of the image's internal uid.
+  StorageTrust.verifyForkGithubCandidateStorageConfiguration(config);
   const child = NodeChildProcess.spawn(
-    config.tools.fuse2fs,
-    [imagePath, mountPath, "-o", "fakeroot", "-f"],
+    config.runtime.loader.path,
+    [
+      "--library-path",
+      config.runtime.libraryDirectory,
+      config.tools.fuse2fs.path,
+      imagePath,
+      mountPath,
+      "-o",
+      "fakeroot",
+      "-f",
+    ],
     {
       cwd: root,
       env: {
         HOME: root,
         LANG: "C",
         LC_ALL: "C",
-        PATH: "/usr/bin:/bin",
-        LD_LIBRARY_PATH: config.fuseRuntimeLibraryDirectory,
+        PATH: "",
+        LD_LIBRARY_PATH: config.runtime.libraryDirectory,
       },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
@@ -842,13 +922,14 @@ const createMountedLease = async (
       throw failure(
         "Mounted candidate storage does not report the verified byte and inode ceilings",
       );
+    StorageTrust.verifyForkGithubCandidateStorageConfiguration(config);
     signal?.removeEventListener("abort", aborted);
     return { child, closed };
   } catch (cause) {
     signal?.removeEventListener("abort", aborted);
     try {
       if (exactMountedEntry(mountPath))
-        await toolFailure(config.tools.fusermount3, ["-u", mountPath], root);
+        await toolFailure(config, "fusermount3", ["-u", mountPath], root);
     } catch {
       /* the recorded lock and image remain for recovery */
     }
@@ -900,11 +981,12 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
   await recoverOrRejectExisting(original, root);
   await cleanBoundedTemporaryMetadata(root);
   const marker: LeaseMarker = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: NodeCrypto.randomUUID(),
     owner: currentOwner(),
     imageBytes: safe.imageBytes,
     inodeLimit: safe.inodeLimit,
+    storageIdentitySha256: original.configurationIdentitySha256,
   };
   const markerText = JSON.stringify(marker);
   let claimed: boolean;
@@ -933,7 +1015,7 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
   } catch (cause) {
     if (mounted) {
       try {
-        await toolFailure(original.tools.fusermount3, ["-u", mountPath], root);
+        await toolFailure(original, "fusermount3", ["-u", mountPath], root);
       } catch {
         /* retain image */
       }
@@ -985,7 +1067,12 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
       throw failure("Candidate process launch is unresolved; storage remains mounted");
     if (state.phase === "candidate-running") {
       const identity = readProcIdentity(state.pid);
-      if (identity?.startTicks === state.startTicks || processGroupExists(state.processGroup))
+      if (
+        (identity?.startTicks === state.startTicks &&
+          identity.bootId === state.bootId &&
+          identity.pidNamespace === state.pidNamespace) ||
+        processGroupExists(state.processGroup, state.sessionId, state.pidNamespace)
+      )
         throw failure("Candidate process is still active; storage remains mounted");
       state = { phase: "candidate-stopped" };
       await persistState(state);
@@ -1001,6 +1088,7 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
   };
   const lease: ForkGithubCandidateStorageLease = {
     id: marker.id,
+    storageIdentitySha256: original.configurationIdentitySha256,
     rootPath: mountPath,
     gitPath: NodePath.join(mountPath, "git"),
     checkoutPath: NodePath.join(mountPath, "checkout"),
@@ -1018,19 +1106,34 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
         try: async () => {
           const identity = readProcIdentity(pid);
           const processGroup = capturedIdentity?.processGroup ?? identity?.processGroup;
+          const sessionId = capturedIdentity?.sessionId ?? identity?.sessionId;
           const startTicks = capturedIdentity?.startTicks ?? identity?.startTicks;
+          const bootId = capturedIdentity?.bootId ?? identity?.bootId;
+          const pidNamespace = capturedIdentity?.pidNamespace ?? identity?.pidNamespace;
           if (
             processGroup !== pid ||
+            sessionId !== pid ||
             !startTicks ||
+            !bootId ||
+            !pidNamespace ||
+            !/^pid:\[[0-9]+\]$/.test(pidNamespace) ||
             (identity !== undefined &&
-              (identity.processGroup !== processGroup || identity.startTicks !== startTicks))
+              (identity.processGroup !== processGroup ||
+                identity.sessionId !== sessionId ||
+                identity.startTicks !== startTicks ||
+                identity.bootId !== bootId ||
+                (capturedIdentity !== undefined &&
+                  identity.pidNamespace !== capturedIdentity.pidNamespace)))
           )
             throw failure("Candidate process must be a verified process-group leader");
           await persistState({
             phase: "candidate-running",
             pid,
             processGroup,
+            sessionId,
             startTicks,
+            bootId,
+            pidNamespace,
           });
         },
         catch: (cause) =>
@@ -1038,13 +1141,11 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
             ? cause
             : failure("Could not persist candidate process identity"),
       }),
-    markCandidateLaunchFailed: (pid) =>
+    markCandidateLaunchFailed: () =>
       Effect.tryPromise({
         try: async () => {
           if (state.phase !== "candidate-starting")
             throw failure("Candidate storage is not in an unresolved launch phase");
-          if (pid !== undefined && processGroupExists(pid))
-            throw failure("Candidate launch process group is still active");
           await persistState({ phase: "mounted" });
         },
         catch: (cause) =>
@@ -1055,11 +1156,14 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
     markCandidateStopped: (pid) =>
       Effect.tryPromise({
         try: async () => {
+          const identity = readProcIdentity(pid);
           if (
             state.phase !== "candidate-running" ||
             state.pid !== pid ||
-            readProcIdentity(pid)?.startTicks === state.startTicks ||
-            processGroupExists(state.processGroup)
+            (identity?.startTicks === state.startTicks &&
+              identity.bootId === state.bootId &&
+              identity.pidNamespace === state.pidNamespace) ||
+            processGroupExists(state.processGroup, state.sessionId, state.pidNamespace)
           )
             throw failure("Candidate process group has not been proven quiescent");
           await persistState({ phase: "candidate-stopped" });
@@ -1081,8 +1185,27 @@ const acquireLease = async (original: ForkGithubCandidateStorageConfig, signal: 
   return { lease, release };
 };
 
-export const makeForkGithubCandidateStorage = (config?: ForkGithubCandidateStorageConfig) =>
+export const makeForkGithubCandidateStorage = (
+  config?: ForkGithubCandidateStorageConfig,
+  unavailableReason?: string,
+) =>
   ForkGithubCandidateStorage.of({
+    configurationIdentitySha256: config?.configurationIdentitySha256 ?? null,
+    verifyConfiguration: () =>
+      config === undefined
+        ? Effect.fail(
+            failure(
+              unavailableReason ??
+                "Candidate storage is unavailable until an operator manifest is configured",
+            ),
+          )
+        : Effect.try({
+            try: () => StorageTrust.verifyForkGithubCandidateStorageConfiguration(config),
+            catch: (cause) =>
+              isCandidateStorageError(cause)
+                ? cause
+                : failure("Candidate storage operator manifest or runtime identity is unavailable"),
+          }),
     acquire: () =>
       config === undefined
         ? Effect.fail(
@@ -1111,3 +1234,24 @@ export const makeForkGithubCandidateStorage = (config?: ForkGithubCandidateStora
 
 export const ForkGithubCandidateStorageLayer = (config?: ForkGithubCandidateStorageConfig) =>
   Layer.succeed(ForkGithubCandidateStorage, makeForkGithubCandidateStorage(config));
+
+/** Operator-owned opt-in seam. Missing or invalid paths produce the inert unavailable layer. */
+const forkGithubCandidateStorageLayerFromOperatorManifest = (manifestPath?: string) =>
+  (() => {
+    const inspected =
+      StorageTrust.inspectForkGithubCandidateStorageOperatorConfiguration(manifestPath);
+    return Layer.succeed(
+      ForkGithubCandidateStorage,
+      makeForkGithubCandidateStorage(inspected.configuration, inspected.reason ?? undefined),
+    );
+  })();
+
+const FORK_GITHUB_CANDIDATE_STORAGE_MANIFEST_ENV = "T3CODE_FORK_GITHUB_CANDIDATE_STORAGE_MANIFEST";
+export const ForkGithubCandidateStorageLayerFromOperatorConfiguration = (
+  manifestPath?: string | null,
+) =>
+  forkGithubCandidateStorageLayerFromOperatorManifest(
+    manifestPath === null
+      ? undefined
+      : (manifestPath ?? NodeProcess.env[FORK_GITHUB_CANDIDATE_STORAGE_MANIFEST_ENV]),
+  );

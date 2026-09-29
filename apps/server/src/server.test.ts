@@ -6,9 +6,11 @@ import * as NodeChildProcess from "node:child_process";
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
+import * as NodeProcess from "node:process";
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
+import * as NodeURL from "node:url";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
@@ -119,7 +121,12 @@ const encodeTestJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unk
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as ServerConfig from "./config.ts";
 import * as DeviceService from "./device/DeviceService.ts";
-import { HTTP_ROUTER_CONFIG, makeRoutesLayer, makeServerLayer } from "./server.ts";
+import {
+  HTTP_ROUTER_CONFIG,
+  makeRoutesLayer,
+  makeServerLayer,
+  makeServerLayerForForkGithubTest,
+} from "./server.ts";
 import {
   isThreadDetailEvent,
   resolveAvailableEditorsForConfig,
@@ -163,12 +170,17 @@ import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ForkCompatibilityNativeService from "./forkCompatibility/ForkCompatibilityNativeService.ts";
 import * as ForkGithubNativeService from "./forkGithub/ForkGithubNativeService.ts";
+import * as ForkGithubNativeLayer from "./forkGithub/ForkGithubNativeLayer.ts";
+import * as ForkGithubAdapter from "./forkGithub/ForkGithubAdapter.ts";
+import * as ForkGithubCandidateArtifactSource from "./forkGithub/ForkGithubCandidateArtifactSource.ts";
+import * as ForkGithubPullRequestEvidence from "./forkGithub/ForkGithubPullRequestEvidence.ts";
+import * as ForkGithubCandidateSandbox from "./forkGithub/ForkGithubCandidateSandbox.ts";
 import * as ForkCompatibilityCoordinator from "./forkCompatibility/ForkCompatibilityCoordinator.ts";
 import * as ForkCompatibilityRunRepository from "./forkCompatibility/ForkCompatibilityRunRepository.ts";
 import * as ForkCompatibilityRequestRepository from "./forkCompatibility/ForkCompatibilityRequestRepository.ts";
 import * as ForkCompatibilityScheduleRepository from "./forkCompatibility/ForkCompatibilityScheduleRepository.ts";
 import * as ForkCompatibilityStableSource from "./forkCompatibility/ForkCompatibilityStableSource.ts";
-import * as ForkGithubCandidateArtifactSource from "./forkGithub/ForkGithubCandidateArtifactSource.ts";
+import { SERVER_VALIDATION_PROFILE } from "./forkCompatibility/ForkCompatibilityNativeService.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import { forkCompatibilityError } from "./forkCompatibility/ForkCompatibilityError.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
@@ -1409,15 +1421,23 @@ const makeOperatorGithubConfigForServerTest = () => ({
 const withProductionGithubRpc = <A, E, R>(input: {
   readonly baseDir: string;
   readonly operatorConfigPath?: string;
+  readonly configOverrides?: Partial<ServerConfig.ServerConfig["Service"]>;
+  readonly forkGithubTestOverrides?: ForkGithubNativeLayer.ForkGithubNativeTestOverrides;
   readonly run: (client: WsRpcClient) => Effect.Effect<A, E, R>;
 }) =>
   Effect.gen(function* () {
     const scope = yield* Scope.make();
     return yield* Effect.ensuring(
       Effect.gen(function* () {
-        const config = yield* productionServerTestConfig(input.baseDir, input.operatorConfigPath);
+        const config = {
+          ...(yield* productionServerTestConfig(input.baseDir, input.operatorConfigPath)),
+          ...input.configOverrides,
+        };
+        const serverLayer = input.forkGithubTestOverrides
+          ? makeServerLayerForForkGithubTest(input.forkGithubTestOverrides)
+          : makeServerLayer;
         const context = yield* Layer.buildWithScope(
-          makeServerLayer.pipe(Layer.provide(ServerConfig.layer(config))),
+          serverLayer.pipe(Layer.provide(ServerConfig.layer(config))),
           scope,
         );
         const server = Context.get(context, HttpServer.HttpServer);
@@ -5144,6 +5164,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               assert.equal(submitError._tag, "EnvironmentAuthorizationError");
               if (submitError._tag === "EnvironmentAuthorizationError")
                 assert.equal(submitError.requiredScope, "orchestration:operate");
+              const prSubmitError = yield* client[WS_METHODS.forkGithubSubmitPullRequestEvidence]({
+                requestId: "123e4567-e89b-42d3-a456-426614174000",
+                number: 7,
+              }).pipe(Effect.flip);
+              assert.equal(prSubmitError._tag, "EnvironmentAuthorizationError");
+              if (prSubmitError._tag === "EnvironmentAuthorizationError")
+                assert.equal(prSubmitError.requiredScope, "orchestration:operate");
+              assert.isNull(
+                yield* client[WS_METHODS.forkGithubPullRequestEvidenceStatus]({
+                  requestId: "123e4567-e89b-42d3-a456-426614174000",
+                }),
+              );
             }),
           ),
         );
@@ -5195,6 +5227,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   operationId: "production-unavailable-promotion",
                 }),
               );
+              assert.isNull(
+                yield* client[WS_METHODS.forkGithubPullRequestEvidenceStatus]({
+                  requestId: "123e4567-e89b-42d3-a456-426614174000",
+                }),
+              );
+              const prSubmitError = yield* client[WS_METHODS.forkGithubSubmitPullRequestEvidence]({
+                requestId: "123e4567-e89b-42d3-a456-426614174000",
+                number: 7,
+              }).pipe(Effect.flip);
+              assert.equal(prSubmitError._tag, "ForkGithubNativeError");
             }),
         }).pipe(
           Effect.provide(FetchHttpClient.layer),
@@ -5316,6 +5358,267 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         Effect.provideService(HostProcessEnvironment, isolatedEnvironment),
       );
     }),
+  );
+
+  it.effect.skipIf(
+    NodeProcess.platform !== "linux" ||
+      !NodeFS.existsSync("/usr/bin/bwrap") ||
+      !NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_OPERATOR_MANIFEST ||
+      !NodeProcess.env.T3_FORK_CANDIDATE_OFFLINE_TOOLCHAIN_MANIFEST ||
+      !NodeFS.existsSync(NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_OPERATOR_MANIFEST ?? "") ||
+      !NodeFS.existsSync(NodeProcess.env.T3_FORK_CANDIDATE_OFFLINE_TOOLCHAIN_MANIFEST ?? ""),
+  )(
+    "routes an authenticated PR request through production startup, sandbox validation, durable publication and restart",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-github-pr-rpc-e2e-" });
+        const fixtureRoot = NodePath.join(baseDir, "git-fixture");
+        const checkout = NodePath.join(fixtureRoot, "checkout");
+        const remote = NodePath.join(fixtureRoot, "remote.git");
+        NodeFS.mkdirSync(fixtureRoot, { recursive: true, mode: 0o700 });
+        const git = (cwd: string, ...args: string[]) =>
+          NodeChildProcess.execFileSync("git", args, {
+            cwd,
+            encoding: "utf8",
+            maxBuffer: 64 * 1024 * 1024,
+            stdio: ["ignore", "pipe", "pipe"],
+          }).trim();
+
+        NodeFS.mkdirSync(checkout, { recursive: true, mode: 0o700 });
+        const committedTreeArchive = NodeChildProcess.execFileSync(
+          "git",
+          ["archive", "--format=tar", "HEAD"],
+          {
+            cwd: process.cwd(),
+            env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+            maxBuffer: 512 * 1024 * 1024,
+          },
+        );
+        NodeChildProcess.execFileSync("tar", ["-xf", "-", "-C", checkout], {
+          input: committedTreeArchive,
+          maxBuffer: 16 * 1024 * 1024,
+        });
+        git(checkout, "init", "-b", "forklauncher");
+        git(checkout, "config", "user.name", "T3 disposable PR fixture");
+        git(checkout, "config", "user.email", "fixture@example.invalid");
+        git(checkout, "add", "-A");
+        git(checkout, "commit", "-m", "committed T3 source tree fixture");
+        const baseSha = git(checkout, "rev-parse", "HEAD");
+        git(fixtureRoot, "init", "--bare", remote);
+        git(checkout, "remote", "add", "origin", remote);
+        git(checkout, "push", "origin", "forklauncher");
+        git(checkout, "checkout", "-b", "pr-head", baseSha);
+        NodeFS.writeFileSync(NodePath.join(checkout, "rpc-candidate-fixture.txt"), "safe\n");
+        git(checkout, "add", "rpc-candidate-fixture.txt");
+        git(checkout, "commit", "-m", "fixture PR change");
+        const headSha = git(checkout, "rev-parse", "HEAD");
+        const treeSha = git(checkout, "merge-tree", "--write-tree", baseSha, headSha)
+          .split("\n")[0]!
+          .trim();
+        const mergeSha = git(checkout, "commit-tree", treeSha, "-p", baseSha, "-p", headSha);
+        git(checkout, "push", "origin", `${mergeSha}:refs/pull/7/merge`);
+        let currentSnapshot: ForkGithubAdapter.PullRequestSnapshot = {
+          owner: "fixture-owner",
+          repository: "fixture-fork",
+          number: 7,
+          state: "open",
+          headSha,
+          baseRef: "forklauncher",
+          baseSha,
+          mergeCandidateSha: mergeSha,
+          mergeTreeSha: treeSha,
+        };
+        const operatorConfigPath = NodePath.join(baseDir, "operator-github.json");
+        const operator = makeOperatorGithubConfigForServerTest();
+        NodeFS.writeFileSync(
+          operatorConfigPath,
+          encodeTestJson({
+            ...operator,
+            validationProfile: SERVER_VALIDATION_PROFILE,
+            candidateWorkflow: {
+              ...operator.candidateWorkflow,
+              workflowCommitSha: baseSha,
+              workflowFiles: ForkGithubCandidateArtifactSource.trustedCandidateWorkflowPaths.map(
+                (path) => ({
+                  path,
+                  sha256: NodeCrypto.createHash("sha256")
+                    .update(NodeFS.readFileSync(NodePath.join(checkout, path)))
+                    .digest("hex"),
+                }),
+              ),
+            },
+          }),
+          { mode: 0o600 },
+        );
+
+        const firstReconcile = yield* Deferred.make<void>();
+        const joinedReconcile = yield* Deferred.make<void>();
+        let postCount = 0;
+        let reconcileCount = 0;
+        let inspectCount = 0;
+        const adapterError = (reason: string) =>
+          new ForkGithubAdapter.ForkGithubAdapterError({ reason });
+        const unused = () => Effect.die("unused external GitHub API operation");
+        const adapter: ForkGithubAdapter.ForkGithubAdapterShape = {
+          resolveCandidateWorkflowRef: unused,
+          dispatchCandidateWorkflow: unused,
+          listCandidateWorkflowRuns: unused,
+          listCandidateWorkflowArtifacts: unused,
+          inspectPullRequest: () =>
+            Effect.sync(() => {
+              inspectCount += 1;
+              return currentSnapshot;
+            }),
+          latestOfficialStable: unused,
+          publishCompatibilityCheck: unused,
+          publishPullRequestCompatibilityCheck: (input) =>
+            Effect.gen(function* () {
+              assert.equal(input.snapshot.mergeCandidateSha, mergeSha);
+              assert.equal(input.evidence.candidateSha, mergeSha);
+              assert.equal(input.evidence.sourceSha, headSha);
+              assert.equal(input.evidence.targetSha, baseSha);
+              assert.equal(input.snapshot.mergeTreeSha, treeSha);
+              assert.match(input.identitySha256, /^[0-9a-f]{64}$/);
+              if (!input.reconcileOnly) {
+                postCount += 1;
+                return yield* Effect.fail(adapterError("fixture lost Check Run POST response"));
+              }
+              reconcileCount += 1;
+              if (reconcileCount === 1) {
+                yield* Deferred.succeed(firstReconcile, undefined);
+                return null;
+              }
+              yield* Deferred.succeed(joinedReconcile, undefined);
+              return {
+                checkRunId: 42,
+                appId: 123_456,
+                externalId: `fixture:${input.identitySha256}`,
+              };
+            }),
+          advancePullRequestBase: unused,
+          advanceStableRef: unused,
+          releaseTagTarget: unused,
+          getReleaseByTag: unused,
+          createDraftRelease: unused,
+          uploadReleaseAsset: unused,
+          getCandidateArtifactMetadata: unused,
+          getCandidateWorkflowFile: unused,
+          downloadCandidateArtifact: unused,
+        };
+        const requestId = "123e4567-e89b-42d3-a456-426614174055";
+        const overrides: ForkGithubNativeLayer.ForkGithubNativeTestOverrides = {
+          adapter: Layer.succeed(ForkGithubAdapter.ForkGithubAdapter, adapter),
+          credentials: Layer.succeed(ForkGithubAdapter.ForkGithubCredentialResolver, {
+            resolve: () =>
+              Effect.succeed({
+                appId: 123_456,
+                installationId: 987_654,
+                privateKeyPem: "fixture-only-placeholder-key",
+              }),
+          }),
+          pullRequestRemote: Layer.succeed(
+            ForkGithubPullRequestEvidence.ForkGithubPullRequestRemote,
+            { url: () => NodeURL.pathToFileURL(remote).href },
+          ),
+        };
+        const offlineSnapshotPath = NodeProcess.env.T3_FORK_CANDIDATE_OFFLINE_TOOLCHAIN_MANIFEST!;
+        const candidateStorageManifestPath =
+          NodeProcess.env.T3_FORK_CANDIDATE_STORAGE_OPERATOR_MANIFEST!;
+        const toolchainSnapshot =
+          ForkGithubCandidateSandbox.readOfflineToolchainSnapshot(offlineSnapshotPath);
+        assert.equal(
+          toolchainSnapshot.profileSha256,
+          ForkGithubAdapter.validationProfileSha256(SERVER_VALIDATION_PROFILE),
+        );
+        const isolatedEnvironment = { ...process.env };
+        delete isolatedEnvironment.T3_SERVICE_LAUNCHER_CONTEXT;
+        const configOverrides: Partial<ServerConfig.ServerConfig["Service"]> = {
+          forkGithubCandidateStorageManifestPath: candidateStorageManifestPath,
+          forkGithubOfflineSnapshotPath: offlineSnapshotPath,
+        };
+        const runServer = <A, E, R>(run: (client: WsRpcClient) => Effect.Effect<A, E, R>) =>
+          withProductionGithubRpc({
+            baseDir,
+            operatorConfigPath,
+            configOverrides,
+            forkGithubTestOverrides: overrides,
+            run,
+          }).pipe(
+            Effect.provide(FetchHttpClient.layer),
+            Effect.provideService(HostProcessEnvironment, isolatedEnvironment),
+          );
+
+        yield* runServer((client) =>
+          Effect.gen(function* () {
+            const configured = yield* client[WS_METHODS.forkGithubConfigure]({ enabled: true });
+            assert.equal(configured.enabled, true);
+            assert.equal(configured.state, "ready", configured.missing.join("; "));
+
+            const accepted = yield* client[WS_METHODS.forkGithubSubmitPullRequestEvidence]({
+              requestId,
+              number: 7,
+            });
+            assert.equal(accepted.requestId, requestId);
+            assert.equal(accepted.status, "accepted");
+            assert.isFalse(accepted.usable);
+            const duplicate = yield* client[WS_METHODS.forkGithubSubmitPullRequestEvidence]({
+              requestId,
+              number: 7,
+            });
+            assert.equal(duplicate.requestId, accepted.requestId);
+
+            yield* Deferred.await(firstReconcile);
+            const retry = yield* client[WS_METHODS.forkGithubSubmitPullRequestEvidence]({
+              requestId,
+              number: 7,
+            });
+            assert.equal(retry.requestId, requestId);
+            yield* Deferred.await(joinedReconcile);
+            const ready = yield* client[WS_METHODS.forkGithubPullRequestEvidenceStatus]({
+              requestId,
+            });
+            assert.isNotNull(ready);
+            assert.equal(ready?.status, "ready");
+            assert.isTrue(ready?.usable);
+            assert.equal(ready?.publication, "published");
+            assert.equal(ready?.headSha, headSha);
+            assert.equal(ready?.baseSha, baseSha);
+            assert.equal(ready?.mergeCandidateSha, mergeSha);
+            assert.equal(ready?.mergeTreeSha, treeSha);
+            assert.isTrue(inspectCount >= 3);
+            assert.equal(postCount, 1, "ambiguous POST is never repeated");
+            assert.equal(reconcileCount, 2, "retry reconciles by GET only");
+
+            currentSnapshot = {
+              ...currentSnapshot,
+              headSha: "b".repeat(40),
+              mergeCandidateSha: "c".repeat(40),
+              mergeTreeSha: "d".repeat(40),
+            };
+            const stale = yield* client[WS_METHODS.forkGithubPullRequestEvidenceStatus]({
+              requestId,
+            });
+            assert.equal(stale?.status, "stale");
+            assert.isFalse(stale?.usable);
+            assert.equal(postCount, 1, "status freshness reads do not issue another POST");
+          }),
+        );
+
+        yield* runServer((client) =>
+          Effect.gen(function* () {
+            const reopened = yield* client[WS_METHODS.forkGithubPullRequestEvidenceStatus]({
+              requestId,
+            });
+            assert.equal(reopened?.requestId, requestId);
+            assert.equal(reopened?.status, "stale");
+            assert.isFalse(reopened?.usable);
+            assert.equal(reopened?.mergeCandidateSha, mergeSha);
+            assert.equal(postCount, 1);
+          }),
+        );
+      }),
+    { timeout: 60 * 60_000 },
   );
 
   it.effect("runs authenticated compatibility RPCs through a durable real Git candidate", () => {

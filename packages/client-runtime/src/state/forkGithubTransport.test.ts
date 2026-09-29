@@ -40,6 +40,29 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
     } as const;
+    const prEvidence = {
+      requestId: "123e4567-e89b-42d3-a456-426614174000",
+      status: "accepted",
+      usable: false,
+      owner: "owner",
+      repository: "fork",
+      number: 7,
+      state: "open",
+      headSha: null,
+      baseRef: "forklauncher",
+      targetBranch: "forklauncher",
+      baseSha: null,
+      mergeCandidateSha: null,
+      mergeTreeSha: null,
+      profileId: "server-validation",
+      profileRevision: "1",
+      profileSha256: "a".repeat(64),
+      toolchainSha256: "b".repeat(64),
+      storageIdentitySha256: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      diagnostic: "pending",
+    } as const;
     const schedule = {
       enabled: true,
       sourceDirectory: "/fixture/fork",
@@ -77,6 +100,14 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
         status: "pending",
       }),
       [WS_METHODS.forkGithubStatus]: rpc(WS_METHODS.forkGithubStatus, operation),
+      [WS_METHODS.forkGithubSubmitPullRequestEvidence]: rpc(
+        WS_METHODS.forkGithubSubmitPullRequestEvidence,
+        prEvidence,
+      ),
+      [WS_METHODS.forkGithubPullRequestEvidenceStatus]: rpc(
+        WS_METHODS.forkGithubPullRequestEvidenceStatus,
+        prEvidence,
+      ),
       [WS_METHODS.forkCompatibilityScheduleStatus]: rpc(
         WS_METHODS.forkCompatibilityScheduleStatus,
         schedule,
@@ -158,6 +189,18 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       }),
     ).toMatchObject({ _tag: "Success", value: operation });
     expect(
+      yield* invoke(atoms.forkGithubSubmitPullRequestEvidence, {
+        environmentId,
+        input: { requestId: prEvidence.requestId, number: 7 },
+      }),
+    ).toMatchObject({ _tag: "Success", value: prEvidence });
+    expect(
+      yield* invoke(atoms.forkGithubPullRequestEvidenceStatus, {
+        environmentId,
+        input: { requestId: prEvidence.requestId },
+      }),
+    ).toMatchObject({ _tag: "Success", value: prEvidence });
+    expect(
       yield* invoke(atoms.forkCompatibilityScheduleStatus, { environmentId, input: {} }),
     ).toMatchObject({
       _tag: "Success",
@@ -169,6 +212,8 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       WS_METHODS.forkGithubSubmitPromotion,
       WS_METHODS.forkGithubSubmitDraft,
       WS_METHODS.forkGithubStatus,
+      WS_METHODS.forkGithubSubmitPullRequestEvidence,
+      WS_METHODS.forkGithubPullRequestEvidenceStatus,
       WS_METHODS.forkCompatibilityScheduleStatus,
     ]);
     registry.dispose();

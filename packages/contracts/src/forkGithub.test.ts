@@ -6,6 +6,7 @@ import {
   ForkGithubOperation,
   ForkGithubPipelineStatus,
   ForkGithubPromotionCommand,
+  ForkGithubPullRequestEvidenceStatus,
 } from "./forkGithub.ts";
 
 const decodePromotionCommand = Schema.decodeSync(ForkGithubPromotionCommand);
@@ -13,6 +14,9 @@ const decodeDraftCommand = Schema.decodeSync(ForkGithubDraftCommand);
 const decodeOperation = Schema.decodeSync(ForkGithubOperation);
 const decodeOperationJson = Schema.decodeSync(Schema.fromJsonString(ForkGithubOperation));
 const decodePipeline = Schema.decodeUnknownSync(ForkGithubPipelineStatus);
+const decodePullRequestEvidenceStatus = Schema.decodeUnknownSync(
+  ForkGithubPullRequestEvidenceStatus,
+);
 
 it("validates explicit idempotent fork GitHub operation identities", () => {
   const promotion = decodePromotionCommand({
@@ -90,4 +94,34 @@ it("validates bounded pipeline states and never reports publication or installat
   const forgedPublishedStatus: unknown = { ...prepared, published: true };
   assert.throws(() => decodePipeline(forgedPublishedStatus));
   assert.throws(() => decodePipeline({ ...prepared, artifactId: "x".repeat(40) }));
+});
+
+it("keeps PR evidence readiness separate from durable Check Run publication", () => {
+  const status = decodePullRequestEvidenceStatus({
+    requestId: "123e4567-e89b-42d3-a456-426614174000",
+    status: "ready",
+    usable: true,
+    publication: "uncertain",
+    owner: "fork-owner",
+    repository: "fork-repo",
+    number: 7,
+    state: "open",
+    headSha: "a".repeat(40),
+    baseRef: "forklauncher",
+    targetBranch: "forklauncher",
+    baseSha: "b".repeat(40),
+    mergeCandidateSha: "c".repeat(40),
+    mergeTreeSha: "d".repeat(40),
+    profileId: "trusted-profile",
+    profileRevision: "4",
+    profileSha256: "e".repeat(64),
+    toolchainSha256: "f".repeat(64),
+    storageIdentitySha256: "1".repeat(64),
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+    diagnostic: null,
+  });
+  assert.equal(status.usable, true);
+  assert.equal(status.publication, "uncertain");
+  assert.throws(() => decodePullRequestEvidenceStatus({ ...status, publication: "success" }));
 });

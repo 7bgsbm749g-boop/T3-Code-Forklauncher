@@ -84,8 +84,10 @@ const makeForkGithubActionRepository = Effect.gen(function* () {
       return { role: "owner", action: existing } as const;
     // An expired lease is transferable with a single conditional UPDATE. Old owners lose write authority.
     if (["reserved", "pushing"].includes(existing.state) && existing.leaseExpiresAt <= input.now) {
+      const recoveredState =
+        input.preservePushingOnRecovery && existing.state === "pushing" ? "pushing" : "reserved";
       const claimed =
-        yield* sql`UPDATE fork_github_actions SET state='reserved',owner_id=${input.ownerId},lease_expires_at=${input.leaseExpiresAt},updated_at=${input.now}
+        yield* sql`UPDATE fork_github_actions SET state=${recoveredState},owner_id=${input.ownerId},lease_expires_at=${input.leaseExpiresAt},updated_at=${input.now}
         WHERE action_id=${input.actionId} AND fingerprint=${input.fingerprint} AND state IN ('reserved','pushing') AND owner_id=${existing.ownerId} AND lease_expires_at=${existing.leaseExpiresAt} RETURNING action_id`;
       const row = yield* read(input.actionId);
       if (claimed.length && row?.ownerId === input.ownerId)

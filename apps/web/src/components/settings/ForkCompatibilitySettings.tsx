@@ -11,12 +11,18 @@ import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import {
+  acknowledgePullRequestEvidence,
+  describePullRequestEvidenceStatus,
+  describePullRequestPublication,
+  pullRequestEvidenceStatusMatchesRequest,
   IdentityEpoch,
   type IdentityToken,
   forgetPendingForkCheck,
   pendingForkCheckForSource,
   rememberPendingForkCheck,
+  startPullRequestEvidence,
 } from "@t3tools/client-runtime/state/fork-compatibility-ui";
+import type { ForkGithubPullRequestEvidenceStatus } from "@t3tools/contracts";
 
 const REQUEST_ID_SCHEMA = Schema.NullOr(Schema.String);
 const PENDING_CHECKS_SCHEMA = Schema.NullOr(
@@ -26,6 +32,17 @@ const PENDING_CHECKS_SCHEMA = Schema.NullOr(
       idempotencyKey: Schema.String,
     }),
   ),
+);
+const PULL_REQUEST_EVIDENCE_SCHEMA = Schema.NullOr(
+  Schema.Struct({
+    number: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(2_147_483_647)),
+    requestId: Schema.String.check(
+      Schema.isPattern(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      ),
+    ),
+    state: Schema.Literals(["uncertain", "active"]),
+  }),
 );
 
 export function ForkCompatibilitySettings() {
@@ -40,6 +57,14 @@ export function ForkCompatibilitySettings() {
   const check = useAtomCommand(serverEnvironment.forkCompatibilityCheck, {
     reportFailure: false,
   });
+  const submitPullRequestEvidence = useAtomCommand(
+    serverEnvironment.forkGithubSubmitPullRequestEvidence,
+    { reportFailure: false },
+  );
+  const readPullRequestEvidenceStatus = useAtomCommand(
+    serverEnvironment.forkGithubPullRequestEvidenceStatus,
+    { reportFailure: false },
+  );
   const readStatus = useAtomCommand(serverEnvironment.forkCompatibilityStatus, {
     reportFailure: false,
   });
@@ -87,6 +112,21 @@ export function ForkCompatibilitySettings() {
     null,
     PENDING_CHECKS_SCHEMA,
   );
+  const [pullRequestRequest, setPullRequestRequest] = useLocalStorage(
+    `fork-compatibility:pull-request-evidence:${environmentId ?? "none"}`,
+    null,
+    PULL_REQUEST_EVIDENCE_SCHEMA,
+  );
+  const [pullRequestDraft, setPullRequestDraft] = useState<{
+    readonly environmentId: string | null;
+    readonly value: string;
+  } | null>(null);
+  const pullRequestNumberText =
+    pullRequestDraft?.environmentId === environmentId
+      ? pullRequestDraft.value
+      : pullRequestRequest
+        ? String(pullRequestRequest.number)
+        : "";
   const automaticStableChecks =
     environment?.serverConfig?.settings.forkCompatibility.automaticStableChecks ?? false;
   const [scheduleStatusEntry, setScheduleStatusEntry] = useState<{
@@ -97,10 +137,18 @@ export function ForkCompatibilitySettings() {
     (candidate) => candidate.environmentId === environmentId,
   );
   const statusIdentity = JSON.stringify([environmentId, lastRequestId, connected]);
+  const pullRequestIdentity = JSON.stringify([
+    environmentId,
+    pullRequestRequest?.number ?? null,
+    pullRequestRequest?.requestId ?? null,
+    connected,
+  ]);
   const scheduleIdentity = JSON.stringify([environmentId, connected]);
   const operationIdentity = JSON.stringify([environmentId, directory, connected]);
   const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
   const statusToken = statusEpoch.update(statusIdentity);
+  const pullRequestEpoch = useRef(new IdentityEpoch(pullRequestIdentity)).current;
+  const pullRequestToken = pullRequestEpoch.update(pullRequestIdentity);
   const scheduleEpoch = useRef(new IdentityEpoch(scheduleIdentity)).current;
   const scheduleToken = scheduleEpoch.update(scheduleIdentity);
   const scheduleStatus =
@@ -112,6 +160,16 @@ export function ForkCompatibilitySettings() {
     readonly result: Awaited<ReturnType<typeof readStatus>> | null;
     readonly error: string | null;
   } | null>(null);
+  const [pullRequestStatusEntry, setPullRequestStatusEntry] = useState<{
+    readonly token: IdentityToken;
+    readonly value: ForkGithubPullRequestEvidenceStatus | null;
+    readonly error: string | null;
+  } | null>(null);
+  const [pullRequestBusyIdentity, setPullRequestBusyIdentity] = useState<string | null>(null);
+  const pullRequestRequestIdentity = JSON.stringify([
+    environmentId,
+    pullRequestRequest?.requestId ?? null,
+  ]);
   const [operationError, setOperationError] = useState<{
     readonly token: IdentityToken;
     readonly message: string;
@@ -126,6 +184,76 @@ export function ForkCompatibilitySettings() {
   const operationErrorMessage =
     operationError?.token === operationToken ? operationError.message : null;
   const evidenceVisible = evidenceToken === statusToken;
+  const pullRequestStatus =
+    pullRequestStatusEntry?.token === pullRequestToken &&
+    pullRequestEvidenceStatusMatchesRequest(pullRequestStatusEntry.value, pullRequestRequest)
+      ? pullRequestStatusEntry.value
+      : null;
+  const pullRequestStatusError =
+    pullRequestStatusEntry?.token === pullRequestToken ? pullRequestStatusEntry.error : null;
+  const pullRequestBusy = pullRequestBusyIdentity === pullRequestRequestIdentity;
+
+  const refreshPullRequestStatus = useCallback(async () => {
+    const token = pullRequestToken;
+    const targetEnvironmentId = environmentId;
+    const targetRequestId = pullRequestRequest?.requestId;
+    if (!targetEnvironmentId || !targetRequestId || !connected) return;
+    const identity = JSON.stringify([targetEnvironmentId, targetRequestId]);
+    setPullRequestBusyIdentity(identity);
+    try {
+      const result = await readPullRequestEvidenceStatus({
+        environmentId: targetEnvironmentId,
+        input: { requestId: targetRequestId },
+      });
+      if (!pullRequestEpoch.isCurrent(token)) return;
+      setPullRequestStatusEntry((current) => {
+        const matchesRequest =
+          result._tag === "Success" &&
+          (result.value === null ||
+            (result.value.requestId === targetRequestId &&
+              (result.value.number === null ||
+                result.value.number === pullRequestRequest?.number)));
+        if (
+          matchesRequest &&
+          result._tag === "Success" &&
+          result.value === null &&
+          current?.token === token &&
+          current.value !== null
+        ) {
+          return current;
+        }
+        return {
+          token,
+          value: matchesRequest && result._tag === "Success" ? result.value : null,
+          error: matchesRequest
+            ? result._tag === "Success"
+              ? null
+              : "Could not refresh validation status."
+            : "Could not refresh validation status for this request.",
+        };
+      });
+    } catch {
+      if (pullRequestEpoch.isCurrent(token)) {
+        setPullRequestStatusEntry({
+          token,
+          value: null,
+          error: "Could not refresh validation status. Reconnect and retry.",
+        });
+      }
+    } finally {
+      setPullRequestBusyIdentity((current) => (current === identity ? null : current));
+    }
+  }, [
+    connected,
+    environmentId,
+    pullRequestEpoch,
+    pullRequestRequest?.number,
+    pullRequestRequest?.requestId,
+    pullRequestToken,
+    readPullRequestEvidenceStatus,
+    setPullRequestBusyIdentity,
+    setPullRequestStatusEntry,
+  ]);
   const busy = busyEntry?.token === operationToken || busyEntry?.token === statusToken;
 
   const setOperationBusy = useCallback(
@@ -205,6 +333,10 @@ export function ForkCompatibilitySettings() {
     if (connected && lastRequestId) void refresh(false, true);
     // Refresh when the selected environment reconnects or a new request is accepted.
   }, [connected, environmentId, lastRequestId, refresh]);
+
+  useEffect(() => {
+    if (connected && pullRequestRequest?.requestId) void refreshPullRequestStatus();
+  }, [connected, environmentId, pullRequestRequest?.requestId, refreshPullRequestStatus]);
 
   useEffect(() => {
     void refreshScheduleStatus();
@@ -324,6 +456,67 @@ export function ForkCompatibilitySettings() {
     }
   };
 
+  const requestPullRequestEvidence = async () => {
+    const targetEnvironmentId = environmentId;
+    const number = Number(pullRequestNumberText.trim());
+    if (
+      !connected ||
+      !targetEnvironmentId ||
+      !/^\d+$/.test(pullRequestNumberText.trim()) ||
+      !Number.isSafeInteger(number) ||
+      number <= 0 ||
+      number > 2_147_483_647
+    ) {
+      return;
+    }
+    const request = startPullRequestEvidence(pullRequestRequest, number, randomUUID);
+    // Persist the UUID before the RPC so a lost response can be retried idempotently.
+    setPullRequestRequest(request);
+    setPullRequestStatusEntry(null);
+    const identity = JSON.stringify([targetEnvironmentId, request.requestId]);
+    setPullRequestBusyIdentity(identity);
+    try {
+      const result = await submitPullRequestEvidence({
+        environmentId: targetEnvironmentId,
+        input: { number, requestId: request.requestId },
+      });
+      if (result._tag === "Failure") {
+        if (environmentId === targetEnvironmentId) {
+          setPullRequestRequest({ ...request, state: "uncertain" });
+          setPullRequestStatusEntry({
+            token: pullRequestToken,
+            value: null,
+            error: "The response was not received. Retry to reuse this request ID.",
+          });
+        }
+        return;
+      }
+      if (environmentId === targetEnvironmentId) {
+        const responseToken = pullRequestEpoch.update(
+          JSON.stringify([targetEnvironmentId, number, request.requestId, connected]),
+        );
+        setPullRequestRequest(acknowledgePullRequestEvidence(request, request.requestId));
+        const matchesRequest = pullRequestEvidenceStatusMatchesRequest(result.value, request);
+        setPullRequestStatusEntry({
+          token: responseToken,
+          value: matchesRequest ? result.value : null,
+          error: matchesRequest ? null : "Could not refresh validation status for this request.",
+        });
+      }
+    } catch {
+      if (environmentId === targetEnvironmentId) {
+        setPullRequestRequest({ ...request, state: "uncertain" });
+        setPullRequestStatusEntry({
+          token: pullRequestToken,
+          value: null,
+          error: "The response was not received. Retry to reuse this request ID.",
+        });
+      }
+    } finally {
+      setPullRequestBusyIdentity((current) => (current === identity ? null : current));
+    }
+  };
+
   const summary = status?._tag === "Success" ? status.value.summary : null;
   const evidence = status?._tag === "Success" ? status.value.evidence : undefined;
   const requestState = !connected
@@ -335,6 +528,14 @@ export function ForkCompatibilitySettings() {
           ? "accepted; waiting for status"
           : "no request"));
   const staleEvidence = summary?.requestStatus === "stale" || summary?.runStatus === "stale";
+  const pullRequestPresentation = describePullRequestEvidenceStatus(pullRequestStatus);
+  const pullRequestPublication = describePullRequestPublication(pullRequestStatus);
+  const parsedPullRequestNumber = Number(pullRequestNumberText.trim());
+  const validPullRequestNumber =
+    /^\d+$/.test(pullRequestNumberText.trim()) &&
+    Number.isSafeInteger(parsedPullRequestNumber) &&
+    parsedPullRequestNumber > 0 &&
+    parsedPullRequestNumber <= 2_147_483_647;
 
   return (
     <SettingsSection id="fork-compatibility" title="Fork compatibility">
@@ -440,6 +641,95 @@ export function ForkCompatibilitySettings() {
           </Button>
         }
       />
+      <SettingsRow
+        title="Validate a pull request"
+        description="Checks the selected PR against the server's trusted profile. The number is the only PR input; validation evidence does not publish a required check or make the PR merge-eligible."
+        control={
+          <div className="flex w-80 max-w-full items-center gap-2">
+            <Input
+              aria-label="Pull request number"
+              inputMode="numeric"
+              value={pullRequestNumberText}
+              onChange={(event) =>
+                setPullRequestDraft({ environmentId, value: event.target.value })
+              }
+              placeholder="PR number"
+              disabled={!connected || pullRequestBusy}
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!connected || pullRequestBusy || !validPullRequestNumber}
+              onClick={() => void requestPullRequestEvidence()}
+            >
+              {pullRequestRequest?.state === "uncertain" &&
+              pullRequestRequest.number === parsedPullRequestNumber
+                ? "Retry validation"
+                : pullRequestRequest?.number === parsedPullRequestNumber
+                  ? "Run again"
+                  : "Validate PR"}
+            </Button>
+          </div>
+        }
+      />
+      <div className="space-y-1 px-4 py-3 text-sm" aria-live="polite">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">PR validation:</span>
+          <span>
+            {pullRequestRequest?.state === "uncertain" && !pullRequestStatus
+              ? "Response uncertain"
+              : pullRequestPresentation.label}
+          </span>
+          {pullRequestRequest ? (
+            <span className="text-xs text-muted-foreground">
+              PR #{pullRequestRequest.number} · request {pullRequestRequest.requestId}
+            </span>
+          ) : null}
+          {pullRequestRequest ? (
+            <Button
+              size="xs"
+              variant="ghost"
+              disabled={!connected || pullRequestBusy}
+              onClick={() => void refreshPullRequestStatus()}
+            >
+              <RefreshCwIcon className="size-3" /> Refresh
+            </Button>
+          ) : null}
+        </div>
+        {pullRequestRequest ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              {pullRequestStatus
+                ? pullRequestPresentation.detail
+                : pullRequestRequest.state === "uncertain"
+                  ? "The server may have accepted this request. Retry to reuse its saved request ID, or refresh status."
+                  : (pullRequestStatusError ?? "Accepted request; refresh to check its status.")}
+            </p>
+            <p className="text-xs text-muted-foreground" aria-live="polite">
+              Required Check Run: {pullRequestPublication.label}. {pullRequestPublication.detail}
+            </p>
+            {pullRequestStatus ? (
+              <p className="break-all text-xs text-muted-foreground">
+                {pullRequestStatus.owner && pullRequestStatus.repository
+                  ? `${pullRequestStatus.owner}/${pullRequestStatus.repository}#${pullRequestStatus.number ?? pullRequestRequest.number}`
+                  : `PR #${pullRequestStatus.number ?? pullRequestRequest.number}`}
+                {pullRequestStatus.state ? ` · ${pullRequestStatus.state}` : ""}
+                {pullRequestStatus.headSha ? ` · head ${pullRequestStatus.headSha}` : ""}
+                {pullRequestStatus.baseRef ? ` · base ${pullRequestStatus.baseRef}` : ""}
+                {pullRequestStatus.baseSha ? ` · base ${pullRequestStatus.baseSha}` : ""}
+                {pullRequestStatus.mergeCandidateSha
+                  ? ` · candidate ${pullRequestStatus.mergeCandidateSha}`
+                  : ""}
+              </p>
+            ) : null}
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            No PR validation request is stored for this server. Connect to a configured server to
+            begin.
+          </p>
+        )}
+      </div>
       <div className="space-y-3 border-t px-4 py-3 text-sm">
         <label className="flex items-center gap-2 font-medium">
           <input

@@ -1041,6 +1041,160 @@ it.effect("refuses to report a check run attributed to a different App", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect(
+  "publishes only a fresh exact PR merge identity and reconciles an ambiguous result",
+  () => {
+    const captured = {
+      owner: "downstream",
+      repository: "project",
+      number: 7,
+      state: "open" as const,
+      headSha,
+      baseRef: "forklauncher",
+      targetBranch: "forklauncher",
+      baseSha,
+      mergeCandidateSha: candidateSha,
+      mergeTreeSha: treeSha,
+    };
+    let current = snapshotJson();
+    let created: Record<string, unknown> | undefined;
+    let posts = 0;
+    const layer = serviceLayer((request) => {
+      if (request.url.includes("access_tokens")) return tokenResponse();
+      if (request.url.endsWith("/pulls/7")) return Response.json(current);
+      if (request.url.endsWith(`/commits/${candidateSha}`))
+        return Response.json({
+          sha: candidateSha,
+          tree: { sha: treeSha },
+          parents: [{ sha: baseSha }, { sha: headSha }],
+        });
+      if (request.url.includes("check-runs?"))
+        return Response.json({
+          check_runs: created
+            ? [
+                {
+                  id: 440,
+                  name: "T3 Fork Compatibility",
+                  head_sha: candidateSha,
+                  external_id: created.external_id,
+                  status: "completed",
+                  conclusion: "success",
+                  app: { id: appId },
+                },
+              ]
+            : [],
+        });
+      if (request.method === "POST" && request.url.endsWith("/check-runs")) {
+        posts += 1;
+        const body = request.body as { readonly _tag?: string; readonly body?: Uint8Array };
+        assert.equal(body._tag, "Uint8Array");
+        created = decodeJson(new TextDecoder().decode(body.body)) as Record<string, unknown>;
+        return Response.json({ id: 440, app: { id: appId } }, { status: 201 });
+      }
+      throw new Error(`Unexpected request ${request.method} ${request.url}`);
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ForkGithubAdapterModule.ForkGithubAdapter;
+      const first = yield* adapter.publishPullRequestCompatibilityCheck({
+        snapshot: captured,
+        evidence,
+        identitySha256: "9".repeat(64),
+        reconcileOnly: false,
+      });
+      assert.equal(first?.checkRunId, 440);
+      assert.equal(first?.appId, appId);
+      assert.equal(posts, 1);
+      assert.equal(created?.head_sha, candidateSha);
+      assert.equal(created?.conclusion, "success");
+      const recovered = yield* adapter.publishPullRequestCompatibilityCheck({
+        snapshot: captured,
+        evidence,
+        identitySha256: "9".repeat(64),
+        reconcileOnly: true,
+      });
+      assert.equal(recovered?.checkRunId, 440);
+      assert.equal(posts, 1, "recovery discovers the remote result without posting twice");
+      current = { ...snapshotJson(), base: { ref: "forklauncher", sha: sha("f") } };
+      const moved = yield* Effect.exit(
+        adapter.publishPullRequestCompatibilityCheck({
+          snapshot: captured,
+          evidence,
+          identitySha256: "9".repeat(64),
+          reconcileOnly: false,
+        }),
+      );
+      assert.isTrue(moved._tag === "Failure");
+      assert.equal(posts, 1, "a changed PR base cannot create a success check");
+      current = {
+        ...snapshotJson(),
+        head: { sha: sha("8") },
+      };
+      const movedHead = yield* Effect.exit(
+        adapter.publishPullRequestCompatibilityCheck({
+          snapshot: captured,
+          evidence,
+          identitySha256: "9".repeat(64),
+          reconcileOnly: false,
+        }),
+      );
+      assert.isTrue(movedHead._tag === "Failure");
+      assert.equal(posts, 1, "a changed PR head cannot create a success check");
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect(
+  "rejects custom PR check attribution when the configured policy names another App",
+  () => {
+    let posts = 0;
+    const layer = serviceLayer(
+      (request) => {
+        if (request.url.includes("access_tokens")) return tokenResponse();
+        if (request.url.endsWith("/pulls/7")) return Response.json(snapshotJson());
+        if (request.url.endsWith(`/commits/${candidateSha}`))
+          return Response.json({
+            sha: candidateSha,
+            tree: { sha: treeSha },
+            parents: [{ sha: baseSha }, { sha: headSha }],
+          });
+        if (request.url.includes("check-runs?")) return Response.json({ check_runs: [] });
+        if (request.method === "POST" && request.url.endsWith("/check-runs")) posts += 1;
+        throw new Error(`Unexpected request ${request.method} ${request.url}`);
+      },
+      undefined,
+      () =>
+        Effect.succeed({
+          ...gatePolicy,
+          requiredChecks: [{ name: "T3 Fork Compatibility", appId: appId + 1 }],
+        }),
+    );
+    return Effect.gen(function* () {
+      const adapter = yield* ForkGithubAdapterModule.ForkGithubAdapter;
+      const result = yield* Effect.exit(
+        adapter.publishPullRequestCompatibilityCheck({
+          snapshot: {
+            owner: "downstream",
+            repository: "project",
+            number: 7,
+            state: "open",
+            headSha,
+            baseRef: "forklauncher",
+            targetBranch: "forklauncher",
+            baseSha,
+            mergeCandidateSha: candidateSha,
+            mergeTreeSha: treeSha,
+          },
+          evidence,
+          identitySha256: "8".repeat(64),
+          reconcileOnly: false,
+        }),
+      );
+      assert.isTrue(result._tag === "Failure");
+      assert.equal(posts, 0);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 it.effect("rejects a matching check name and SHA published by another App", () => {
   const layer = serviceLayer((request) => {
     if (request.url.includes("access_tokens")) return tokenResponse();

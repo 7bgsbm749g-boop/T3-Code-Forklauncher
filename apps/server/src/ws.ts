@@ -2846,6 +2846,34 @@ const makeWsRpcLayer = (
               ),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.forkGithubSubmitPullRequestEvidence]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubSubmitPullRequestEvidence,
+            forkGithubHandlers
+              .submitPullRequestEvidence(input)
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.forkGithubPullRequestEvidenceStatus]: ({ requestId }) =>
+          observeRpcEffect(
+            WS_METHODS.forkGithubPullRequestEvidenceStatus,
+            forkGithubHandlers
+              .pullRequestEvidenceStatus(requestId)
+              .pipe(
+                Effect.mapError((error) =>
+                  error._tag === "ForkGithubNativeError"
+                    ? error
+                    : new ForkGithubNativeError({ reason: error.reason }),
+                ),
+              ),
+            { "rpc.aggregate": "server" },
+          ),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>
           observeRpcEffect(
             WS_METHODS.serverDiscoverSourceControl,

@@ -21,6 +21,7 @@ import * as Repairs from "../forkCompatibility/ForkCompatibilityRepairRepository
 import type { ForkCompatibilityRun } from "../forkCompatibility/model.ts";
 import * as Native from "./ForkGithubNativeService.ts";
 import * as NativeRepository from "./ForkGithubNativeOperationRepository.ts";
+import * as PullRequestEvidence from "./ForkGithubPullRequestEvidence.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import Migration056 from "../persistence/Migrations/056_ForkGithubActions.ts";
 
@@ -177,6 +178,31 @@ it.effect(
     const staleWorkerReached = Deferred.makeUnsafe<void>();
     const finishStaleWorker = Deferred.makeUnsafe<void>();
     const staleOperationFinished = Deferred.makeUnsafe<void>();
+    const prValidationReached = Deferred.makeUnsafe<void>();
+    const finishPrValidation = Deferred.makeUnsafe<void>();
+    const prValidationFinished = Deferred.makeUnsafe<void>();
+    const prPublicationFinished = Deferred.makeUnsafe<void>();
+    const prRequestId = "123e4567-e89b-42d3-a456-426614174090";
+    let prValidationCalls = 0;
+    let prPublicationCalls = 0;
+    let prPublication: "queued" | "published" = "queued";
+    let prRecord: PullRequestEvidence.PullRequestEvidenceRecord = {
+      requestId: prRequestId,
+      evidenceFingerprint: "p".repeat(64),
+      status: "accepted",
+      usable: false,
+      snapshot: null,
+      submission: { owner: "owner", repository: "repo", number: 9 },
+      profileId: profile.id,
+      profileRevision: profile.revision,
+      profileSha256: profile.sha256,
+      toolchainSha256: "t".repeat(64),
+      candidatePath: null,
+      evidence: null,
+      error: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
     let policyReads = 0;
     let blockPolicyAt: number | null = null;
     let policySha = "7".repeat(64);
@@ -314,6 +340,43 @@ it.effect(
       }),
       Layer.succeed(Promotion.ForkGithubStablePromotion, promotionService),
       Layer.succeed(Draft.ForkGithubDraftReleasePreparation, draftService),
+      Layer.succeed(PullRequestEvidence.ForkGithubPullRequestEvidence, {
+        accept: () => Effect.succeed(prRecord),
+        pending: () =>
+          Effect.succeed(
+            prRecord.status === "accepted"
+              ? [{ requestId: prRequestId, owner: "owner", repository: "repo", number: 9 }]
+              : [],
+          ),
+        pendingPublications: () => Effect.succeed(prRecord.status === "ready" ? [prRequestId] : []),
+        publishCheck: () =>
+          Effect.gen(function* () {
+            prPublicationCalls += 1;
+            prPublication = "published";
+            yield* Deferred.succeed(prPublicationFinished, undefined);
+          }),
+        publicationStatus: () => Effect.succeed(prPublication),
+        failAccepted: () =>
+          Effect.sync(() => {
+            prRecord = { ...prRecord, status: "failed", updatedAt: "2026-01-01T00:01:00.000Z" };
+          }),
+        validate: () =>
+          Effect.gen(function* () {
+            prValidationCalls += 1;
+            prRecord = { ...prRecord, status: "validating" };
+            yield* Deferred.succeed(prValidationReached, undefined);
+            yield* Deferred.await(finishPrValidation);
+            prRecord = {
+              ...prRecord,
+              status: "ready",
+              usable: true,
+              updatedAt: "2026-01-01T00:02:00.000Z",
+            };
+            yield* Deferred.succeed(prValidationFinished, undefined);
+            return prRecord;
+          }),
+        get: () => Effect.succeed(prRecord),
+      }),
     );
     const serviceLayer = Layer.effect(
       Native.ForkGithubNativeService,
@@ -338,6 +401,41 @@ it.effect(
           "required-check App identity does not match ServerSecretStore credentials",
         );
         credentialAppId = 1;
+        const acceptedPr = yield* service.submitPullRequestEvidence({
+          requestId: prRequestId,
+          number: 9,
+        });
+        assert.equal(acceptedPr.status, "accepted");
+        assert.isFalse(acceptedPr.usable);
+        yield* Deferred.await(prValidationReached);
+        const duplicatePr = yield* service.submitPullRequestEvidence({
+          requestId: prRequestId,
+          number: 9,
+        });
+        assert.equal(duplicatePr.requestId, prRequestId);
+        assert.equal(prValidationCalls, 1, "a duplicate joins the single native worker attempt");
+        assert.equal((yield* service.pullRequestEvidenceStatus(prRequestId))?.status, "validating");
+        yield* Deferred.succeed(finishPrValidation, undefined);
+        yield* Deferred.await(prValidationFinished);
+        yield* Deferred.await(prPublicationFinished);
+        const readyStatus = yield* service.pullRequestEvidenceStatus(prRequestId);
+        assert.equal(readyStatus?.status, "ready");
+        assert.equal(prPublicationCalls, 1);
+        assert.equal(
+          (yield* service.pullRequestEvidenceStatus(prRequestId))?.publication,
+          "published",
+        );
+        const publishedRetry = yield* service.submitPullRequestEvidence({
+          requestId: prRequestId,
+          number: 9,
+        });
+        assert.equal(publishedRetry.status, "ready");
+        assert.equal(publishedRetry.publication, "published");
+        assert.equal(
+          prPublicationCalls,
+          1,
+          "same-key retry does not queue or republish a completed check",
+        );
         const input = { operationId: "op-a", requestId: request.requestId, runId: run.runId };
         const accepted = yield* service.submitPromotion(input);
         assert.equal(accepted.status, "pending");

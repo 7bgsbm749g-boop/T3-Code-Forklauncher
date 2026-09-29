@@ -9,6 +9,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
 import * as NodeProcess from "node:process";
 import {
   ForkGithubConfigurationStatus as ConfigurationStatusSchema,
@@ -19,6 +20,9 @@ import {
   type ForkGithubDraftCommand,
   type ForkGithubOperation,
   type ForkGithubPromotionCommand,
+  type ForkGithubPullRequestEvidenceSubmit,
+  ForkGithubPullRequestEvidenceStatus as PullRequestEvidenceStatusSchema,
+  type ForkGithubPullRequestEvidenceStatus,
 } from "../../../../packages/contracts/src/forkGithub.ts";
 import * as Requests from "../forkCompatibility/ForkCompatibilityRequestRepository.ts";
 import * as Runs from "../forkCompatibility/ForkCompatibilityRunRepository.ts";
@@ -29,6 +33,7 @@ import * as Draft from "./ForkGithubDraftReleasePreparation.ts";
 import * as Artifacts from "./ForkGithubCandidateArtifactSource.ts";
 import { trustedCandidateWorkflowPaths } from "./ForkGithubCandidateArtifactSource.ts";
 import * as OperationRepository from "./ForkGithubNativeOperationRepository.ts";
+import * as PullRequestEvidence from "./ForkGithubPullRequestEvidence.ts";
 
 type NativeFailure = ForkGithubNativeError | Github.ForkGithubAdapterError;
 type OperationInput = ForkGithubPromotionCommand | ForkGithubDraftCommand;
@@ -58,6 +63,7 @@ const leaseExpiresAt = (timestamp: string) =>
   DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(timestamp), { seconds: 90 }));
 const operationSchema = Schema.decodeUnknownSync(OperationSchema);
 const configStatusSchema = Schema.decodeUnknownSync(ConfigurationStatusSchema);
+const pullRequestEvidenceStatusSchema = Schema.decodeUnknownSync(PullRequestEvidenceStatusSchema);
 const NativeOperationInputSchema = Schema.Union([
   Schema.Struct({
     operationId: Schema.String,
@@ -113,6 +119,12 @@ export interface ForkGithubNativeServiceShape {
   readonly status: (
     operationId: string,
   ) => Effect.Effect<ForkGithubOperation | null, NativeFailure>;
+  readonly submitPullRequestEvidence: (
+    input: ForkGithubPullRequestEvidenceSubmit,
+  ) => Effect.Effect<ForkGithubPullRequestEvidenceStatus, NativeFailure>;
+  readonly pullRequestEvidenceStatus: (
+    requestId: string,
+  ) => Effect.Effect<ForkGithubPullRequestEvidenceStatus | null, NativeFailure>;
   /** Internal bounded recovery wake; not exposed through RPC. */
   readonly wakePending: () => Effect.Effect<void, NativeFailure>;
 }
@@ -135,6 +147,9 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
   const workflowTrust = yield* Artifacts.ForkGithubCandidateWorkflowTrust;
   const promotion = yield* Promotion.ForkGithubStablePromotion;
   const draft = yield* Draft.ForkGithubDraftReleasePreparation;
+  const pullRequestEvidence = yield* Effect.serviceOption(
+    PullRequestEvidence.ForkGithubPullRequestEvidence,
+  );
   const queue = yield* Queue.dropping<void>(1);
 
   const configurationStatus = Effect.fn("ForkGithubNativeService.read")(function* () {
@@ -525,6 +540,52 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
     );
   };
 
+  const publicPullRequestEvidenceStatus = (
+    record: PullRequestEvidence.PullRequestEvidenceRecord,
+    publication: ForkGithubPullRequestEvidenceStatus["publication"],
+  ) => {
+    const snapshot = record.snapshot;
+    const submission = record.submission;
+    const evidence = record.evidence;
+    const diagnostic = record.usable
+      ? null
+      : record.status === "accepted" || record.status === "validating"
+        ? "pending"
+        : record.status === "stale"
+          ? "stale"
+          : record.status === "unavailable"
+            ? "unavailable"
+            : record.status === "failed"
+              ? "validation-failed"
+              : record.status === "ready"
+                ? "unavailable"
+                : null;
+    return pullRequestEvidenceStatusSchema({
+      requestId: record.requestId,
+      status: record.status,
+      usable: record.usable,
+      publication,
+      owner: snapshot?.owner ?? submission?.owner ?? evidence?.owner ?? null,
+      repository: snapshot?.repository ?? submission?.repository ?? evidence?.repository ?? null,
+      number: snapshot?.number ?? submission?.number ?? evidence?.number ?? null,
+      state: snapshot?.state ?? evidence?.state ?? null,
+      headSha: snapshot?.headSha ?? evidence?.headSha ?? null,
+      baseRef: snapshot?.baseRef ?? evidence?.baseRef ?? null,
+      targetBranch: snapshot?.targetBranch ?? evidence?.targetBranch ?? null,
+      baseSha: snapshot?.baseSha ?? evidence?.baseSha ?? null,
+      mergeCandidateSha: snapshot?.mergeCandidateSha ?? evidence?.mergeCandidateSha ?? null,
+      mergeTreeSha: snapshot?.mergeTreeSha ?? evidence?.mergeTreeSha ?? null,
+      profileId: record.profileId,
+      profileRevision: record.profileRevision,
+      profileSha256: record.profileSha256,
+      toolchainSha256: record.toolchainSha256,
+      storageIdentitySha256: evidence?.storageIdentitySha256 ?? null,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      diagnostic,
+    });
+  };
+
   const drainRecoverable = Effect.gen(function* () {
     const pending = yield* repository.pending();
     for (const row of pending)
@@ -536,6 +597,27 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
           }),
         ),
       );
+    if (Option.isSome(pullRequestEvidence)) {
+      const accepted = yield* pullRequestEvidence.value.pending();
+      for (const request of accepted) {
+        yield* pullRequestEvidence.value
+          .validate(request)
+          .pipe(
+            Effect.catch(() =>
+              pullRequestEvidence.value.failAccepted(request.requestId).pipe(Effect.as(null)),
+            ),
+          );
+      }
+      const ready = yield* pullRequestEvidence.value.pendingPublications();
+      for (const requestId of ready)
+        yield* pullRequestEvidence.value.publishCheck(requestId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("Could not reconcile PR compatibility check", {
+              cause: Cause.pretty(cause).slice(0, 2_000),
+            }),
+          ),
+        );
+    }
   });
 
   const worker = Effect.forever(
@@ -662,6 +744,74 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
             }),
         ),
       ),
+    submitPullRequestEvidence: (input) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (Option.isNone(pullRequestEvidence))
+            return yield* new ForkGithubNativeError({
+              reason:
+                "Custom PR evidence is unavailable because its trusted executor is not configured.",
+            });
+          const resolvedCredentials = yield* credentials.resolve();
+          if (!resolvedCredentials)
+            return yield* new ForkGithubNativeError({
+              reason: "Custom PR evidence requires configured GitHub App credentials.",
+            });
+          const accepted = yield* pullRequestEvidence.value.accept(input);
+          let publication: ForkGithubPullRequestEvidenceStatus["publication"] =
+            accepted.status === "stale"
+              ? "stale"
+              : accepted.status === "unavailable"
+                ? "unavailable"
+                : accepted.status === "failed"
+                  ? "not-eligible"
+                  : "queued";
+          if (accepted.status === "ready" && accepted.usable)
+            publication = yield* pullRequestEvidence.value.publicationStatus(input.requestId);
+          if (
+            accepted.status === "accepted" ||
+            (accepted.status === "ready" &&
+              accepted.usable &&
+              publication !== "published" &&
+              publication !== "stale" &&
+              publication !== "unavailable")
+          )
+            yield* Queue.offer(queue, undefined);
+          return publicPullRequestEvidenceStatus(accepted, publication);
+        }),
+      ).pipe(
+        Effect.mapError((error) =>
+          isNativeError(error)
+            ? error
+            : isAdapterError(error)
+              ? new ForkGithubNativeError({ reason: error.reason })
+              : new ForkGithubNativeError({
+                  reason: "Could not accept custom PR evidence request.",
+                }),
+        ),
+      ),
+    pullRequestEvidenceStatus: (requestId) =>
+      Option.isNone(pullRequestEvidence)
+        ? Effect.succeed(null)
+        : pullRequestEvidence.value.get(requestId).pipe(
+            Effect.flatMap((record) =>
+              record
+                ? pullRequestEvidence.value
+                    .publicationStatus(requestId)
+                    .pipe(
+                      Effect.map((publication) =>
+                        publicPullRequestEvidenceStatus(record, publication),
+                      ),
+                    )
+                : Effect.succeed(null),
+            ),
+            Effect.mapError(
+              () =>
+                new ForkGithubNativeError({
+                  reason: "Could not verify current PR evidence status.",
+                }),
+            ),
+          ),
     wakePending: () =>
       Queue.offer(queue, undefined).pipe(
         Effect.mapError(
@@ -670,7 +820,14 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
       ),
   };
   const pending = yield* repository.pending();
-  if (pending.length > 0) yield* Queue.offer(queue, undefined);
+  const acceptedPr = Option.isSome(pullRequestEvidence)
+    ? yield* pullRequestEvidence.value.pending()
+    : [];
+  const publicationPr = Option.isSome(pullRequestEvidence)
+    ? yield* pullRequestEvidence.value.pendingPublications()
+    : [];
+  if (pending.length > 0 || acceptedPr.length > 0 || publicationPr.length > 0)
+    yield* Queue.offer(queue, undefined);
   yield* worker.pipe(Effect.forkScoped);
   return service;
 });
@@ -697,6 +854,9 @@ export const ForkGithubNativeServiceInert = Layer.succeed(ForkGithubNativeServic
   submitScheduledDraft: () => fail("Native GitHub integration is not configured."),
   submitDraft: () => fail("Native GitHub integration is not configured."),
   status: () => Effect.succeed(null),
+  submitPullRequestEvidence: () =>
+    fail("Custom PR evidence is unavailable because its trusted executor is not configured."),
+  pullRequestEvidenceStatus: () => Effect.succeed(null),
   wakePending: () => Effect.void,
 });
 
@@ -706,11 +866,15 @@ export const makeForkGithubNativeHandlers = (service: ForkGithubNativeServiceSha
     read: "orchestration:read",
     submitPromotion: "orchestration:operate",
     submitDraft: "orchestration:operate",
+    submitPullRequestEvidence: "orchestration:operate",
     status: "orchestration:read",
+    pullRequestEvidenceStatus: "orchestration:read",
   } as const,
   configure: service.configure,
   read: service.read,
   submitPromotion: service.submitPromotion,
   submitDraft: service.submitDraft,
   status: service.status,
+  submitPullRequestEvidence: service.submitPullRequestEvidence,
+  pullRequestEvidenceStatus: service.pullRequestEvidenceStatus,
 });

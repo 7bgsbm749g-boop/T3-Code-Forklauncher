@@ -282,6 +282,8 @@ export interface DurableRefAction {
   readonly leaseExpiresAt: string;
   readonly state: "reserved" | "pushing" | "applied" | "failed" | "cancelled";
   readonly resultSha?: string;
+  /** Keep an external check creation in the uncertain state after lease recovery. */
+  readonly preservePushingOnRecovery?: boolean;
 }
 
 /** Implementations must atomically reserve by actionId and reject changed fingerprints. */
@@ -613,6 +615,15 @@ export interface ForkGithubAdapterShape {
     { readonly checkRunId: number; readonly appId: number; readonly externalId: string },
     ForkGithubAdapterFailure
   >;
+  readonly publishPullRequestCompatibilityCheck: (input: {
+    readonly snapshot: PullRequestSnapshot & { readonly targetBranch: string };
+    readonly evidence: CompatibilityEvidence;
+    readonly identitySha256: string;
+    readonly reconcileOnly: boolean;
+  }) => Effect.Effect<
+    { readonly checkRunId: number; readonly appId: number; readonly externalId: string } | null,
+    ForkGithubAdapterFailure
+  >;
   readonly advancePullRequestBase: (input: {
     readonly snapshot: PullRequestSnapshot;
     readonly repositoryRoot: string;
@@ -741,6 +752,7 @@ export const ForkGithubAdapterInert = Layer.succeed(ForkGithubAdapter, {
   inspectPullRequest: disabled,
   latestOfficialStable: disabled,
   publishCompatibilityCheck: disabled,
+  publishPullRequestCompatibilityCheck: disabled,
   advancePullRequestBase: disabled,
   advanceStableRef: disabled,
   releaseTagTarget: disabled,
@@ -1312,6 +1324,102 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
     return { checkRunId: check.id, appId: check.app.id, externalId };
   });
 
+  const publishPullRequestCompatibilityCheck: ForkGithubAdapterShape["publishPullRequestCompatibilityCheck"] =
+    Effect.fn("ForkGithubAdapter.publishPullRequestCompatibilityCheck")(function* (input) {
+      const { snapshot, evidence } = input;
+      if (
+        !/^[0-9a-f]{64}$/i.test(input.identitySha256) ||
+        evidence.kind !== "custom-pr" ||
+        evidence.sourceSha.toLowerCase() !== snapshot.headSha.toLowerCase() ||
+        evidence.targetSha.toLowerCase() !== snapshot.baseSha.toLowerCase() ||
+        evidence.candidateSha.toLowerCase() !== snapshot.mergeCandidateSha.toLowerCase()
+      )
+        return yield* fail("Custom PR check identity does not match its captured merge candidate.");
+      const profile = yield* validationProfile.get();
+      const policy = yield* gatePolicy.get();
+      if (!profile || !policy || !validateEvidence(evidence, profile))
+        return yield* fail("Current trusted profile does not validate the captured PR evidence.");
+      if (
+        !/^[0-9a-f]{64}$/i.test(policy.sha256) ||
+        policy.requiredChecks.length === 0 ||
+        policy.requiredChecks.some((check) => !check.name || !Number.isSafeInteger(check.appId))
+      )
+        return yield* fail("Trusted GitHub App check policy is unavailable or invalid.");
+      const app = yield* auth(snapshot.owner, snapshot.repository);
+      if (policy.requiredChecks.some((check) => check.appId !== app.appId))
+        return yield* fail("Required-check policy is attributed to a different GitHub App.");
+      const latest = yield* inspectPullRequest({
+        owner: snapshot.owner,
+        repository: snapshot.repository,
+        number: snapshot.number,
+      });
+      if (
+        latest.state !== "open" ||
+        latest.owner.toLowerCase() !== snapshot.owner.toLowerCase() ||
+        latest.repository.toLowerCase() !== snapshot.repository.toLowerCase() ||
+        latest.number !== snapshot.number ||
+        latest.headSha.toLowerCase() !== snapshot.headSha.toLowerCase() ||
+        latest.baseRef !== snapshot.baseRef ||
+        latest.baseSha.toLowerCase() !== snapshot.baseSha.toLowerCase() ||
+        latest.mergeCandidateSha.toLowerCase() !== snapshot.mergeCandidateSha.toLowerCase() ||
+        latest.mergeTreeSha.toLowerCase() !== snapshot.mergeTreeSha.toLowerCase() ||
+        latest.baseRef !== snapshot.targetBranch
+      )
+        return yield* fail("Pull request or configured target moved before check publication.");
+      const externalId = `t3-fork:v2:${NodeCrypto.createHash("sha256")
+        .update(`${checkExternalId(evidence)}\n${input.identitySha256.toLowerCase()}`)
+        .digest("hex")}`;
+      const list = yield* requestJson(
+        app.token,
+        HttpClientRequest.get(
+          `${API}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repository)}/commits/${encodeURIComponent(snapshot.mergeCandidateSha)}/check-runs?check_name=${encodeURIComponent(FORK_GITHUB_COMPATIBILITY_CHECK_NAME)}&per_page=100`,
+        ),
+        CheckListJson,
+      );
+      const matches = list.check_runs.filter((run) => run.external_id === externalId);
+      if (matches.length > 1)
+        return yield* fail("Multiple GitHub checks match one durable PR evidence identity.");
+      const existing = matches[0];
+      if (existing) {
+        if (
+          existing.name !== FORK_GITHUB_COMPATIBILITY_CHECK_NAME ||
+          existing.head_sha.toLowerCase() !== snapshot.mergeCandidateSha.toLowerCase() ||
+          existing.app.id !== app.appId
+        )
+          return yield* fail("An existing PR check has a mismatched candidate or App identity.");
+        if (existing.status !== "completed" || existing.conclusion !== "success")
+          return yield* fail("The matching GitHub PR check is not a completed success.");
+        return { checkRunId: existing.id, appId: existing.app.id, externalId };
+      }
+      if (input.reconcileOnly) return null;
+      const response = yield* http
+        .execute(
+          HttpClientRequest.post(
+            `${API}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repository)}/check-runs`,
+          ).pipe(
+            HttpClientRequest.setHeader("Authorization", `Bearer ${app.token}`),
+            HttpClientRequest.setHeader("Accept", "application/vnd.github+json"),
+            HttpClientRequest.setHeader("X-GitHub-Api-Version", API_VERSION),
+            jsonBody({
+              name: FORK_GITHUB_COMPATIBILITY_CHECK_NAME,
+              head_sha: snapshot.mergeCandidateSha,
+              external_id: externalId,
+              status: "completed",
+              conclusion: "success",
+              output: {
+                title: "custom-pr compatibility passed",
+                summary: `request=${evidence.requestId}\nhead=${snapshot.headSha}\nbase=${snapshot.baseSha}\nmerge=${snapshot.mergeCandidateSha}\ntree=${snapshot.mergeTreeSha}\ntarget=${snapshot.targetBranch}\nprofile=${profile.id}@${profile.revision}\nprofileSha256=${profile.sha256}`,
+              },
+            }),
+          ),
+        )
+        .pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
+      const check = yield* HttpClientResponse.schemaBodyJson(CheckJson)(response);
+      if (check.app.id !== app.appId)
+        return yield* fail("Published PR check was attributed to a different GitHub App.");
+      return { checkRunId: check.id, appId: check.app.id, externalId };
+    });
+
   const advance = (input: {
     owner: string;
     repository: string;
@@ -1641,6 +1749,7 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
     inspectPullRequest,
     latestOfficialStable,
     publishCompatibilityCheck,
+    publishPullRequestCompatibilityCheck,
     advancePullRequestBase,
     advanceStableRef,
     releaseTagTarget,

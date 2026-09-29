@@ -68,6 +68,13 @@ describe("mobile preferences state", () => {
       Effect.gen(function* () {
         let saved: Preferences = {
           forkCompatibilityRequestIds: { "server-1": "request-old" },
+          forkCompatibilityPullRequestEvidence: {
+            "server-1": {
+              number: 42,
+              requestId: "00000000-0000-4000-8000-000000000001",
+              state: "uncertain",
+            },
+          },
           forkCompatibilityPendingChecks: {
             "server-1": [{ sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" }],
           },
@@ -86,6 +93,13 @@ describe("mobile preferences state", () => {
         yield* AtomRegistry.getResult(registry, state.preferencesAtom, { suspendOnWaiting: true });
         registry.set(state.updatePreferencesAtom, {
           forkCompatibilityRequestIds: { "server-1": "request-new", "server-2": "request-two" },
+          forkCompatibilityPullRequestEvidence: {
+            "server-1": {
+              number: 43,
+              requestId: "00000000-0000-4000-8000-000000000002",
+              state: "active",
+            },
+          },
         });
         yield* Effect.promise(() =>
           vi.waitFor(() => {
@@ -96,6 +110,13 @@ describe("mobile preferences state", () => {
                 "server-1": "request-new",
                 "server-2": "request-two",
               },
+              forkCompatibilityPullRequestEvidence: {
+                "server-1": {
+                  number: 43,
+                  requestId: "00000000-0000-4000-8000-000000000002",
+                  state: "active",
+                },
+              },
               forkCompatibilityPendingChecks: {
                 "server-1": [{ sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" }],
               },
@@ -103,6 +124,11 @@ describe("mobile preferences state", () => {
           }),
         );
         expect(saved.forkCompatibilityRequestIds?.["server-1"]).toBe("request-new");
+        expect(saved.forkCompatibilityPullRequestEvidence?.["server-1"]).toEqual({
+          number: 43,
+          requestId: "00000000-0000-4000-8000-000000000002",
+          state: "active",
+        });
         expect(saved.forkCompatibilityPendingChecks?.["server-1"]).toEqual([
           { sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" },
         ]);

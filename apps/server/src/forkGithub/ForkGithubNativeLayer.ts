@@ -1,6 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as Layer from "effect/Layer";
 import * as Effect from "effect/Effect";
 import { ForkGithubCredentialResolverFromSecretStore } from "./ForkGithubAdapter.ts";
+import * as GithubAdapter from "./ForkGithubAdapter.ts";
 import { ForkGithubDurableActionStoreLive } from "./ForkGithubActionRepository.ts";
 import { ForkGithubAdapterLive, ForkGithubRefUpdateTransportLive } from "./ForkGithubAdapter.ts";
 import { ForkGithubNativeEvidenceResolverLive } from "./ForkGithubNativeEvidence.ts";
@@ -15,6 +17,9 @@ import {
   ForkGithubCandidateWorkflowTrust,
 } from "./ForkGithubCandidateArtifactSource.ts";
 import { ForkGithubNativeServiceLive } from "./ForkGithubNativeService.ts";
+import * as PullRequestEvidence from "./ForkGithubPullRequestEvidence.ts";
+import * as CandidateSandbox from "./ForkGithubCandidateSandbox.ts";
+import * as CandidateStorage from "./ForkGithubCandidateStorage.ts";
 import {
   ForkGithubOperatorConfigurationService,
   makeForkGithubOperatorConfigurationLayer,
@@ -38,10 +43,15 @@ const ForkGithubAdapterWithNativeBackingLive = ForkGithubAdapterLive.pipe(
   ),
 );
 
-/** Stable promotion entry point; callers must explicitly provide the trusted target and profile/policy. */
-const ForkGithubStablePromotionWithNativeBackingLive = ForkGithubStablePromotionLive.pipe(
-  Layer.provideMerge(ForkGithubAdapterWithNativeBackingLive),
-);
+/**
+ * Test-only overrides for external GitHub and trusted remote boundaries. Server startup has no
+ * environment or RPC path for setting these; production always uses its operator-backed adapter.
+ */
+export interface ForkGithubNativeTestOverrides {
+  readonly adapter: Layer.Layer<GithubAdapter.ForkGithubAdapter>;
+  readonly credentials: Layer.Layer<GithubAdapter.ForkGithubCredentialResolver>;
+  readonly pullRequestRemote: Layer.Layer<PullRequestEvidence.ForkGithubPullRequestRemote>;
+}
 
 /**
  * Native command surface with production SQLite/GitHub/coordinator adapters. The caller must
@@ -63,10 +73,23 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
     never,
     R
   >,
+  candidateStorageManifestPath?: string,
+  offlineSnapshotPath?: string,
+  testOverrides?: ForkGithubNativeTestOverrides,
 ) => {
-  const adapter = ForkGithubAdapterWithNativeBackingLive.pipe(
-    Layer.provideMerge(ForkGithubCredentialResolverFromSecretStore),
-  );
+  const credentials = testOverrides?.credentials ?? ForkGithubCredentialResolverFromSecretStore;
+  const adapter = testOverrides
+    ? testOverrides.adapter.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            ForkGithubDurableActionStoreLive,
+            ForkGithubRefUpdateTransportLive,
+            ForkGithubNativeEvidenceResolverLive,
+          ),
+        ),
+        Layer.provideMerge(credentials),
+      )
+    : ForkGithubAdapterWithNativeBackingLive.pipe(Layer.provideMerge(credentials));
   const artifacts = ForkGithubCandidateArtifactSourceLive.pipe(
     Layer.provide(trust),
     Layer.provideMerge(adapter),
@@ -77,12 +100,30 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
     Layer.provideMerge(ForkGithubDraftReleaseApiLive.pipe(Layer.provideMerge(adapter))),
     Layer.provideMerge(artifacts),
   );
-  const promotion = ForkGithubStablePromotionWithNativeBackingLive.pipe(
-    Layer.provideMerge(ForkGithubCredentialResolverFromSecretStore),
+  const promotion = ForkGithubStablePromotionLive.pipe(Layer.provideMerge(adapter));
+  const pullRequestEvidence = PullRequestEvidence.ForkGithubPullRequestEvidenceLive({
+    candidateExecutorLayer:
+      CandidateSandbox.ForkGithubCandidateExecutorFromSnapshotManifest(offlineSnapshotPath),
+    candidateStorageLayer:
+      CandidateStorage.ForkGithubCandidateStorageLayerFromOperatorConfiguration(
+        candidateStorageManifestPath ?? null,
+      ),
+  }).pipe(
+    Layer.provideMerge(adapter),
+    Layer.provideMerge(operator),
+    Layer.provideMerge(
+      testOverrides?.pullRequestRemote ??
+        Layer.succeed(PullRequestEvidence.ForkGithubPullRequestRemote, {
+          // This trusted URL is derived only from the immutable operator target and server-resolved
+          // PR identity. Candidate commands run with Git remotes/configuration sanitized.
+          url: (snapshot) => `https://github.com/${snapshot.owner}/${snapshot.repository}.git`,
+        }),
+    ),
   );
   const native = ForkGithubNativeServiceLive.pipe(
     Layer.provideMerge(promotion),
     Layer.provideMerge(draft),
+    Layer.provideMerge(pullRequestEvidence),
   );
   const candidateBuild = CandidateBuild.ForkGithubCandidateBuildServiceLive.pipe(
     Layer.provideMerge(CandidateBuildRepository.ForkGithubCandidateBuildRepositoryLive),
@@ -106,6 +147,9 @@ const makeForkGithubNativeServiceFromOperatorConfiguration = <R>(
     never,
     R
   >,
+  candidateStorageManifestPath?: string,
+  offlineSnapshotPath?: string,
+  testOverrides?: ForkGithubNativeTestOverrides,
 ) => {
   const trust = Layer.effect(
     ForkGithubCandidateWorkflowTrust,
@@ -116,16 +160,30 @@ const makeForkGithubNativeServiceFromOperatorConfiguration = <R>(
       };
     }),
   ).pipe(Layer.provide(operator));
-  return makeForkGithubNativeServiceWithNativeBacking(trust, operator).pipe(
-    Layer.provideMerge(operator),
-  );
+  return makeForkGithubNativeServiceWithNativeBacking(
+    trust,
+    operator,
+    candidateStorageManifestPath,
+    offlineSnapshotPath,
+    testOverrides,
+  ).pipe(Layer.provideMerge(operator));
 };
 
 /**
  * Operator-selected immutable config snapshot. Missing/invalid files keep the service inert or
  * unavailable; they never cause credentials or GitHub requests to be synthesized.
  */
-export const makeForkGithubNativeServiceFromOperatorConfig = (path: string | undefined) => {
+export const makeForkGithubNativeServiceFromOperatorConfig = (
+  path: string | undefined,
+  candidateStorageManifestPath?: string,
+  offlineSnapshotPath?: string,
+  testOverrides?: ForkGithubNativeTestOverrides,
+) => {
   const operator = makeForkGithubOperatorConfigurationLayer(path);
-  return makeForkGithubNativeServiceFromOperatorConfiguration(operator);
+  return makeForkGithubNativeServiceFromOperatorConfiguration(
+    operator,
+    candidateStorageManifestPath,
+    offlineSnapshotPath,
+    testOverrides,
+  );
 };

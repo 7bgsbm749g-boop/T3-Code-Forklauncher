@@ -16,6 +16,8 @@ import {
   ForkGithubOperation,
   ForkGithubPipelineStatus,
   ForkGithubPromotionCommand,
+  ForkGithubPullRequestEvidenceSubmit,
+  ForkGithubPullRequestEvidenceStatus,
 } from "./forkGithub.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
@@ -396,6 +398,8 @@ export const WS_METHODS = {
   forkGithubSubmitPromotion: "forkGithub.submitPromotion",
   forkGithubSubmitDraft: "forkGithub.submitDraft",
   forkGithubStatus: "forkGithub.status",
+  forkGithubSubmitPullRequestEvidence: "forkGithub.submitPullRequestEvidence",
+  forkGithubPullRequestEvidenceStatus: "forkGithub.pullRequestEvidenceStatus",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
@@ -696,6 +700,22 @@ const WsForkGithubStatusRpc = Rpc.make(WS_METHODS.forkGithubStatus, {
   success: Schema.NullOr(ForkGithubOperation),
   error: ForkGithubRpcError,
 });
+const WsForkGithubSubmitPullRequestEvidenceRpc = Rpc.make(
+  WS_METHODS.forkGithubSubmitPullRequestEvidence,
+  {
+    payload: ForkGithubPullRequestEvidenceSubmit,
+    success: ForkGithubPullRequestEvidenceStatus,
+    error: ForkGithubRpcError,
+  },
+);
+const WsForkGithubPullRequestEvidenceStatusRpc = Rpc.make(
+  WS_METHODS.forkGithubPullRequestEvidenceStatus,
+  {
+    payload: Schema.Struct({ requestId: Schema.String }),
+    success: Schema.NullOr(ForkGithubPullRequestEvidenceStatus),
+    error: ForkGithubRpcError,
+  },
+);
 
 const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
   payload: Schema.Struct({}),
@@ -1507,6 +1527,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsForkGithubSubmitPromotionRpc,
   WsForkGithubSubmitDraftRpc,
   WsForkGithubStatusRpc,
+  WsForkGithubSubmitPullRequestEvidenceRpc,
+  WsForkGithubPullRequestEvidenceStatusRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,

@@ -118,6 +118,13 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  forkGithubCandidateStorageManifestPath: Config.string(
+    "T3CODE_FORK_GITHUB_CANDIDATE_STORAGE_MANIFEST",
+  ).pipe(Config.option, Config.map(Option.getOrUndefined)),
+  forkGithubOfflineSnapshotPath: Config.string("T3CODE_FORK_GITHUB_OFFLINE_SNAPSHOT").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devAllowedOrigins: Config.string("T3CODE_DEV_ALLOWED_ORIGINS").pipe(
     Config.withDefault(""),
@@ -418,6 +425,12 @@ export const resolveServerConfig = (
       ...(env.forkGithubConfigPath === undefined
         ? {}
         : { forkGithubConfigPath: env.forkGithubConfigPath }),
+      ...(env.forkGithubCandidateStorageManifestPath === undefined
+        ? {}
+        : { forkGithubCandidateStorageManifestPath: env.forkGithubCandidateStorageManifestPath }),
+      ...(env.forkGithubOfflineSnapshotPath === undefined
+        ? {}
+        : { forkGithubOfflineSnapshotPath: env.forkGithubOfflineSnapshotPath }),
       desktopTelemetryFd,
       desktopTelemetryControlFd,
       resourceMonitorPath,

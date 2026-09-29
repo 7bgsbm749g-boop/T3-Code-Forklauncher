@@ -7,6 +7,7 @@ import * as NodeProcess from "node:process";
 import * as NodeStream from "node:stream";
 import * as NodeStringDecoder from "node:string_decoder";
 import * as NodeTimers from "node:timers";
+import * as CandidateProcess from "./ForkGithubCandidateProcess.ts";
 
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -98,6 +99,7 @@ export interface ForkGithubCandidateExecutionInput {
 export interface ForkGithubCandidateExecutionDiagnostic {
   readonly stage:
     | "spawned"
+    | "candidate-spawned"
     | "stdout"
     | "stderr"
     | "timeout"
@@ -108,7 +110,10 @@ export interface ForkGithubCandidateExecutionDiagnostic {
   readonly phase: "preflight" | "install" | "prepare" | "validation";
   readonly pid?: number;
   readonly processGroup?: number;
+  readonly sessionId?: number;
   readonly processStartTicks?: string;
+  readonly processBootId?: string;
+  readonly processPidNamespace?: string;
   readonly text?: string;
   readonly truncated?: boolean;
   readonly exitCode?: number | null;
@@ -682,20 +687,16 @@ const prepareHome = (path: string, snapshot?: OfflineToolchainSnapshot) => {
 };
 
 const processIdentity = (pid: number) => {
-  try {
-    const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat
-      .slice(stat.lastIndexOf(")") + 2)
-      .trim()
-      .split(/\s+/);
-    const processGroup = Number(fields[2]);
-    const processStartTicks = fields[19];
-    return processGroup === pid && processStartTicks
-      ? { processGroup, processStartTicks }
-      : undefined;
-  } catch {
+  const identity = CandidateProcess.makeForkGithubCandidateProcessOperations().readIdentity(pid);
+  if (!CandidateProcess.isForkGithubCandidateSessionLeader(identity, pid) || !identity)
     return undefined;
-  }
+  return {
+    processGroup: identity.processGroup,
+    sessionId: identity.sessionId,
+    processStartTicks: identity.startTicks,
+    processBootId: identity.bootId,
+    processPidNamespace: identity.pidNamespace,
+  };
 };
 
 const guestFilesystemArgs = (input: {
@@ -1000,18 +1001,29 @@ export const ForkGithubCandidateExecutorBubblewrap = (toolchain: BubblewrapToolc
           let resolveClosed!: () => void;
           const closed = new Promise<void>((resolve) => (resolveClosed = resolve));
           let child: NodeChildProcess.ChildProcessByStdio<
-            null,
+            NodeStream.Writable,
             NodeStream.Readable,
             NodeStream.Readable
           >;
           try {
-            child = NodeChildProcess.spawn(bubblewrapPath!, input.args, {
-              cwd: input.cwd,
-              env: {},
-              shell: false,
-              detached: true,
-              stdio: ["ignore", "pipe", "pipe"],
-            });
+            child = NodeChildProcess.spawn(
+              NodeProcess.execPath,
+              [
+                "-e",
+                CandidateProcess.FORK_GITHUB_CANDIDATE_SUPERVISOR,
+                bubblewrapPath!,
+                ...input.args,
+              ],
+              {
+                cwd: input.cwd,
+                env: {},
+                shell: false,
+                detached: true,
+                // fd 3 is a private reporter channel. The guard forwards only
+                // structured lifecycle receipts; candidate argv gets fds 0–2.
+                stdio: ["pipe", "pipe", "pipe", "pipe"],
+              },
+            );
           } catch {
             try {
               input.onDiagnostic?.({
@@ -1034,10 +1046,14 @@ export const ForkGithubCandidateExecutorBubblewrap = (toolchain: BubblewrapToolc
           let stderrTruncated = false;
           let timedOut = false;
           let spawnFailed = false;
+          let supervisorIdentity: CandidateProcess.ForkGithubCandidateProcessIdentity | undefined;
+          let executionResult:
+            | { readonly valid: true; readonly code: number | null; readonly signal: string | null }
+            | undefined;
+          let controlBuffer = "";
           let diagnosticHeadBytes = 0;
           const diagnosticTail: Array<{ readonly stage: "stdout" | "stderr"; bytes: Buffer }> = [];
           let diagnosticTailBytes = 0;
-          let escalation: NodeJS.Timeout | undefined;
           const stdoutDecoder = new NodeStringDecoder.StringDecoder("utf8");
           const stderrDecoder = new NodeStringDecoder.StringDecoder("utf8");
           const notify = (event: ForkGithubCandidateExecutionDiagnostic) => {
@@ -1155,37 +1171,100 @@ export const ForkGithubCandidateExecutorBubblewrap = (toolchain: BubblewrapToolc
           };
           child.stdout.on("data", (chunk: Buffer) => capture(stdout, "stdout", chunk));
           child.stderr.on("data", (chunk: Buffer) => capture(stderr, "stderr", chunk));
-          const terminate = () => {
-            if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null)
-              return;
-            const signalOwnedProcess = (signalName: NodeJS.Signals) => {
-              if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null)
-                return;
-              const identity = processIdentity(child.pid);
-              if (identity?.processGroup === child.pid) {
+          const control = child.stdio[3];
+          if (!control || !(control instanceof NodeStream.Readable)) {
+            spawnFailed = true;
+            child.stdin.end();
+          } else {
+            control.setEncoding("utf8");
+            control.on("data", (chunk: string) => {
+              controlBuffer += chunk;
+              for (;;) {
+                const newline = controlBuffer.indexOf("\n");
+                if (newline < 0) break;
+                const line = controlBuffer.slice(0, newline);
+                controlBuffer = controlBuffer.slice(newline + 1);
+                let frame: unknown;
                 try {
-                  NodeProcess.kill(-child.pid, signalName);
+                  frame = JSON.parse(line);
                 } catch {
-                  // A concurrent close is handled by the close listener below.
+                  continue;
                 }
-              } else {
-                // Bubblewrap's PID namespace init has --die-with-parent. If it
-                // has left its launch group, signal that captured process;
-                // never guess at or signal a now-shared process group.
-                try {
-                  child.kill(signalName);
-                } catch {
-                  // A concurrent close is handled by the close listener below.
+                if (typeof frame !== "object" || frame === null || !("type" in frame)) continue;
+                if (frame.type === "guard-started" && "identity" in frame) {
+                  const identity =
+                    frame.identity as CandidateProcess.ForkGithubCandidateProcessIdentity | null;
+                  if (
+                    identity &&
+                    CandidateProcess.isForkGithubCandidateSessionLeader(identity, identity.pid)
+                  ) {
+                    supervisorIdentity = identity;
+                    notify({
+                      stage: "spawned",
+                      command: input.command,
+                      phase: input.phase,
+                      pid: identity.pid,
+                      processGroup: identity.processGroup,
+                      sessionId: identity.sessionId,
+                      processStartTicks: identity.startTicks,
+                      processBootId: identity.bootId,
+                      processPidNamespace: identity.pidNamespace,
+                    });
+                  }
+                } else if (
+                  frame.type === "candidate-started" &&
+                  "identity" in frame &&
+                  typeof frame.identity === "object" &&
+                  frame.identity !== null &&
+                  supervisorIdentity !== undefined
+                ) {
+                  const identity =
+                    frame.identity as CandidateProcess.ForkGithubCandidateProcessIdentity;
+                  if (
+                    Number.isSafeInteger(identity.pid) &&
+                    identity.pid > 0 &&
+                    identity.processGroup === supervisorIdentity.processGroup &&
+                    identity.sessionId === supervisorIdentity.sessionId &&
+                    /^[0-9]+$/.test(identity.startTicks) &&
+                    identity.bootId === supervisorIdentity.bootId &&
+                    identity.pidNamespace === supervisorIdentity.pidNamespace
+                  ) {
+                    notify({
+                      stage: "candidate-spawned",
+                      command: input.command,
+                      phase: input.phase,
+                      pid: identity.pid,
+                      processGroup: identity.processGroup,
+                      sessionId: identity.sessionId,
+                      processStartTicks: identity.startTicks,
+                      processBootId: identity.bootId,
+                      processPidNamespace: identity.pidNamespace,
+                    });
+                  }
+                } else if (
+                  frame.type === "execution-result" &&
+                  "valid" in frame &&
+                  frame.valid === true &&
+                  "code" in frame &&
+                  (frame.code === null || typeof frame.code === "number") &&
+                  "signal" in frame &&
+                  (frame.signal === null || typeof frame.signal === "string")
+                ) {
+                  executionResult = {
+                    valid: true,
+                    code: frame.code,
+                    signal: frame.signal,
+                  };
                 }
               }
-            };
-            signalOwnedProcess("SIGTERM");
-            // @effect-diagnostics-next-line globalTimers:off -- This timer escalates the captured bubblewrap child after SIGTERM.
-            escalation = NodeTimers.setTimeout(() => {
-              if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null)
-                return;
-              signalOwnedProcess("SIGKILL");
-            }, 250);
+            });
+          }
+          const terminate = () => {
+            if (child.exitCode !== null || child.signalCode !== null) return;
+            // The detached trusted supervisor owns its group and performs TERM
+            // plus KILL escalation itself. Closing this private pipe is safe
+            // even if the supervisor has already exited; no host group is guessed.
+            child.stdin.end();
           };
           // @effect-diagnostics-next-line globalTimersInEffect:off -- This timer enforces the bounded external process timeout.
           const timeout = NodeTimers.setTimeout(() => {
@@ -1225,34 +1304,50 @@ export const ForkGithubCandidateExecutorBubblewrap = (toolchain: BubblewrapToolc
           });
           child.once("close", (code, signalName) => {
             clearTimeout(timeout);
-            if (escalation) clearTimeout(escalation);
             signal.removeEventListener("abort", onAbort);
             emitText("stdout", stdoutDecoder.end());
             emitText("stderr", stderrDecoder.end());
             flushDiagnosticTail();
+            const result = executionResult;
             notify({
               stage: "exit",
               command: input.command,
               phase: input.phase,
-              ...(child.pid === undefined ? {} : { pid: child.pid }),
-              ...(child.pid === undefined ? {} : processIdentity(child.pid)),
-              exitCode: code,
-              signal: signalName,
+              ...(supervisorIdentity === undefined ? {} : { pid: supervisorIdentity.pid }),
+              ...(supervisorIdentity === undefined ? {} : processIdentity(supervisorIdentity.pid)),
+              exitCode: result === undefined ? code : result.code,
+              signal: result === undefined ? signalName : result.signal,
               timedOut,
             });
             resolveClosed();
             if (signal.aborted) {
               return;
             }
-            if (spawnFailed) {
-              resume(Effect.fail(failed("Bubblewrap candidate command could not be spawned.")));
+            if (spawnFailed || !result || !supervisorIdentity) {
+              resume(
+                Effect.fail(
+                  failed(
+                    "Bubblewrap supervisor did not provide a valid quiescent execution receipt.",
+                  ),
+                ),
+              );
+            } else if (
+              (result.code !== null && (code !== result.code || result.signal !== null)) ||
+              (result.code === null &&
+                (code !== 128 || result.signal === null || signalName !== null))
+            ) {
+              resume(
+                Effect.fail(
+                  failed("Bubblewrap supervisor receipt did not match its process exit."),
+                ),
+              );
             } else {
               resume(
                 Effect.succeed({
                   stdout: Buffer.concat(stdout).toString("utf8"),
                   stderr: Buffer.concat(stderr).toString("utf8"),
-                  code: code === null ? null : code,
-                  signal: signalName,
+                  code: result.code,
+                  signal: result.signal,
                   timedOut,
                   stdoutTruncated,
                   stderrTruncated,
@@ -1263,13 +1358,6 @@ export const ForkGithubCandidateExecutorBubblewrap = (toolchain: BubblewrapToolc
             }
           });
           child.once("spawn", () => {
-            notify({
-              stage: "spawned",
-              command: input.command,
-              phase: input.phase,
-              ...(child.pid === undefined ? {} : { pid: child.pid }),
-              ...(child.pid === undefined ? {} : processIdentity(child.pid)),
-            });
             if (signal.aborted) terminate();
           });
           signal.addEventListener("abort", onAbort, { once: true });

@@ -61,6 +61,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.forkGithubSubmitPromotion]: AuthOrchestrationOperateScope,
   [WS_METHODS.forkGithubSubmitDraft]: AuthOrchestrationOperateScope,
   [WS_METHODS.forkGithubStatus]: AuthOrchestrationReadScope,
+  [WS_METHODS.forkGithubSubmitPullRequestEvidence]: AuthOrchestrationOperateScope,
+  [WS_METHODS.forkGithubPullRequestEvidenceStatus]: AuthOrchestrationReadScope,
   [WS_METHODS.serverDiscoverSourceControl]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetTraceDiagnostics]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetProcessDiagnostics]: AuthOrchestrationReadScope,
