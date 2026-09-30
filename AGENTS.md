@@ -103,6 +103,25 @@ An empty database is a bad test. Seed your worktree's `.t3` with a copy of real 
 
 ## Verifying
 
+> **VPS MEMORY PROTECTION — full server checks belong in hosted CI.**
+> Agents must not run the full server TypeScript check or an equivalent heavy
+> typecheck/build on this VPS. This includes `vp run --filter t3 typecheck` and
+> `tsc --noEmit` from `apps/server`: filtering to the server still loads all
+> server source and tests, so the no-repo-wide-checks rule alone is insufficient.
+>
+> Measured on 2026-09-30: individual `tsc` jobs reached approximately
+> **5.2–6.0 GiB RSS** on this **7.6 GiB RAM VPS**, which also runs live T3 and
+> other services. The Linux kernel OOM-killed four compiler jobs at **19:20,
+> 20:20, 20:24 and 20:54 UTC**.
+>
+> Use focused local tests/lint and **exact-commit hosted CI for the full check**.
+> If a local heavy check is ever necessary, first demonstrate a safe memory
+> budget that preserves headroom for the live services and enforce an isolated
+> hard memory limit before starting it. **Do not simply retry an exit-137 job.**
+> This is a project-specific VPS resource rule, not permission to skip final
+> validation; a killed local check is incomplete, and the full validation must
+> still pass.
+
 - Smallest proof that the change works. `vp test run <files>` for the tests you touched, targeted lint and typecheck for the scope you changed.
 - Test meaningful logic or observable behavior. Do not render components to static markup to assert props or attributes, or add tests that merely assert callback wiring or mirror the implementation.
 - **Do not run repo-wide checks.** No `vp check`, no `vp run -r test`, no `vp run -r typecheck` unless I ask. CI owns the full suite.
