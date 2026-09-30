@@ -30,26 +30,33 @@ const sampleDecoded = <S extends Schema.Constraint>(schema: S) =>
 const encodeSnapshot = Schema.encodeEffect(OrchestrationShellSnapshot);
 
 describe("encodeShellSnapshotForCache", () => {
-  it.effect("matches the Schema encoding of a generated snapshot", () =>
-    Effect.gen(function* () {
-      const threads = yield* sampleDecoded(OrchestrationThreadShell);
-      const projects = yield* sampleDecoded(OrchestrationProjectShell);
-      const snapshot: OrchestrationShellSnapshot = {
-        snapshotSequence: 1,
-        // The generator rarely makes monogram icons, and they are the one
-        // project field whose encoding differs from the decoded value.
-        projects: projects.map((project, index) =>
-          index % 2 === 0
-            ? { ...project, projectIcon: { kind: "monogram", text: "T3", color: "blue" } }
-            : project,
-        ),
-        threads,
-        updatedAt: "2026-09-25T00:00:00.000Z",
-      };
+  // The full-workspace CI test shard can run this 1000-value round trip under
+  // heavy contention; keep the coverage and give that bounded CPU work room.
+  it.effect(
+    "matches the Schema encoding of a generated snapshot",
+    () =>
+      Effect.gen(function* () {
+        const threads = yield* sampleDecoded(OrchestrationThreadShell);
+        const projects = yield* sampleDecoded(OrchestrationProjectShell);
+        const snapshot: OrchestrationShellSnapshot = {
+          snapshotSequence: 1,
+          // The generator rarely makes monogram icons, and they are the one
+          // project field whose encoding differs from the decoded value.
+          projects: projects.map((project, index) =>
+            index % 2 === 0
+              ? { ...project, projectIcon: { kind: "monogram", text: "T3", color: "blue" } }
+              : project,
+          ),
+          threads,
+          updatedAt: "2026-09-25T00:00:00.000Z",
+        };
 
-      expect(threads.length).toBeGreaterThan(0);
-      expect(projects.length).toBeGreaterThan(0);
-      expect(yield* encodeShellSnapshotForCache(snapshot)).toEqual(yield* encodeSnapshot(snapshot));
-    }),
+        expect(threads.length).toBeGreaterThan(0);
+        expect(projects.length).toBeGreaterThan(0);
+        expect(yield* encodeShellSnapshotForCache(snapshot)).toEqual(
+          yield* encodeSnapshot(snapshot),
+        );
+      }),
+    30_000,
   );
 });
