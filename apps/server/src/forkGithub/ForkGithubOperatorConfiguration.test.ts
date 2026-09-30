@@ -373,13 +373,18 @@ it.effect(
 
       const bypass = makeFile();
       bypass.directPushBypass = true;
-      const invalidBypass = yield* runCase(bypass);
-      assert.isTrue(Result.isFailure(invalidBypass));
-      if (Result.isFailure(invalidBypass))
-        assert.equal(
-          invalidBypass.failure.message,
-          "directPushBypass is unsupported; custom updates remain gated",
-        );
+      const enabledBypass = yield* runCase(bypass);
+      assert.isTrue(Result.isSuccess(enabledBypass));
+      if (Result.isSuccess(enabledBypass)) {
+        assert.isTrue(enabledBypass.success.configuration?.directPushBypass);
+        assert.isTrue(enabledBypass.success.configuration?.gatePolicy.directPushBypass);
+        assert.deepEqual(enabledBypass.success.configuration?.gatePolicy.target, {
+          owner: "7bgsbm749g-boop",
+          repository: "T3-Code-Forklauncher",
+          repositoryId: 987654321,
+          branch: "forklauncher",
+        });
+      }
 
       const malformedPin = makeFile();
       malformedPin.candidateWorkflow.workflowFiles[0]!.sha256 = "bad";

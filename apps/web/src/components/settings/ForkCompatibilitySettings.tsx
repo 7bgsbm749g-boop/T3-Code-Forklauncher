@@ -11,6 +11,10 @@ import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import {
+  acknowledgeCustomUpdate,
+  customUpdateStatusMatchesRequest,
+  describeCustomUpdateStatus,
+  startCustomUpdate,
   acknowledgePullRequestEvidence,
   describePullRequestEvidenceStatus,
   describePullRequestPublication,
@@ -22,7 +26,10 @@ import {
   rememberPendingForkCheck,
   startPullRequestEvidence,
 } from "@t3tools/client-runtime/state/fork-compatibility-ui";
-import type { ForkGithubPullRequestEvidenceStatus } from "@t3tools/contracts";
+import type {
+  ForkGithubCustomUpdateStatus,
+  ForkGithubPullRequestEvidenceStatus,
+} from "@t3tools/contracts";
 
 const REQUEST_ID_SCHEMA = Schema.NullOr(Schema.String);
 const PENDING_CHECKS_SCHEMA = Schema.NullOr(
@@ -36,6 +43,16 @@ const PENDING_CHECKS_SCHEMA = Schema.NullOr(
 const PULL_REQUEST_EVIDENCE_SCHEMA = Schema.NullOr(
   Schema.Struct({
     number: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(2_147_483_647)),
+    requestId: Schema.String.check(
+      Schema.isPattern(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      ),
+    ),
+    state: Schema.Literals(["uncertain", "active"]),
+  }),
+);
+const CUSTOM_UPDATE_REQUEST_SCHEMA = Schema.NullOr(
+  Schema.Struct({
     requestId: Schema.String.check(
       Schema.isPattern(
         /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
@@ -65,6 +82,12 @@ export function ForkCompatibilitySettings() {
     serverEnvironment.forkGithubPullRequestEvidenceStatus,
     { reportFailure: false },
   );
+  const submitCustomUpdate = useAtomCommand(serverEnvironment.forkGithubSubmitCustomUpdate, {
+    reportFailure: false,
+  });
+  const readCustomUpdateStatus = useAtomCommand(serverEnvironment.forkGithubCustomUpdateStatus, {
+    reportFailure: false,
+  });
   const readStatus = useAtomCommand(serverEnvironment.forkCompatibilityStatus, {
     reportFailure: false,
   });
@@ -116,6 +139,11 @@ export function ForkCompatibilitySettings() {
     `fork-compatibility:pull-request-evidence:${environmentId ?? "none"}`,
     null,
     PULL_REQUEST_EVIDENCE_SCHEMA,
+  );
+  const [customUpdateRequest, setCustomUpdateRequest] = useLocalStorage(
+    `fork-compatibility:custom-update:${environmentId ?? "none"}`,
+    null,
+    CUSTOM_UPDATE_REQUEST_SCHEMA,
   );
   const [pullRequestDraft, setPullRequestDraft] = useState<{
     readonly environmentId: string | null;
@@ -170,6 +198,19 @@ export function ForkCompatibilitySettings() {
     environmentId,
     pullRequestRequest?.requestId ?? null,
   ]);
+  const customUpdateIdentity = JSON.stringify([
+    environmentId,
+    customUpdateRequest?.requestId ?? null,
+    connected,
+  ]);
+  const customUpdateEpoch = useRef(new IdentityEpoch(customUpdateIdentity)).current;
+  const customUpdateToken = customUpdateEpoch.update(customUpdateIdentity);
+  const [customUpdateStatusEntry, setCustomUpdateStatusEntry] = useState<{
+    readonly token: IdentityToken;
+    readonly value: ForkGithubCustomUpdateStatus | null;
+    readonly error: string | null;
+  } | null>(null);
+  const [customUpdateBusyIdentity, setCustomUpdateBusyIdentity] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<{
     readonly token: IdentityToken;
     readonly message: string;
@@ -192,6 +233,132 @@ export function ForkCompatibilitySettings() {
   const pullRequestStatusError =
     pullRequestStatusEntry?.token === pullRequestToken ? pullRequestStatusEntry.error : null;
   const pullRequestBusy = pullRequestBusyIdentity === pullRequestRequestIdentity;
+  const customUpdateBusy = customUpdateBusyIdentity === customUpdateIdentity;
+  const customUpdateStatus =
+    customUpdateStatusEntry?.token === customUpdateToken &&
+    customUpdateStatusMatchesRequest(customUpdateStatusEntry.value, customUpdateRequest)
+      ? customUpdateStatusEntry.value
+      : null;
+  const customUpdateStatusError =
+    customUpdateStatusEntry?.token === customUpdateToken ? customUpdateStatusEntry.error : null;
+
+  const refreshCustomUpdateStatus = useCallback(async () => {
+    const token = customUpdateToken;
+    const targetEnvironmentId = environmentId;
+    const targetRequestId = customUpdateRequest?.requestId;
+    if (!targetEnvironmentId || !targetRequestId || !connected) return;
+    const identity = JSON.stringify([targetEnvironmentId, targetRequestId]);
+    setCustomUpdateBusyIdentity(identity);
+    try {
+      const result = await readCustomUpdateStatus({
+        environmentId: targetEnvironmentId,
+        input: { requestId: targetRequestId },
+      });
+      if (!customUpdateEpoch.isCurrent(token)) return;
+      const value = result._tag === "Success" ? result.value : null;
+      const matches =
+        value === null || customUpdateStatusMatchesRequest(value, customUpdateRequest);
+      setCustomUpdateStatusEntry((current) => {
+        if (
+          matches &&
+          result._tag === "Success" &&
+          value === null &&
+          current?.token === token &&
+          current.value
+        )
+          return current;
+        return {
+          token,
+          value: matches ? value : null,
+          error: !matches
+            ? "The server returned status for a different update request."
+            : result._tag === "Failure"
+              ? "Could not refresh update status. Reconnect and retry."
+              : value === null
+                ? "No accepted update is recorded yet. Retry with this request ID."
+                : null,
+        };
+      });
+    } catch {
+      if (customUpdateEpoch.isCurrent(token))
+        setCustomUpdateStatusEntry({
+          token,
+          value: null,
+          error: "Could not refresh update status. Reconnect and retry.",
+        });
+    } finally {
+      setCustomUpdateBusyIdentity((current) => (current === identity ? null : current));
+    }
+  }, [
+    connected,
+    customUpdateEpoch,
+    customUpdateRequest,
+    customUpdateToken,
+    environmentId,
+    readCustomUpdateStatus,
+  ]);
+
+  const requestCustomUpdate = async (newRequest = false) => {
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId || !connected) return;
+    const request =
+      !newRequest && customUpdateRequest ? customUpdateRequest : startCustomUpdate(randomUUID);
+    if (request !== customUpdateRequest) {
+      setCustomUpdateRequest(request);
+      setCustomUpdateStatusEntry(null);
+    }
+    const identity = JSON.stringify([targetEnvironmentId, request.requestId]);
+    setCustomUpdateBusyIdentity(identity);
+    try {
+      const result = await submitCustomUpdate({
+        environmentId: targetEnvironmentId,
+        input: { requestId: request.requestId },
+      });
+      if (result._tag === "Failure") {
+        if (environmentId === targetEnvironmentId) {
+          setCustomUpdateRequest({ ...request, state: "uncertain" });
+          const responseToken = customUpdateEpoch.update(
+            JSON.stringify([targetEnvironmentId, request.requestId, connected]),
+          );
+          setCustomUpdateStatusEntry({
+            token: responseToken,
+            value: null,
+            error: "The response was not received. Retry to reuse this request ID.",
+          });
+        }
+        return;
+      }
+      if (environmentId === targetEnvironmentId) {
+        const responseIdentity = JSON.stringify([
+          targetEnvironmentId,
+          request.requestId,
+          connected,
+        ]);
+        const responseToken = customUpdateEpoch.update(responseIdentity);
+        const matches = customUpdateStatusMatchesRequest(result.value, request);
+        setCustomUpdateRequest(acknowledgeCustomUpdate(request, request.requestId));
+        setCustomUpdateStatusEntry({
+          token: responseToken,
+          value: matches ? result.value : null,
+          error: matches ? null : "The server response did not match this update request.",
+        });
+      }
+    } catch {
+      if (environmentId === targetEnvironmentId) {
+        setCustomUpdateRequest({ ...request, state: "uncertain" });
+        const responseToken = customUpdateEpoch.update(
+          JSON.stringify([targetEnvironmentId, request.requestId, connected]),
+        );
+        setCustomUpdateStatusEntry({
+          token: responseToken,
+          value: null,
+          error: "The response was not received. Retry to reuse this request ID.",
+        });
+      }
+    } finally {
+      setCustomUpdateBusyIdentity((current) => (current === identity ? null : current));
+    }
+  };
 
   const refreshPullRequestStatus = useCallback(async () => {
     const token = pullRequestToken;
@@ -337,6 +504,10 @@ export function ForkCompatibilitySettings() {
   useEffect(() => {
     if (connected && pullRequestRequest?.requestId) void refreshPullRequestStatus();
   }, [connected, environmentId, pullRequestRequest?.requestId, refreshPullRequestStatus]);
+
+  useEffect(() => {
+    if (connected && customUpdateRequest?.requestId) void refreshCustomUpdateStatus();
+  }, [connected, environmentId, customUpdateRequest?.requestId, refreshCustomUpdateStatus]);
 
   useEffect(() => {
     void refreshScheduleStatus();
@@ -727,6 +898,84 @@ export function ForkCompatibilitySettings() {
           <p className="text-xs text-muted-foreground">
             No PR validation request is stored for this server. Connect to a configured server to
             begin.
+          </p>
+        )}
+      </div>
+      <div className="space-y-2 border-t px-4 py-3 text-sm" aria-live="polite">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">Custom branch update:</span>
+          <span>
+            {customUpdateRequest?.state === "uncertain" && !customUpdateStatus
+              ? "Response uncertain"
+              : describeCustomUpdateStatus(customUpdateStatus).label}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!connected || customUpdateBusy}
+            onClick={() =>
+              void requestCustomUpdate(
+                customUpdateStatus !== null && customUpdateStatus.status !== "pending",
+              )
+            }
+          >
+            {customUpdateBusy
+              ? "Working…"
+              : !customUpdateRequest
+                ? "Update configured branch"
+                : customUpdateRequest.state === "uncertain" && !customUpdateStatus
+                  ? "Retry update"
+                  : customUpdateStatus && customUpdateStatus.status !== "pending"
+                    ? "Start new update"
+                    : "Resume update"}
+          </Button>
+          {customUpdateRequest ? (
+            <Button
+              size="xs"
+              variant="ghost"
+              disabled={!connected || customUpdateBusy}
+              onClick={() => void refreshCustomUpdateStatus()}
+            >
+              <RefreshCwIcon className="size-3" /> Refresh
+            </Button>
+          ) : null}
+        </div>
+        {customUpdateRequest ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              {customUpdateStatus
+                ? describeCustomUpdateStatus(customUpdateStatus).detail
+                : (customUpdateStatusError ??
+                  "The server may have accepted this update. Retry with the saved request ID or refresh status.")}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {customUpdateStatus
+                ? describeCustomUpdateStatus(customUpdateStatus).validation
+                : "The server chooses the configured validation or explicit operator bypass mode."}
+            </p>
+            {customUpdateStatus ? (
+              <p className="break-all text-xs text-muted-foreground">
+                {customUpdateStatus.sourceRepository}@{customUpdateStatus.sourceRef} ·{" "}
+                {customUpdateStatus.sourceSha} → {customUpdateStatus.targetRepository}{" "}
+                {customUpdateStatus.targetRef} (expected {customUpdateStatus.expectedTargetSha})
+              </p>
+            ) : null}
+            {customUpdateStatus && customUpdateStatus.status !== "pending" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={!connected || customUpdateBusy}
+                onClick={() => setCustomUpdateRequest(null)}
+              >
+                Reset request
+              </Button>
+            ) : null}
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            This submits the server-configured source checkout to its configured remote branch. It
+            does not install or replace the running server. Configure a source checkout on the
+            server first.
           </p>
         )}
       </div>

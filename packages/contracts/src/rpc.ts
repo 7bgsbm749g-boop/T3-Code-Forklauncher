@@ -18,6 +18,8 @@ import {
   ForkGithubPromotionCommand,
   ForkGithubPullRequestEvidenceSubmit,
   ForkGithubPullRequestEvidenceStatus,
+  ForkGithubCustomUpdateSubmit,
+  ForkGithubCustomUpdateStatus,
 } from "./forkGithub.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
@@ -400,6 +402,8 @@ export const WS_METHODS = {
   forkGithubStatus: "forkGithub.status",
   forkGithubSubmitPullRequestEvidence: "forkGithub.submitPullRequestEvidence",
   forkGithubPullRequestEvidenceStatus: "forkGithub.pullRequestEvidenceStatus",
+  forkGithubSubmitCustomUpdate: "forkGithub.submitCustomUpdate",
+  forkGithubCustomUpdateStatus: "forkGithub.customUpdateStatus",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
@@ -716,6 +720,16 @@ const WsForkGithubPullRequestEvidenceStatusRpc = Rpc.make(
     error: ForkGithubRpcError,
   },
 );
+const WsForkGithubSubmitCustomUpdateRpc = Rpc.make(WS_METHODS.forkGithubSubmitCustomUpdate, {
+  payload: ForkGithubCustomUpdateSubmit,
+  success: ForkGithubCustomUpdateStatus,
+  error: ForkGithubRpcError,
+});
+const WsForkGithubCustomUpdateStatusRpc = Rpc.make(WS_METHODS.forkGithubCustomUpdateStatus, {
+  payload: Schema.Struct({ requestId: Schema.String }),
+  success: Schema.NullOr(ForkGithubCustomUpdateStatus),
+  error: ForkGithubRpcError,
+});
 
 const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
   payload: Schema.Struct({}),
@@ -1529,6 +1543,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsForkGithubStatusRpc,
   WsForkGithubSubmitPullRequestEvidenceRpc,
   WsForkGithubPullRequestEvidenceStatusRpc,
+  WsForkGithubSubmitCustomUpdateRpc,
+  WsForkGithubCustomUpdateStatusRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,

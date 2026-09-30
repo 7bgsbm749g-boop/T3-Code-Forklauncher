@@ -63,6 +63,26 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       updatedAt: "2026-01-01T00:00:00.000Z",
       diagnostic: "pending",
     } as const;
+    const customUpdate = {
+      requestId: "123e4567-e89b-42d3-a456-426614174001",
+      operationId: "fork-custom-update:123e4567-e89b-42d3-a456-426614174001",
+      status: "pending",
+      mode: "validated",
+      sourceRepository: "owner/fork",
+      sourceRef: "refs/heads/forklauncher",
+      sourceSha: "a".repeat(40),
+      sourceTreeSha: "b".repeat(40),
+      targetRepository: "owner/fork",
+      targetRepositoryId: 7,
+      targetRef: "refs/heads/forklauncher",
+      expectedTargetSha: "c".repeat(40),
+      candidateSha: "a".repeat(40),
+      validation: "pending",
+      resultSha: null,
+      diagnostic: "pending",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    } as const;
     const schedule = {
       enabled: true,
       sourceDirectory: "/fixture/fork",
@@ -107,6 +127,14 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       [WS_METHODS.forkGithubPullRequestEvidenceStatus]: rpc(
         WS_METHODS.forkGithubPullRequestEvidenceStatus,
         prEvidence,
+      ),
+      [WS_METHODS.forkGithubSubmitCustomUpdate]: rpc(
+        WS_METHODS.forkGithubSubmitCustomUpdate,
+        customUpdate,
+      ),
+      [WS_METHODS.forkGithubCustomUpdateStatus]: rpc(
+        WS_METHODS.forkGithubCustomUpdateStatus,
+        customUpdate,
       ),
       [WS_METHODS.forkCompatibilityScheduleStatus]: rpc(
         WS_METHODS.forkCompatibilityScheduleStatus,
@@ -201,6 +229,18 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       }),
     ).toMatchObject({ _tag: "Success", value: prEvidence });
     expect(
+      yield* invoke(atoms.forkGithubSubmitCustomUpdate, {
+        environmentId,
+        input: { requestId: customUpdate.requestId },
+      }),
+    ).toMatchObject({ _tag: "Success", value: customUpdate });
+    expect(
+      yield* invoke(atoms.forkGithubCustomUpdateStatus, {
+        environmentId,
+        input: { requestId: customUpdate.requestId },
+      }),
+    ).toMatchObject({ _tag: "Success", value: customUpdate });
+    expect(
       yield* invoke(atoms.forkCompatibilityScheduleStatus, { environmentId, input: {} }),
     ).toMatchObject({
       _tag: "Success",
@@ -214,6 +254,8 @@ it.effect("routes typed GitHub commands through the environment RPC client", () 
       WS_METHODS.forkGithubStatus,
       WS_METHODS.forkGithubSubmitPullRequestEvidence,
       WS_METHODS.forkGithubPullRequestEvidenceStatus,
+      WS_METHODS.forkGithubSubmitCustomUpdate,
+      WS_METHODS.forkGithubCustomUpdateStatus,
       WS_METHODS.forkCompatibilityScheduleStatus,
     ]);
     registry.dispose();

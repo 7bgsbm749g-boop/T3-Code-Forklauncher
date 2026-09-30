@@ -55,10 +55,15 @@ describe("RPC authorization scopes", () => {
       WS_METHODS.forkGithubConfigure,
       WS_METHODS.forkGithubSubmitPromotion,
       WS_METHODS.forkGithubSubmitDraft,
+      WS_METHODS.forkGithubSubmitCustomUpdate,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
     }
-    for (const method of [WS_METHODS.forkGithubRead, WS_METHODS.forkGithubStatus]) {
+    for (const method of [
+      WS_METHODS.forkGithubRead,
+      WS_METHODS.forkGithubStatus,
+      WS_METHODS.forkGithubCustomUpdateStatus,
+    ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
     }
   });
@@ -69,6 +74,7 @@ describe("RPC authorization scopes", () => {
         WS_METHODS.forkGithubConfigure,
         WS_METHODS.forkGithubSubmitPromotion,
         WS_METHODS.forkGithubSubmitDraft,
+        WS_METHODS.forkGithubSubmitCustomUpdate,
       ]) {
         const error = yield* Effect.flip(
           authorizeRpcEffect([], requiredScopeForRpcMethod(method), Effect.succeed("must not run")),

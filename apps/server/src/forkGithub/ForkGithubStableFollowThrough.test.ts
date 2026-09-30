@@ -39,6 +39,7 @@ import Migration056 from "../persistence/Migrations/056_ForkGithubActions.ts";
 import Migration057 from "../persistence/Migrations/057_ForkCompatibilitySchedule.ts";
 import Migration058 from "../persistence/Migrations/058_ForkCompatibilityScheduleGeneration.ts";
 import Migration061 from "../persistence/Migrations/061_ForkGithubAutomaticPromotionIntents.ts";
+import Migration063 from "../persistence/Migrations/063_ForkGithubCustomUpdateOperations.ts";
 import * as Github from "./ForkGithubAdapter.ts";
 import * as Evidence from "./ForkGithubNativeEvidence.ts";
 import * as Native from "./ForkGithubNativeService.ts";
@@ -50,6 +51,7 @@ import * as Promotion from "./ForkGithubStablePromotion.ts";
 import * as Draft from "./ForkGithubDraftReleasePreparation.ts";
 import * as Artifacts from "./ForkGithubCandidateArtifactSource.ts";
 import * as CandidateBuild from "./ForkGithubCandidateBuildService.ts";
+import * as CustomCheckoutEvidence from "./ForkGithubCustomCheckoutEvidence.ts";
 
 const now = "2026-09-28T00:00:00.000Z";
 const sourceSha = "a".repeat(40);
@@ -92,6 +94,7 @@ const migratedLayer = (database: Layer.Layer<SqlClient.SqlClient, SqlError.SqlEr
     Migration057,
     Migration058,
     Migration061,
+    Migration063,
   ];
   return migrations.reduce((prior, migration) => migrate(prior, migration), database);
 };
@@ -101,6 +104,7 @@ const readyConfiguration: Operator.ForkGithubOperatorConfiguration = {
   repositoryId: 321,
   nativeAppId: 654,
   automaticStablePromotion: true,
+  directPushBypass: false,
   validationProfile: { ...profile, sha256: profileSha },
   gatePolicy: {
     sha256: "d".repeat(64),
@@ -368,6 +372,8 @@ const makeRuntime = (
         submitScheduledDraft: () => Effect.die("automatic draft not used in this fixture"),
         submitPullRequestEvidence: () => Effect.die("PR evidence is not used in this fixture"),
         pullRequestEvidenceStatus: () => Effect.succeed(null),
+        submitCustomUpdate: () => Effect.die("custom update is not used by this fixture"),
+        customUpdateStatus: () => Effect.succeed(null),
         wakePending: () => Effect.void,
       } satisfies Native.ForkGithubNativeServiceShape;
     }),
@@ -375,6 +381,10 @@ const makeRuntime = (
   let targetReads = 0;
   const actualNativeProviders = Layer.mergeAll(
     repositories,
+    Github.ForkGithubAdapterInert,
+    Layer.succeed(CustomCheckoutEvidence.ForkGithubCustomCheckoutSource, {
+      getSourceDirectory: () => Effect.succeed(null),
+    }),
     Layer.succeed(Github.ForkGithubCredentialResolver, {
       resolve: () =>
         Effect.succeed({ appId: 654, installationId: 987, privateKeyPem: "fixture-only" }),

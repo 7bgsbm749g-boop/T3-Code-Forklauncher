@@ -12,7 +12,7 @@ import * as Github from "./ForkGithubAdapter.ts";
 import * as Promotion from "./ForkGithubStablePromotion.ts";
 import * as Artifacts from "./ForkGithubCandidateArtifactSource.ts";
 import { ValidationProfileSchema } from "../forkCompatibility/model.ts";
-import { SERVER_VALIDATION_PROFILE } from "../forkCompatibility/ForkCompatibilityNativeService.ts";
+import { SERVER_VALIDATION_PROFILE } from "../forkCompatibility/ForkCompatibilityValidationProfile.ts";
 
 const MAX_CONFIG_BYTES = 128 * 1024;
 const CONFIG_READ_CHUNK_BYTES = 16 * 1024;
@@ -52,6 +52,8 @@ export interface ForkGithubOperatorConfiguration {
   readonly repositoryId: number;
   readonly nativeAppId: number;
   readonly automaticStablePromotion: boolean;
+  /** Only the server-mediated custom direct-update action may use this policy. */
+  readonly directPushBypass: boolean;
   readonly validationProfile: Github.TrustedValidationProfileWithHash;
   readonly gatePolicy: Github.ForkGithubGatePolicySnapshot;
   readonly workflow: Artifacts.TrustedCandidateWorkflow;
@@ -154,7 +156,6 @@ const validateAndBuild = (
     fail("nativeAppId must be a positive GitHub App id");
   if (value.target.branch !== "forklauncher")
     fail("target.branch must be forklauncher for the pinned candidate workflow");
-  if (value.directPushBypass) fail("directPushBypass is unsupported; custom updates remain gated");
   if (
     !slug.test(value.candidateWorkflow.repository) ||
     value.candidateWorkflow.repository.toLowerCase() !== value.target.repository.toLowerCase() ||
@@ -223,7 +224,7 @@ const validateAndBuild = (
     repository: value.target.repository.toLowerCase(),
     repositoryId: value.target.repositoryId,
     branch: value.target.branch,
-    directPushBypass: false,
+    directPushBypass: value.directPushBypass,
     nativeAppId: value.nativeAppId,
     automaticStablePromotion: value.automaticStablePromotion === true,
     profileSha256: profileWithHash.sha256,
@@ -243,6 +244,13 @@ const validateAndBuild = (
   const policy: Github.ForkGithubGatePolicySnapshot = {
     sha256: NodeCrypto.createHash("sha256").update(JSON.stringify(canonicalPolicy)).digest("hex"),
     requiredChecks: canonicalPolicy.requiredChecks,
+    directPushBypass: value.directPushBypass,
+    target: {
+      owner: value.target.repository.split("/")[0]!,
+      repository: value.target.repository.split("/")[1]!,
+      repositoryId: value.target.repositoryId,
+      branch: value.target.branch,
+    },
   };
   const workflow: Artifacts.TrustedCandidateWorkflow = {
     repository: value.candidateWorkflow.repository,
@@ -262,6 +270,7 @@ const validateAndBuild = (
     repositoryId: value.target.repositoryId,
     nativeAppId: value.nativeAppId,
     automaticStablePromotion: value.automaticStablePromotion === true,
+    directPushBypass: value.directPushBypass,
     validationProfile: profileWithHash,
     gatePolicy: policy,
     workflow,

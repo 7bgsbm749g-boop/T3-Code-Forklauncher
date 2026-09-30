@@ -60,14 +60,18 @@ contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/con
 The reviewed ruleset payload restricts writes to the dedicated App, its only
 bypass actor, because GitHub bypass applies to the whole ruleset. PR evidence
 and Check Run publication code exist, but ruleset activation remains blocked as
-described below. Direct-push bypass is not implemented. No human, write-role,
-or Actions actor is included.
+described below. No human, write-role, or Actions actor is included.
 
-`directPushBypass` is false and the native config rejects `true`; mediated
-custom direct updates are not exposed. Any future bypass must be limited to a
-native direct-update action. It must never waive published upstream stable
-validation. Stable metadata and ancestry come from the trusted GitHub/Git
-adapter, not caller labels.
+`directPushBypass` defaults to false and is captured in the trusted operator
+policy digest. The native adapter has a custom-PR-only action that can use the
+durable action journal and exact expected-old Git lease when that operator bit
+is true. It still binds the configured repository/branch and current PR
+head/base/merge/tree, retains non-compatibility required checks, and does not
+change the stable promotion path. This adapter primitive is not yet accepted or
+exposed by the native operation worker/RPC, so no user-facing direct-update
+request path is active. Do not change the operator file or use the primitive as
+a generic ref update. Stable metadata and ancestry come from the trusted
+GitHub/Git adapter, not caller labels.
 
 ## Ruleset generation and provisioning
 
@@ -113,7 +117,7 @@ The generated branch ruleset grants its sole bypass actor to the dedicated
 Integration App in `always` mode; a ruleset bypass actor can bypass the whole
 ruleset. Keep that App credential server-only and expose updates only through
 the native mediator. Do not add human, repository-role or Actions bypasses.
-`directPushBypass` remains false and unsupported. The current PR evidence path
+`directPushBypass` remains false in the checked-in operator config. The current PR evidence path
 has no merge-queue `merge_group` implementation; do not enable a merge queue
 until the producer and required-check identity are extended and verified for
 queue candidates. Its default PR Git fetch uses an unauthenticated
@@ -150,7 +154,8 @@ original snapshot and fail freshness checks if trust configuration changes.
 repository/App/workflow pins. Without an App ID it returns `incomplete`; it
 never invents trust. Repository slug/id, branch, profile, check App identity,
 workflow control commit and required file digests are validated together. The
-loader rejects unknown fields and `directPushBypass: true`.
+loader rejects unknown fields. The opt-in only authorizes the custom direct-update
+adapter action; it does not activate a public request path.
 
 Scheduled stable validation remains non-mutating by default. Set
 `automaticStablePromotion: true` to opt eligible scheduled requests into the

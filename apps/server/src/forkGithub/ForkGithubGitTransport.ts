@@ -10,6 +10,46 @@ const shaPattern = /^[a-f0-9]{40}$/i;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const githubRepositoryUrl = /^https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+)\.git$/i;
 
+const assertNoSymlinkPath = (path: string) => {
+  const absolute = NodePath.resolve(path);
+  const parsed = NodePath.parse(absolute);
+  let current = parsed.root;
+  for (const segment of absolute.slice(parsed.root.length).split(NodePath.sep).filter(Boolean)) {
+    current = NodePath.join(current, segment);
+    if (NodeFS.lstatSync(current).isSymbolicLink())
+      throw new Error("Git metadata path contains a symbolic link.");
+  }
+};
+
+/** Resolve object storage from filesystem metadata; never run host Git with candidate config. */
+const resolveObjectStore = (cwd: string): string => {
+  const root = NodeFS.realpathSync(cwd);
+  const gitEntry = NodePath.join(root, ".git");
+  const entryStat = NodeFS.lstatSync(gitEntry);
+  if (!entryStat.isDirectory() || entryStat.isSymbolicLink())
+    throw new Error(
+      "Trusted update transport requires a checkout with regular in-tree Git metadata.",
+    );
+  let gitDir = gitEntry;
+  assertNoSymlinkPath(gitDir);
+  gitDir = NodeFS.realpathSync(gitDir);
+  const commonDirFile = NodePath.join(gitDir, "commondir");
+  if (NodeFS.existsSync(commonDirFile))
+    throw new Error("Trusted update transport does not accept linked Git administration metadata.");
+  let commonDir = gitDir;
+  assertNoSymlinkPath(commonDir);
+  commonDir = NodeFS.realpathSync(commonDir);
+  const objects = NodePath.join(commonDir, "objects");
+  assertNoSymlinkPath(objects);
+  const objectStat = NodeFS.lstatSync(objects);
+  if (!objectStat.isDirectory() || objectStat.isSymbolicLink())
+    throw new Error("Git object storage is not a regular directory.");
+  const alternates = NodePath.join(objects, "info", "alternates");
+  if (NodeFS.existsSync(alternates))
+    throw new Error("External Git object alternates are not allowed for a leased update.");
+  return objects;
+};
+
 type GitResult = { readonly code: number | null; readonly stdout: string };
 
 const cleanEnvironment = (home: string, allowFile: boolean, askpass?: string, token?: string) => ({
@@ -94,8 +134,12 @@ export interface ExactLeaseInput {
   readonly branch: string;
   readonly expectedOldSha: string;
   readonly candidateSha: string;
+  /** When supplied, verify the tree through the isolated bare object view. */
+  readonly candidateTreeSha?: string;
   readonly platform: NodeJS.Platform;
   readonly token?: string;
+  /** Local-only fixture scratch; production HTTPS transport always uses the process temp root. */
+  readonly temporaryDirectory?: string;
   readonly signal?: AbortSignal;
   /** Test seam. Production calls never set this. */
   readonly beforePush?: () => Promise<void>;
@@ -114,7 +158,11 @@ const pushExactLeaseInternal = async (
   if (!validInput(input, allowFile)) return { ok: false, unknown: false };
   if (input.platform === "win32" && !allowFile) return { ok: false, unknown: false };
   if (input.signal?.aborted) return { ok: false, unknown: false };
-  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-git-"));
+  const tempRoot =
+    allowFile && input.temporaryDirectory
+      ? NodeFS.realpathSync(input.temporaryDirectory)
+      : NodeOS.tmpdir();
+  const tempDir = NodeFS.mkdtempSync(NodePath.join(tempRoot, "t3-fork-git-"));
   const home = NodePath.join(tempDir, "home");
   const gitDir = NodePath.join(tempDir, "repo.git");
   let askpass: string | undefined;
@@ -132,17 +180,7 @@ const pushExactLeaseInternal = async (
 
     // An alternates file exposes only immutable objects. All Git config and hooks live in this
     // fresh directory; no candidate, global or system config participates in credentialed I/O.
-    const objectStore = (
-      await runGit(
-        input.cwd,
-        ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
-        env,
-        input.platform,
-        input.signal,
-      )
-    ).stdout.trim();
-    if (!objectStore || !NodeFS.statSync(objectStore, { throwIfNoEntry: false })?.isDirectory())
-      return { ok: false, unknown: false };
+    const objectStore = resolveObjectStore(input.cwd);
     NodeFS.writeFileSync(
       NodePath.join(gitDir, "objects", "info", "alternates"),
       `${objectStore}\n`,
@@ -156,6 +194,21 @@ const pushExactLeaseInternal = async (
       input.signal,
     );
     if (isAncestor.code !== 0) return { ok: false, unknown: false };
+    if (input.candidateTreeSha) {
+      if (!shaPattern.test(input.candidateTreeSha)) return { ok: false, unknown: false };
+      const tree = await runGit(
+        gitDir,
+        ["rev-parse", `${input.candidateSha}^{tree}`],
+        isolatedEnv,
+        input.platform,
+        input.signal,
+      );
+      if (
+        tree.code !== 0 ||
+        tree.stdout.trim().toLowerCase() !== input.candidateTreeSha.toLowerCase()
+      )
+        return { ok: false, unknown: false };
+    }
     if (input.signal?.aborted) return { ok: false, unknown: false };
     await input.beforePush?.();
     if (input.signal?.aborted) return { ok: false, unknown: false };

@@ -130,6 +130,7 @@ const config: Operator.ForkGithubOperatorConfiguration = {
   repositoryId: 71,
   nativeAppId: 13,
   automaticStablePromotion: false,
+  directPushBypass: false,
   validationProfile: { ...profile, sha256: profileSha },
   gatePolicy: {
     sha256: "d".repeat(64),

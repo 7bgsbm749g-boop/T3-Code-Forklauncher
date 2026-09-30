@@ -27,6 +27,8 @@ const state = vi.hoisted(() => ({
     | ((input: { number: number; requestId: string }) => Promise<unknown>)
     | null,
   pullRequestStatusWaiters: new Map<string, () => Promise<unknown>>(),
+  customUpdateSubmitHandler: null as ((input: { requestId: string }) => Promise<unknown>) | null,
+  customUpdateStatusWaiters: new Map<string, () => Promise<unknown>>(),
   idCounter: 0,
 }));
 
@@ -65,6 +67,8 @@ vi.mock("../../state/server", () => ({
     forkCompatibilityScheduleStatus: "schedule-status",
     forkGithubSubmitPullRequestEvidence: "pr-submit",
     forkGithubPullRequestEvidenceStatus: "pr-status",
+    forkGithubSubmitCustomUpdate: "custom-submit",
+    forkGithubCustomUpdateStatus: "custom-status",
   },
 }));
 vi.mock("../../state/use-atom-command", async () => {
@@ -117,6 +121,16 @@ vi.mock("../../state/use-atom-command", async () => {
             return await state.pullRequestSubmitHandler(
               target.input as { number: number; requestId: string },
             );
+          }
+          if (command === "custom-status") {
+            const input = target.input as { requestId: string };
+            const waiter = state.customUpdateStatusWaiters.get(
+              `${target.environmentId}:${input.requestId}`,
+            );
+            return waiter ? await waiter() : { _tag: "Success", value: null };
+          }
+          if (command === "custom-submit" && state.customUpdateSubmitHandler) {
+            return await state.customUpdateSubmitHandler(target.input as { requestId: string });
           }
           if (command === "schedule-status") {
             const waiter = state.scheduleWaiters.get(target.environmentId);
@@ -277,6 +291,29 @@ function pullRequestStatus(requestId: string, status = "ready", usable = true) {
   };
 }
 
+function customUpdateStatus(requestId: string, status = "pending", mode = "validated") {
+  return {
+    requestId,
+    operationId: `fork-custom-update:${requestId}`,
+    status,
+    mode,
+    sourceRepository: "7bgsbm749g-boop/T3-Code-Forklauncher",
+    sourceRef: "refs/heads/forklauncher",
+    sourceSha: "a".repeat(40),
+    sourceTreeSha: "b".repeat(40),
+    targetRepository: "7bgsbm749g-boop/T3-Code-Forklauncher",
+    targetRepositoryId: 123,
+    targetRef: "refs/heads/forklauncher",
+    expectedTargetSha: "c".repeat(40),
+    candidateSha: "a".repeat(40),
+    validation: mode === "validated" ? "passed" : "not-required",
+    resultSha: status === "applied" ? "a".repeat(40) : null,
+    diagnostic: status === "applied" ? "applied" : status === "pending" ? "pending" : status,
+    createdAt: "2026-09-29T00:00:00.000Z",
+    updatedAt: "2026-09-29T00:00:00.000Z",
+  };
+}
+
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   state.connected = true;
@@ -296,6 +333,8 @@ beforeEach(() => {
   state.checkHandler = null;
   state.pullRequestSubmitHandler = null;
   state.pullRequestStatusWaiters.clear();
+  state.customUpdateSubmitHandler = null;
+  state.customUpdateStatusWaiters.clear();
   state.idCounter = 0;
 });
 
@@ -776,5 +815,45 @@ describe("ForkCompatibilitySettings", () => {
     expect(text).toContain("Required Check Run: Uncertain.");
     expect(text).toContain("not confirmed published");
     expect(text).not.toContain("Required Check Run: Published.");
+  });
+
+  it("saves a custom-update UUID before submit, retries it, and reports explicit bypass accurately", async () => {
+    const submitted: Array<{ requestId: string }> = [];
+    state.customUpdateSubmitHandler = async (input) => {
+      submitted.push(input);
+      expect(state.storage.get("fork-compatibility:custom-update:server-1")).toMatchObject({
+        requestId: input.requestId,
+        state: "uncertain",
+      });
+      return submitted.length === 1
+        ? { _tag: "Failure", failure: new Error("connection dropped") }
+        : {
+            _tag: "Success",
+            value: customUpdateStatus(input.requestId, "applied", "custom-checkout-direct-bypass"),
+          };
+    };
+    await act(async () => {
+      renderer = create(<ForkCompatibilitySettings />);
+    });
+    await act(async () => button("Update configured branch").props.onClick());
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]).toEqual({ requestId: "00000000-0000-4000-8000-000000000001" });
+    await act(async () => button("Retry update").props.onClick());
+    expect(submitted).toHaveLength(2);
+    expect(submitted[1]).toEqual(submitted[0]);
+    const text = renderer!.root
+      .findAll((node) => node.type === "p" || node.type === "span")
+      .map((node) => node.children.join(""))
+      .join(" ");
+    expect(text).toContain("Branch updated");
+    expect(text).toContain("explicit bypass policy");
+    expect(text).toContain("did not install or replace the running server");
+    expect(state.storage.get("fork-compatibility:custom-update:server-1")).toMatchObject({
+      requestId: submitted[0]?.requestId,
+      state: "active",
+    });
+    await act(async () => button("Start new update").props.onClick());
+    expect(submitted).toHaveLength(3);
+    expect(submitted[2]?.requestId).not.toBe(submitted[0]?.requestId);
   });
 });

@@ -35,6 +35,7 @@ import * as StableSource from "./ForkCompatibilityStableSource.ts";
 import * as ScheduleRepository from "./ForkCompatibilityScheduleRepository.ts";
 import * as AutomaticIntents from "../forkGithub/ForkGithubAutomaticPromotionIntentRepository.ts";
 import * as GithubOperator from "../forkGithub/ForkGithubOperatorConfiguration.ts";
+import { SERVER_VALIDATION_PROFILE } from "./ForkCompatibilityValidationProfile.ts";
 import * as FollowThroughSignal from "../forkGithub/ForkGithubStableFollowThroughSignal.ts";
 import * as ForkGithubNative from "../forkGithub/ForkGithubNativeService.ts";
 import * as ForkGithubAdapter from "../forkGithub/ForkGithubAdapter.ts";
@@ -46,23 +47,7 @@ import {
   validateAllowedRepairPaths,
 } from "./ForkCompatibilityRepairEligibility.ts";
 
-export const SERVER_VALIDATION_PROFILE: ValidationProfile = {
-  id: "t3-server-default",
-  revision: "3",
-  commands: [
-    {
-      command: "vp",
-      args: ["i", "--frozen-lockfile"],
-      timeoutMs: 30 * 60_000,
-    },
-    { command: "vp", args: ["run", "--filter", "t3", "typecheck"], timeoutMs: 30 * 60_000 },
-    {
-      command: "vp",
-      args: ["run", "--filter", "t3", "build:bundle"],
-      timeoutMs: 30 * 60_000,
-    },
-  ],
-};
+export { SERVER_VALIDATION_PROFILE } from "./ForkCompatibilityValidationProfile.ts";
 
 export interface AcceptCompatibilityInput {
   readonly idempotencyKey: string;

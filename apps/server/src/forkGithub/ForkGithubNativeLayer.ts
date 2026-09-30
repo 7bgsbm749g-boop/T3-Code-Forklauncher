@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as Layer from "effect/Layer";
 import * as Effect from "effect/Effect";
+import * as HttpClient from "effect/unstable/http/HttpClient";
 import { ForkGithubCredentialResolverFromSecretStore } from "./ForkGithubAdapter.ts";
 import * as GithubAdapter from "./ForkGithubAdapter.ts";
 import { ForkGithubDurableActionStoreLive } from "./ForkGithubActionRepository.ts";
@@ -17,6 +18,7 @@ import {
   ForkGithubCandidateWorkflowTrust,
 } from "./ForkGithubCandidateArtifactSource.ts";
 import { ForkGithubNativeServiceLive } from "./ForkGithubNativeService.ts";
+import * as ForkGithubNative from "./ForkGithubNativeService.ts";
 import * as PullRequestEvidence from "./ForkGithubPullRequestEvidence.ts";
 import * as CandidateSandbox from "./ForkGithubCandidateSandbox.ts";
 import * as CandidateStorage from "./ForkGithubCandidateStorage.ts";
@@ -28,6 +30,9 @@ import { ForkGithubGatePolicy, ForkGithubValidationProfile } from "./ForkGithubA
 import { ForkGithubStablePromotionTarget } from "./ForkGithubStablePromotion.ts";
 import * as CandidateBuildRepository from "./ForkGithubCandidateBuildRepository.ts";
 import * as CandidateBuild from "./ForkGithubCandidateBuildService.ts";
+import * as CustomCheckoutEvidence from "./ForkGithubCustomCheckoutEvidence.ts";
+import * as CompatibilitySchedule from "../forkCompatibility/ForkCompatibilityScheduleRepository.ts";
+import * as CustomUpdateEvidenceResolver from "./ForkGithubCustomUpdateEvidenceResolver.ts";
 
 /**
  * Production backing for the adapter. Native startup supplies this layer with its trusted
@@ -39,6 +44,7 @@ const ForkGithubAdapterWithNativeBackingLive = ForkGithubAdapterLive.pipe(
       ForkGithubDurableActionStoreLive,
       ForkGithubRefUpdateTransportLive,
       ForkGithubNativeEvidenceResolverLive,
+      CustomUpdateEvidenceResolver.ForkGithubCustomUpdateEvidenceResolverLive,
     ),
   ),
 );
@@ -48,9 +54,18 @@ const ForkGithubAdapterWithNativeBackingLive = ForkGithubAdapterLive.pipe(
  * environment or RPC path for setting these; production always uses its operator-backed adapter.
  */
 export interface ForkGithubNativeTestOverrides {
-  readonly adapter: Layer.Layer<GithubAdapter.ForkGithubAdapter>;
+  /** Replaces the whole adapter only in older focused unit tests. Production-composition tests
+   * should leave this unset and override only the external HTTP/ref-update boundaries below. */
+  readonly adapter?: Layer.Layer<GithubAdapter.ForkGithubAdapter>;
   readonly credentials: Layer.Layer<GithubAdapter.ForkGithubCredentialResolver>;
   readonly pullRequestRemote: Layer.Layer<PullRequestEvidence.ForkGithubPullRequestRemote>;
+  readonly httpClient?: Layer.Layer<HttpClient.HttpClient>;
+  readonly refUpdateTransport?: Layer.Layer<
+    GithubAdapter.ForkGithubRefUpdateTransport,
+    never,
+    CandidateStorage.ForkGithubCandidateStorage
+  >;
+  readonly customUpdateReceipt?: Layer.Layer<ForkGithubNative.ForkGithubNativeCustomUpdateReceipt>;
 }
 
 /**
@@ -78,18 +93,40 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
   testOverrides?: ForkGithubNativeTestOverrides,
 ) => {
   const credentials = testOverrides?.credentials ?? ForkGithubCredentialResolverFromSecretStore;
-  const adapter = testOverrides
+  const candidateExecutor =
+    CandidateSandbox.ForkGithubCandidateExecutorFromSnapshotManifest(offlineSnapshotPath);
+  const candidateStorage =
+    CandidateStorage.ForkGithubCandidateStorageLayerFromOperatorConfiguration(
+      candidateStorageManifestPath ?? null,
+    );
+  const transport = testOverrides?.refUpdateTransport
+    ? testOverrides.refUpdateTransport.pipe(Layer.provideMerge(candidateStorage))
+    : ForkGithubRefUpdateTransportLive;
+  const adapterBacking = Layer.mergeAll(
+    ForkGithubDurableActionStoreLive,
+    transport,
+    ForkGithubNativeEvidenceResolverLive,
+    CustomUpdateEvidenceResolver.ForkGithubCustomUpdateEvidenceResolverLive,
+  );
+  const adapter = testOverrides?.adapter
     ? testOverrides.adapter.pipe(
         Layer.provideMerge(
           Layer.mergeAll(
             ForkGithubDurableActionStoreLive,
-            ForkGithubRefUpdateTransportLive,
+            transport,
             ForkGithubNativeEvidenceResolverLive,
+            CustomUpdateEvidenceResolver.ForkGithubCustomUpdateEvidenceResolverLive,
           ),
         ),
         Layer.provideMerge(credentials),
       )
-    : ForkGithubAdapterWithNativeBackingLive.pipe(Layer.provideMerge(credentials));
+    : testOverrides?.httpClient
+      ? ForkGithubAdapterLive.pipe(
+          Layer.provideMerge(adapterBacking),
+          Layer.provideMerge(credentials),
+          Layer.provide(testOverrides.httpClient),
+        )
+      : ForkGithubAdapterWithNativeBackingLive.pipe(Layer.provideMerge(credentials));
   const artifacts = ForkGithubCandidateArtifactSourceLive.pipe(
     Layer.provide(trust),
     Layer.provideMerge(adapter),
@@ -102,12 +139,8 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
   );
   const promotion = ForkGithubStablePromotionLive.pipe(Layer.provideMerge(adapter));
   const pullRequestEvidence = PullRequestEvidence.ForkGithubPullRequestEvidenceLive({
-    candidateExecutorLayer:
-      CandidateSandbox.ForkGithubCandidateExecutorFromSnapshotManifest(offlineSnapshotPath),
-    candidateStorageLayer:
-      CandidateStorage.ForkGithubCandidateStorageLayerFromOperatorConfiguration(
-        candidateStorageManifestPath ?? null,
-      ),
+    candidateExecutorLayer: candidateExecutor,
+    candidateStorageLayer: candidateStorage,
   }).pipe(
     Layer.provideMerge(adapter),
     Layer.provideMerge(operator),
@@ -120,10 +153,25 @@ const makeForkGithubNativeServiceWithNativeBacking = <R>(
         }),
     ),
   );
-  const native = ForkGithubNativeServiceLive.pipe(
+  const customCheckoutEvidence = CustomCheckoutEvidence.ForkGithubCustomCheckoutEvidenceLive().pipe(
+    Layer.provideMerge(candidateExecutor),
+    Layer.provideMerge(candidateStorage),
+    Layer.provideMerge(operator),
+    Layer.provideMerge(adapter),
+    Layer.provideMerge(
+      CustomCheckoutEvidence.ForkGithubCustomCheckoutSourceFromSchedule.pipe(
+        Layer.provideMerge(CompatibilitySchedule.ForkCompatibilityScheduleRepositoryLive),
+      ),
+    ),
+  );
+  const nativeService = testOverrides?.customUpdateReceipt
+    ? ForkGithubNativeServiceLive.pipe(Layer.provideMerge(testOverrides.customUpdateReceipt))
+    : ForkGithubNativeServiceLive;
+  const native = nativeService.pipe(
     Layer.provideMerge(promotion),
     Layer.provideMerge(draft),
     Layer.provideMerge(pullRequestEvidence),
+    Layer.provideMerge(customCheckoutEvidence),
   );
   const candidateBuild = CandidateBuild.ForkGithubCandidateBuildServiceLive.pipe(
     Layer.provideMerge(CandidateBuildRepository.ForkGithubCandidateBuildRepositoryLive),

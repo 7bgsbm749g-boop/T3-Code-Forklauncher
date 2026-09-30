@@ -7,8 +7,10 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import type { SidebarProjectGroupingMode } from "@t3tools/contracts";
 import {
+  isPendingCustomUpdate,
   isPendingPullRequestEvidence,
   type PendingForkCheck,
+  type PendingCustomUpdate,
   type PendingPullRequestEvidence,
 } from "@t3tools/client-runtime/state/fork-compatibility-ui";
 import type { ComposerEnterBehavior } from "../lib/composerEnterBehavior";
@@ -63,6 +65,8 @@ export interface Preferences {
   readonly forkCompatibilityPullRequestEvidence?: Readonly<
     Record<string, PendingPullRequestEvidence>
   >;
+  /** Retry identity for an explicit configured-branch update, isolated per server. */
+  readonly forkCompatibilityCustomUpdateRequests?: Readonly<Record<string, PendingCustomUpdate>>;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
@@ -127,6 +131,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     forkCompatibilityRequestIds?: Readonly<Record<string, string>>;
     forkCompatibilityPendingChecks?: Readonly<Record<string, ReadonlyArray<PendingForkCheck>>>;
     forkCompatibilityPullRequestEvidence?: Readonly<Record<string, PendingPullRequestEvidence>>;
+    forkCompatibilityCustomUpdateRequests?: Readonly<Record<string, PendingCustomUpdate>>;
   } = {};
 
   if (typeof parsed.liveActivitiesEnabled === "boolean") {
@@ -250,6 +255,18 @@ function sanitizePreferences(parsed: Preferences): Preferences {
       Object.entries(parsed.forkCompatibilityPullRequestEvidence).filter(
         (entry): entry is [string, PendingPullRequestEvidence] =>
           isPendingPullRequestEvidence(entry[1]),
+      ),
+    );
+  }
+  if (
+    parsed.forkCompatibilityCustomUpdateRequests !== undefined &&
+    typeof parsed.forkCompatibilityCustomUpdateRequests === "object" &&
+    parsed.forkCompatibilityCustomUpdateRequests !== null &&
+    !Array.isArray(parsed.forkCompatibilityCustomUpdateRequests)
+  ) {
+    preferences.forkCompatibilityCustomUpdateRequests = Object.fromEntries(
+      Object.entries(parsed.forkCompatibilityCustomUpdateRequests).filter(
+        (entry): entry is [string, PendingCustomUpdate] => isPendingCustomUpdate(entry[1]),
       ),
     );
   }

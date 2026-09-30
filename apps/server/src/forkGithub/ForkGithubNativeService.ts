@@ -22,7 +22,10 @@ import {
   type ForkGithubPromotionCommand,
   type ForkGithubPullRequestEvidenceSubmit,
   ForkGithubPullRequestEvidenceStatus as PullRequestEvidenceStatusSchema,
+  ForkGithubCustomUpdateStatus as CustomUpdateStatusSchema,
   type ForkGithubPullRequestEvidenceStatus,
+  type ForkGithubCustomUpdateStatus,
+  type ForkGithubCustomUpdateSubmit,
 } from "../../../../packages/contracts/src/forkGithub.ts";
 import * as Requests from "../forkCompatibility/ForkCompatibilityRequestRepository.ts";
 import * as Runs from "../forkCompatibility/ForkCompatibilityRunRepository.ts";
@@ -34,6 +37,8 @@ import * as Artifacts from "./ForkGithubCandidateArtifactSource.ts";
 import { trustedCandidateWorkflowPaths } from "./ForkGithubCandidateArtifactSource.ts";
 import * as OperationRepository from "./ForkGithubNativeOperationRepository.ts";
 import * as PullRequestEvidence from "./ForkGithubPullRequestEvidence.ts";
+import * as CustomCheckoutEvidence from "./ForkGithubCustomCheckoutEvidence.ts";
+import * as Operator from "./ForkGithubOperatorConfiguration.ts";
 
 type NativeFailure = ForkGithubNativeError | Github.ForkGithubAdapterError;
 type OperationInput = ForkGithubPromotionCommand | ForkGithubDraftCommand;
@@ -64,6 +69,17 @@ const leaseExpiresAt = (timestamp: string) =>
 const operationSchema = Schema.decodeUnknownSync(OperationSchema);
 const configStatusSchema = Schema.decodeUnknownSync(ConfigurationStatusSchema);
 const pullRequestEvidenceStatusSchema = Schema.decodeUnknownSync(PullRequestEvidenceStatusSchema);
+const customUpdateStatusSchema = Schema.decodeUnknownSync(CustomUpdateStatusSchema);
+const decodeCustomCheckoutSnapshot = Schema.decodeUnknownSync(
+  CustomCheckoutEvidence.ForkGithubCustomCheckoutSnapshotSchema,
+);
+const decodeCustomCheckoutEvidence = Schema.decodeUnknownSync(
+  CustomCheckoutEvidence.ForkGithubCustomCheckoutEvidenceSchema,
+);
+const CustomUpdateResultJson = Schema.fromJsonString(
+  Schema.Struct({ sha: Schema.NullOr(Schema.String) }),
+);
+const decodeCustomUpdateResult = Schema.decodeUnknownSync(CustomUpdateResultJson);
 const NativeOperationInputSchema = Schema.Union([
   Schema.Struct({
     operationId: Schema.String,
@@ -83,6 +99,9 @@ const NativeOperationInputSchema = Schema.Union([
 const NativeOperationInputJson = Schema.fromJsonString(NativeOperationInputSchema);
 const encodeNativeOperationInput = Schema.encodeSync(NativeOperationInputJson);
 const decodeNativeOperationInput = Schema.decodeSync(NativeOperationInputJson);
+const decodeCustomUpdateOperationInput = Schema.decodeUnknownEffect(
+  OperationRepository.CustomUpdateOperationInputSchema,
+);
 const isNativeError = Schema.is(ForkGithubNativeError);
 const isAdapterError = Schema.is(Github.ForkGithubAdapterError);
 const activeNativeOperationOwners = new Set<string>();
@@ -125,6 +144,12 @@ export interface ForkGithubNativeServiceShape {
   readonly pullRequestEvidenceStatus: (
     requestId: string,
   ) => Effect.Effect<ForkGithubPullRequestEvidenceStatus | null, NativeFailure>;
+  readonly submitCustomUpdate: (
+    input: ForkGithubCustomUpdateSubmit,
+  ) => Effect.Effect<ForkGithubCustomUpdateStatus, NativeFailure>;
+  readonly customUpdateStatus: (
+    requestId: string,
+  ) => Effect.Effect<ForkGithubCustomUpdateStatus | null, NativeFailure>;
   /** Internal bounded recovery wake; not exposed through RPC. */
   readonly wakePending: () => Effect.Effect<void, NativeFailure>;
 }
@@ -132,6 +157,19 @@ export class ForkGithubNativeService extends Context.Service<
   ForkGithubNativeService,
   ForkGithubNativeServiceShape
 >()("t3/forkGithub/ForkGithubNativeService") {}
+
+/** Internal completion receipt used only by production-composition integration tests. */
+export class ForkGithubNativeCustomUpdateReceipt extends Context.Service<
+  ForkGithubNativeCustomUpdateReceipt,
+  {
+    readonly terminal: (
+      requestId: string,
+      state: OperationRepository.CustomUpdateOperationRow["state"] | null,
+      evidenceJson: string | null,
+    ) => Effect.Effect<void, never, never>;
+    readonly failed: (requestId: string, reason: string) => Effect.Effect<void, never, never>;
+  }
+>()("t3/forkGithub/ForkGithubNativeService/ForkGithubNativeCustomUpdateReceipt") {}
 
 type InputSnapshot = typeof NativeOperationInputSchema.Type;
 
@@ -150,6 +188,11 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
   const pullRequestEvidence = yield* Effect.serviceOption(
     PullRequestEvidence.ForkGithubPullRequestEvidence,
   );
+  const customCheckoutEvidence = yield* Effect.serviceOption(
+    CustomCheckoutEvidence.ForkGithubCustomCheckoutEvidenceService,
+  );
+  const operator = yield* Effect.serviceOption(Operator.ForkGithubOperatorConfigurationService);
+  const customUpdateReceipt = yield* Effect.serviceOption(ForkGithubNativeCustomUpdateReceipt);
   const queue = yield* Queue.dropping<void>(1);
 
   const configurationStatus = Effect.fn("ForkGithubNativeService.read")(function* () {
@@ -540,6 +583,281 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
     );
   };
 
+  const processCustomUpdate = (
+    row: OperationRepository.CustomUpdateOperationRow,
+    ownerId: string,
+    leaseLost: Ref.Ref<boolean>,
+  ) =>
+    Effect.gen(function* () {
+      const snapshot = decodeCustomCheckoutSnapshot(decodeJson(row.snapshotJson));
+      const evidenceService = Option.getOrUndefined(customCheckoutEvidence);
+      if (!evidenceService || !Option.isSome(operator)) {
+        yield* repository.finishCustomUpdate({
+          operationId: row.operationId,
+          fingerprint: row.fingerprint,
+          ownerId,
+          state: "unavailable",
+          resultJson: null,
+          error: "Trusted custom-update validator is unavailable.",
+          now: yield* now,
+        });
+        return true;
+      }
+
+      const adapterOutcome = yield* Github.ForkGithubAdapter.pipe(
+        Effect.flatMap((adapter) => adapter.customDirectUpdateStatus(row.requestId)),
+      ).pipe(Effect.result);
+      if (Result.isSuccess(adapterOutcome) && adapterOutcome.success?.status === "applied") {
+        if (adapterOutcome.success.sha?.toLowerCase() !== snapshot.sourceSha.toLowerCase())
+          return yield* fail("Existing custom-update action applied a different candidate SHA.");
+        yield* repository.finishCustomUpdate({
+          operationId: row.operationId,
+          fingerprint: row.fingerprint,
+          ownerId,
+          state: "applied",
+          resultJson: canonicalJson({ sha: snapshot.sourceSha.toLowerCase() }),
+          error: null,
+          now: yield* now,
+        });
+        return true;
+      }
+      if (Result.isSuccess(adapterOutcome) && adapterOutcome.success?.status === "pushing")
+        return false;
+
+      const currentSnapshot = yield* evidenceService.capture(row.requestId, snapshot.mode);
+      if (currentSnapshot.identitySha256 !== snapshot.identitySha256) {
+        yield* repository.finishCustomUpdate({
+          operationId: row.operationId,
+          fingerprint: row.fingerprint,
+          ownerId,
+          state: "unavailable",
+          resultJson: null,
+          error: "Accepted source, target or policy identity is stale.",
+          now: yield* now,
+        });
+        return true;
+      }
+
+      let evidence: CustomCheckoutEvidence.ForkGithubCustomCheckoutEvidence | undefined;
+      let evidenceJson: string | undefined;
+      if (snapshot.mode === "validated") {
+        evidenceJson = row.evidenceJson ?? undefined;
+        evidence = evidenceJson
+          ? decodeCustomCheckoutEvidence(decodeJson(evidenceJson))
+          : yield* evidenceService.validate(snapshot);
+        if (!row.evidenceJson) {
+          evidenceJson = canonicalJson(evidence);
+          yield* repository.recordCustomUpdateEvidence({
+            operationId: row.operationId,
+            fingerprint: row.fingerprint,
+            ownerId,
+            evidenceJson,
+            now: yield* now,
+          });
+        }
+        if (evidence.status !== "ready" || !evidence.usable) {
+          yield* repository.finishCustomUpdate({
+            operationId: row.operationId,
+            fingerprint: row.fingerprint,
+            ownerId,
+            state: evidence.status === "unavailable" ? "unavailable" : "failed",
+            resultJson: null,
+            error:
+              evidence.status === "stale"
+                ? "Captured source, target or profile changed during validation."
+                : "Trusted custom checkout validation did not pass.",
+            now: yield* now,
+          });
+          return true;
+        }
+        const freshness = yield* evidenceService.checkFreshness(snapshot, evidence);
+        if (!freshness.usable) {
+          yield* repository.finishCustomUpdate({
+            operationId: row.operationId,
+            fingerprint: row.fingerprint,
+            ownerId,
+            state: "unavailable",
+            resultJson: null,
+            error: freshness.reason ?? "Custom checkout validation evidence is stale.",
+            now: yield* now,
+          });
+          return true;
+        }
+      } else {
+        const freshness = yield* evidenceService.checkSnapshotFreshness(snapshot);
+        if (!freshness.usable) {
+          yield* repository.finishCustomUpdate({
+            operationId: row.operationId,
+            fingerprint: row.fingerprint,
+            ownerId,
+            state: "unavailable",
+            resultJson: null,
+            error: freshness.reason ?? "Custom direct-update identity is stale.",
+            now: yield* now,
+          });
+          return true;
+        }
+      }
+      if (yield* Ref.get(leaseLost)) return yield* fail("Custom-update operation lease expired.");
+      const sourceDirectory = yield* CustomCheckoutEvidence.ForkGithubCustomCheckoutSource.pipe(
+        Effect.flatMap((source) => source.getSourceDirectory()),
+      );
+      if (!sourceDirectory) return yield* fail("Configured custom checkout was removed.");
+      const adapter = yield* Github.ForkGithubAdapter;
+      const outcome = yield* adapter.advanceCustomDirectUpdate({
+        requestId: row.requestId,
+        operationId: row.operationId,
+        fingerprint: row.fingerprint,
+        mode: snapshot.mode,
+        snapshotIdentitySha256: snapshot.identitySha256,
+        expectedTargetSha: snapshot.targetSha,
+        candidateSha: snapshot.sourceSha,
+        candidateTreeSha: snapshot.sourceTreeSha,
+        repositoryRoot: sourceDirectory,
+        ...(evidenceJson ? { validationEvidenceJson: evidenceJson } : {}),
+        beforeUpdate: () =>
+          (snapshot.mode === "validated"
+            ? evidenceService.checkFreshness(snapshot, evidence!)
+            : evidenceService.checkSnapshotFreshness(snapshot)
+          ).pipe(
+            Effect.mapError(
+              () =>
+                new Github.ForkGithubAdapterError({
+                  reason: "Could not recheck captured custom-update identity before ref mutation.",
+                }),
+            ),
+            Effect.flatMap((fresh) =>
+              fresh.usable
+                ? Effect.void
+                : Effect.fail(
+                    new Github.ForkGithubAdapterError({
+                      reason:
+                        fresh.reason ?? "Custom-update identity became stale before ref update.",
+                    }),
+                  ),
+            ),
+          ),
+      });
+      if (outcome.sha.toLowerCase() !== snapshot.sourceSha.toLowerCase())
+        return yield* fail("Custom-update adapter returned an unexpected target SHA.");
+      yield* repository.finishCustomUpdate({
+        operationId: row.operationId,
+        fingerprint: row.fingerprint,
+        ownerId,
+        state: "applied",
+        resultJson: canonicalJson({ sha: outcome.sha.toLowerCase() }),
+        error: null,
+        now: yield* now,
+      });
+      return true;
+    }).pipe(
+      // A failed/interrupted SQL claim must not strand this in-memory ownership token.
+      Effect.onExit((exit) =>
+        exit._tag === "Success"
+          ? Effect.void
+          : Effect.sync(() => activeNativeOperationOwners.delete(ownerId)),
+      ),
+    );
+
+  const processCustomClaimed = (row: OperationRepository.CustomUpdateOperationRow) => {
+    const ownerId = NodeCrypto.randomUUID();
+    const acquire = Effect.gen(function* () {
+      activeNativeOperationOwners.add(ownerId);
+      const timestamp = yield* now;
+      if (
+        row.ownerId !== null &&
+        (activeNativeOperationOwners.has(row.ownerId) ||
+          (row.ownerPid !== null &&
+            row.ownerPid !== NodeProcess.pid &&
+            processIsAlive(row.ownerPid)))
+      )
+        return null;
+      return yield* repository.claimCustomUpdate({
+        operationId: row.operationId,
+        fingerprint: row.fingerprint,
+        ownerId,
+        ownerPid: NodeProcess.pid,
+        expectedOwnerId: row.ownerId,
+        expectedOwnerPid: row.ownerPid,
+        expectedLeaseExpiresAt: row.leaseExpiresAt,
+        leaseExpiresAt: leaseExpiresAt(timestamp),
+        now: timestamp,
+      });
+    });
+    return Effect.acquireUseRelease(
+      acquire,
+      (claimed) =>
+        Effect.gen(function* () {
+          if (!claimed) return;
+          const lost = yield* Ref.make(false);
+          const heartbeat = Effect.forever(
+            Effect.sleep("20 seconds").pipe(
+              Effect.andThen(now),
+              Effect.flatMap((time) =>
+                repository.renewCustomUpdate({
+                  operationId: row.operationId,
+                  fingerprint: row.fingerprint,
+                  ownerId,
+                  leaseExpiresAt: leaseExpiresAt(time),
+                  now: time,
+                }),
+              ),
+              Effect.flatMap((renewed) =>
+                renewed ? Effect.void : Ref.set(lost, true).pipe(Effect.andThen(Effect.interrupt)),
+              ),
+            ),
+          );
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* heartbeat.pipe(Effect.forkScoped);
+              return yield* processCustomUpdate(claimed, ownerId, lost);
+            }),
+          );
+        }),
+      (claimed, exit) =>
+        now.pipe(
+          Effect.flatMap((time) =>
+            (claimed
+              ? repository.releaseCustomUpdate({
+                  operationId: row.operationId,
+                  fingerprint: row.fingerprint,
+                  ownerId,
+                  error:
+                    exit._tag === "Success"
+                      ? exit.value
+                        ? null
+                        : "Waiting for existing action reconciliation before retry."
+                      : `Custom update will reconcile its exact ref action after worker interruption. ${Cause.pretty(exit.cause).slice(0, 1_000)}`,
+                  now: time,
+                })
+              : Effect.void
+            ).pipe(Effect.ensuring(Effect.sync(() => activeNativeOperationOwners.delete(ownerId)))),
+          ),
+        ),
+    ).pipe(
+      Effect.tapCause((cause) =>
+        Option.isSome(customUpdateReceipt)
+          ? customUpdateReceipt.value.failed(row.requestId, Cause.pretty(cause).slice(0, 2_000))
+          : Effect.void,
+      ),
+      Effect.tap((terminal) =>
+        terminal === true && Option.isSome(customUpdateReceipt)
+          ? repository
+              .getCustomUpdateByRequestId(row.requestId)
+              .pipe(
+                Effect.flatMap((stored) =>
+                  customUpdateReceipt.value.terminal(
+                    row.requestId,
+                    stored?.state ?? null,
+                    stored?.evidenceJson ?? null,
+                  ),
+                ),
+              )
+          : Effect.void,
+      ),
+    );
+  };
+
   const publicPullRequestEvidenceStatus = (
     record: PullRequestEvidence.PullRequestEvidenceRecord,
     publication: ForkGithubPullRequestEvidenceStatus["publication"],
@@ -586,6 +904,55 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
     });
   };
 
+  const publicCustomUpdateStatus = (row: OperationRepository.CustomUpdateOperationRow) => {
+    const snapshot = decodeCustomCheckoutSnapshot(decodeJson(row.snapshotJson));
+    const evidence = row.evidenceJson
+      ? decodeCustomCheckoutEvidence(decodeJson(row.evidenceJson))
+      : null;
+    const result = row.resultJson ? decodeCustomUpdateResult(row.resultJson) : null;
+    const validation =
+      snapshot.mode === "custom-checkout-direct-bypass"
+        ? "not-required"
+        : evidence?.status === "ready" && evidence.usable
+          ? "passed"
+          : evidence?.status === "failed"
+            ? "failed"
+            : evidence?.status === "stale"
+              ? "stale"
+              : "pending";
+    return customUpdateStatusSchema({
+      requestId: row.requestId,
+      operationId: row.operationId,
+      status: row.state,
+      mode: snapshot.mode,
+      sourceRepository: snapshot.sourceRepository,
+      sourceRef: snapshot.sourceRef,
+      sourceSha: snapshot.sourceSha,
+      sourceTreeSha: snapshot.sourceTreeSha,
+      targetRepository: `${snapshot.owner}/${snapshot.repository}`,
+      targetRepositoryId: snapshot.repositoryId,
+      targetRef: `refs/heads/${snapshot.targetBranch}`,
+      expectedTargetSha: snapshot.targetSha,
+      candidateSha: evidence?.candidateSha ?? snapshot.sourceSha,
+      validation,
+      resultSha: result?.sha ?? null,
+      diagnostic:
+        row.state === "applied"
+          ? "applied"
+          : row.state === "failed"
+            ? "failed"
+            : row.state === "unavailable"
+              ? "unavailable"
+              : evidence?.status === "stale"
+                ? "stale"
+                : row.state === "pending"
+                  ? "pending"
+                  : null,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
+  };
+
   const drainRecoverable = Effect.gen(function* () {
     const pending = yield* repository.pending();
     for (const row of pending)
@@ -594,6 +961,16 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
           Effect.logError("Could not process durable fork GitHub operation", {
             operationId: row.operationId,
             cause: Cause.pretty(cause).slice(0, 4_000),
+          }),
+        ),
+      );
+    const pendingCustom = yield* repository.pendingCustomUpdates();
+    for (const row of pendingCustom)
+      yield* processCustomClaimed(row).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logError("Could not process durable custom checkout update", {
+            operationId: row.operationId,
+            cause: Cause.pretty(cause).slice(0, 3_000),
           }),
         ),
       );
@@ -709,6 +1086,78 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
       ),
     );
 
+  const submitCustomUpdate = (input: ForkGithubCustomUpdateSubmit) =>
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        const existing = yield* repository.getCustomUpdateByRequestId(input.requestId);
+        if (existing) {
+          if (existing.state === "pending") yield* Queue.offer(queue, undefined);
+          return publicCustomUpdateStatus(existing);
+        }
+        if (Option.isNone(customCheckoutEvidence) || Option.isNone(operator))
+          return yield* fail("Trusted non-PR custom-update validation is not configured.");
+        const nativeConfiguration = yield* repository.configuration();
+        const nativeStatus = yield* configurationStatus();
+        if (!nativeConfiguration.enabled || nativeStatus.state !== "ready")
+          return yield* fail(
+            "Native custom updates are unavailable until trusted GitHub operations are enabled.",
+          );
+        const operatorConfig = yield* operator.value.get();
+        if (!operatorConfig)
+          return yield* fail("Trusted custom-update operator policy is unavailable.");
+        const mode = operatorConfig.directPushBypass
+          ? "custom-checkout-direct-bypass"
+          : "validated";
+        const snapshot = yield* customCheckoutEvidence.value.capture(input.requestId, mode);
+        const operationId = `fork-custom-update:${input.requestId.toLowerCase()}`;
+        const operation = yield* decodeCustomUpdateOperationInput({
+          operationId,
+          kind: "custom-update",
+          requestId: input.requestId.toLowerCase(),
+          source: {
+            repository: snapshot.sourceRepository,
+            ref: snapshot.sourceRef,
+            commitSha: snapshot.sourceSha,
+            treeSha: snapshot.sourceTreeSha,
+          },
+          target: {
+            repository: `${snapshot.owner}/${snapshot.repository}`,
+            repositoryId: snapshot.repositoryId,
+            ref: `refs/heads/${snapshot.targetBranch}`,
+            expectedSha: snapshot.targetSha,
+          },
+          policySha256: snapshot.policySha256,
+          profileSha256: snapshot.profileSha256,
+          toolchainSha256: snapshot.toolchainSha256,
+          storageIdentitySha256: snapshot.storageIdentitySha256,
+          mode: snapshot.mode,
+        }).pipe(
+          Effect.mapError(
+            () =>
+              new ForkGithubNativeError({ reason: "Captured custom-update identity is invalid." }),
+          ),
+        );
+        const snapshotJson = canonicalJson(snapshot);
+        const operationFingerprint = fingerprint({ operation, snapshot });
+        const row = yield* repository.acceptCustomUpdate({
+          operation,
+          fingerprint: operationFingerprint,
+          snapshotJson,
+          now: yield* now,
+        });
+        if (row.state === "pending") yield* Queue.offer(queue, undefined);
+        return publicCustomUpdateStatus(row);
+      }),
+    ).pipe(
+      Effect.mapError((error) =>
+        isNativeError(error)
+          ? error
+          : isAdapterError(error)
+            ? new ForkGithubNativeError({ reason: error.reason })
+            : new ForkGithubNativeError({ reason: "Could not accept the custom update durably." }),
+      ),
+    );
+
   const service: ForkGithubNativeServiceShape = {
     configure: (input) =>
       now.pipe(
@@ -812,6 +1261,14 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
                 }),
             ),
           ),
+    submitCustomUpdate,
+    customUpdateStatus: (requestId) =>
+      repository.getCustomUpdateByRequestId(requestId).pipe(
+        Effect.map((row) => (row ? publicCustomUpdateStatus(row) : null)),
+        Effect.mapError(
+          () => new ForkGithubNativeError({ reason: "Could not read custom-update status." }),
+        ),
+      ),
     wakePending: () =>
       Queue.offer(queue, undefined).pipe(
         Effect.mapError(
@@ -820,13 +1277,19 @@ export const makeForkGithubNativeService = Effect.gen(function* () {
       ),
   };
   const pending = yield* repository.pending();
+  const pendingCustom = yield* repository.pendingCustomUpdates();
   const acceptedPr = Option.isSome(pullRequestEvidence)
     ? yield* pullRequestEvidence.value.pending()
     : [];
   const publicationPr = Option.isSome(pullRequestEvidence)
     ? yield* pullRequestEvidence.value.pendingPublications()
     : [];
-  if (pending.length > 0 || acceptedPr.length > 0 || publicationPr.length > 0)
+  if (
+    pending.length > 0 ||
+    pendingCustom.length > 0 ||
+    acceptedPr.length > 0 ||
+    publicationPr.length > 0
+  )
     yield* Queue.offer(queue, undefined);
   yield* worker.pipe(Effect.forkScoped);
   return service;
@@ -857,6 +1320,8 @@ export const ForkGithubNativeServiceInert = Layer.succeed(ForkGithubNativeServic
   submitPullRequestEvidence: () =>
     fail("Custom PR evidence is unavailable because its trusted executor is not configured."),
   pullRequestEvidenceStatus: () => Effect.succeed(null),
+  submitCustomUpdate: () => fail("Trusted non-PR custom-update validation is not configured."),
+  customUpdateStatus: () => Effect.succeed(null),
   wakePending: () => Effect.void,
 });
 
@@ -869,6 +1334,8 @@ export const makeForkGithubNativeHandlers = (service: ForkGithubNativeServiceSha
     submitPullRequestEvidence: "orchestration:operate",
     status: "orchestration:read",
     pullRequestEvidenceStatus: "orchestration:read",
+    submitCustomUpdate: "orchestration:operate",
+    customUpdateStatus: "orchestration:read",
   } as const,
   configure: service.configure,
   read: service.read,
@@ -877,4 +1344,6 @@ export const makeForkGithubNativeHandlers = (service: ForkGithubNativeServiceSha
   status: service.status,
   submitPullRequestEvidence: service.submitPullRequestEvidence,
   pullRequestEvidenceStatus: service.pullRequestEvidenceStatus,
+  submitCustomUpdate: service.submitCustomUpdate,
+  customUpdateStatus: service.customUpdateStatus,
 });

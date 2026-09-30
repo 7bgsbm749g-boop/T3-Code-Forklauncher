@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  acknowledgeCustomUpdate,
+  customUpdateStatusMatchesRequest,
+  describeCustomUpdateStatus,
   forgetPendingForkCheck,
   acknowledgePullRequestEvidence,
   describePullRequestEvidenceStatus,
@@ -7,9 +10,11 @@ import {
   pullRequestEvidenceStatusMatchesRequest,
   IdentityEpoch,
   sanitizePendingPullRequestEvidenceByEnvironment,
+  sanitizePendingCustomUpdatesByEnvironment,
   pendingForkCheckForSource,
   rememberPendingForkCheck,
   startPullRequestEvidence,
+  startCustomUpdate,
 } from "./forkCompatibilityUi.js";
 
 function deferred<T>() {
@@ -21,6 +26,68 @@ function deferred<T>() {
 }
 
 describe("fork compatibility UI state", () => {
+  it("persists custom update retry identity and rejects mismatched or contradictory status", () => {
+    const first = startCustomUpdate(() => "00000000-0000-4000-8000-000000000011");
+    expect(first).toEqual({
+      requestId: "00000000-0000-4000-8000-000000000011",
+      state: "uncertain",
+    });
+    expect(acknowledgeCustomUpdate(first, "different")).toBe(first);
+    const active = acknowledgeCustomUpdate(first, first.requestId);
+    expect(active.state).toBe("active");
+    expect(
+      sanitizePendingCustomUpdatesByEnvironment({
+        server: active,
+        invalid: { requestId: "bad", state: "active" },
+      }),
+    ).toEqual({ server: active });
+
+    const status = {
+      requestId: first.requestId,
+      operationId: `fork-custom-update:${first.requestId}`,
+      status: "applied",
+      mode: "validated",
+      sourceRepository: "owner/source",
+      sourceRef: "refs/heads/forklauncher",
+      sourceSha: "a".repeat(40),
+      sourceTreeSha: "b".repeat(40),
+      targetRepository: "owner/fork",
+      targetRepositoryId: 1,
+      targetRef: "refs/heads/forklauncher",
+      expectedTargetSha: "c".repeat(40),
+      candidateSha: "a".repeat(40),
+      validation: "passed",
+      resultSha: "a".repeat(40),
+      diagnostic: "applied",
+      createdAt: "now",
+      updatedAt: "now",
+    } as const;
+    expect(customUpdateStatusMatchesRequest(status, active)).toBe(true);
+    expect(customUpdateStatusMatchesRequest({ ...status, requestId: "other" }, active)).toBe(false);
+    expect(customUpdateStatusMatchesRequest({ ...status, operationId: "other" }, active)).toBe(
+      false,
+    );
+    expect(customUpdateStatusMatchesRequest({ ...status, resultSha: "d".repeat(40) }, active)).toBe(
+      false,
+    );
+    expect(describeCustomUpdateStatus(status)).toMatchObject({ label: "Branch updated" });
+    expect(
+      describeCustomUpdateStatus({
+        ...status,
+        status: "pending",
+        mode: "custom-checkout-direct-bypass",
+        resultSha: null,
+        validation: "not-required",
+      }),
+    ).toMatchObject({
+      label: "Update pending",
+      validation: expect.stringContaining("explicit bypass"),
+    });
+    expect(describeCustomUpdateStatus({ ...status, status: "unavailable" }).label).toBe(
+      "Update unavailable",
+    );
+  });
+
   it("persists an uncertain PR key for retry and creates a new key only for an explicit rerun", () => {
     const initial = startPullRequestEvidence(
       null,

@@ -75,6 +75,12 @@ describe("mobile preferences state", () => {
               state: "uncertain",
             },
           },
+          forkCompatibilityCustomUpdateRequests: {
+            "server-1": {
+              requestId: "00000000-0000-4000-8000-000000000011",
+              state: "uncertain",
+            },
+          },
           forkCompatibilityPendingChecks: {
             "server-1": [{ sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" }],
           },
@@ -100,6 +106,16 @@ describe("mobile preferences state", () => {
               state: "active",
             },
           },
+          forkCompatibilityCustomUpdateRequests: {
+            "server-1": {
+              requestId: "00000000-0000-4000-8000-000000000012",
+              state: "active",
+            },
+            "server-2": {
+              requestId: "00000000-0000-4000-8000-000000000013",
+              state: "uncertain",
+            },
+          },
         });
         yield* Effect.promise(() =>
           vi.waitFor(() => {
@@ -117,6 +133,16 @@ describe("mobile preferences state", () => {
                   state: "active",
                 },
               },
+              forkCompatibilityCustomUpdateRequests: {
+                "server-1": {
+                  requestId: "00000000-0000-4000-8000-000000000012",
+                  state: "active",
+                },
+                "server-2": {
+                  requestId: "00000000-0000-4000-8000-000000000013",
+                  state: "uncertain",
+                },
+              },
               forkCompatibilityPendingChecks: {
                 "server-1": [{ sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" }],
               },
@@ -132,6 +158,16 @@ describe("mobile preferences state", () => {
         expect(saved.forkCompatibilityPendingChecks?.["server-1"]).toEqual([
           { sourceDirectory: "/srv/fork", idempotencyKey: "retry-key" },
         ]);
+        expect(saved.forkCompatibilityCustomUpdateRequests).toEqual({
+          "server-1": {
+            requestId: "00000000-0000-4000-8000-000000000012",
+            state: "active",
+          },
+          "server-2": {
+            requestId: "00000000-0000-4000-8000-000000000013",
+            state: "uncertain",
+          },
+        });
 
         unmountUpdate();
         unmountPreferences();

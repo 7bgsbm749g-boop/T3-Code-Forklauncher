@@ -25,12 +25,38 @@ import {
   validationProfileJson,
 } from "../forkCompatibility/model.ts";
 import { pushExactLease } from "./ForkGithubGitTransport.ts";
+import * as CustomUpdateEvidenceResolver from "./ForkGithubCustomUpdateEvidenceResolver.ts";
 
 const API = "https://api.github.com";
 const API_VERSION = "2026-03-10";
 const ACTIONS_LIST_PAGE_SIZE = 100;
 const ACTIONS_LIST_MAX_PAGES = 10;
 export const FORK_GITHUB_COMPATIBILITY_CHECK_NAME = "T3 Fork Compatibility";
+const CustomUpdateSnapshotBindingSchema = Schema.Struct({
+  requestId: Schema.String,
+  mode: Schema.Literals(["validated", "custom-checkout-direct-bypass"]),
+  sourceSha: Schema.String,
+  sourceTreeSha: Schema.String,
+  targetSha: Schema.String,
+  policySha256: Schema.String,
+  profileSha256: Schema.String,
+  identitySha256: Schema.String,
+});
+const CustomUpdateEvidenceBindingSchema = Schema.Struct({
+  requestId: Schema.String,
+  status: Schema.Literal("ready"),
+  usable: Schema.Literal(true),
+  candidateSha: Schema.String,
+  candidateTreeSha: Schema.String,
+  snapshot: CustomUpdateSnapshotBindingSchema,
+});
+type CustomUpdateEvidenceBinding = typeof CustomUpdateEvidenceBindingSchema.Type;
+const decodeCustomUpdateSnapshotBinding = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(CustomUpdateSnapshotBindingSchema),
+);
+const decodeCustomUpdateEvidenceBinding = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(CustomUpdateEvidenceBindingSchema),
+);
 const jsonBody = (value: unknown) =>
   HttpClientRequest.bodyUint8Array(
     new TextEncoder().encode(JSON.stringify(value)),
@@ -210,6 +236,14 @@ export interface RequiredCheckIdentity {
 export interface ForkGithubGatePolicySnapshot {
   readonly sha256: string;
   readonly requiredChecks: ReadonlyArray<RequiredCheckIdentity>;
+  /** Operator-owned custom-update policy; absent is always fail-closed. */
+  readonly directPushBypass?: boolean;
+  readonly target?: {
+    readonly owner: string;
+    readonly repository: string;
+    readonly repositoryId: number;
+    readonly branch: string;
+  };
 }
 export class ForkGithubGatePolicy extends Context.Service<
   ForkGithubGatePolicy,
@@ -339,6 +373,7 @@ export class ForkGithubRefUpdateTransport extends Context.Service<
       readonly branch: string;
       readonly expectedOldSha: string;
       readonly candidateSha: string;
+      readonly candidateTreeSha?: string;
       readonly token: string;
     }) => Effect.Effect<
       { readonly ok: boolean; readonly unknown?: boolean },
@@ -463,17 +498,46 @@ const ActionsWorkflowArtifactsJson = Schema.Struct({
 const WorkflowDispatchResponseJson = Schema.Struct({ workflow_run_id: Schema.Finite });
 const GatePolicyCanonicalSchema = Schema.Struct({
   sha256: Schema.String,
+  directPushBypass: Schema.Boolean,
+  target: Schema.NullOr(
+    Schema.Struct({
+      owner: Schema.String,
+      repository: Schema.String,
+      repositoryId: Schema.Finite,
+      branch: Schema.String,
+    }),
+  ),
   requiredChecks: Schema.Array(Schema.Struct({ name: Schema.String, appId: Schema.Finite })),
 });
+const DirectUpdateActionIdentity = Schema.fromJsonString(
+  Schema.Struct({
+    mode: Schema.Literals(["validated", "custom-checkout-direct-bypass"]),
+    target: Schema.Struct({
+      owner: Schema.String,
+      repository: Schema.String,
+      branch: Schema.String,
+    }),
+    policy: Schema.String,
+    expectedTargetSha: Schema.String,
+    candidateSha: Schema.String,
+    candidateTreeSha: Schema.String,
+    snapshotIdentitySha256: Schema.String,
+    validationEvidenceSha256: Schema.NullOr(Schema.String),
+  }),
+);
+const decodeDirectUpdateActionIdentity = Schema.decodeUnknownEffect(DirectUpdateActionIdentity);
+const encodeDirectUpdateActionIdentity = Schema.encodeSync(DirectUpdateActionIdentity);
 const encodeGatePolicy = Schema.encodeSync(GatePolicyCanonicalSchema);
 export const canonicalGatePolicyJson = (policy: ForkGithubGatePolicySnapshot) => {
   const encoded = encodeGatePolicy({
     sha256: policy.sha256.toLowerCase(),
+    directPushBypass: policy.directPushBypass === true,
+    target: policy.target ?? null,
     requiredChecks: [...policy.requiredChecks]
       .map(({ name, appId }) => ({ name, appId }))
       .toSorted((a, b) => a.name.localeCompare(b.name) || a.appId - b.appId),
   });
-  return `${encoded.sha256}\n${encoded.requiredChecks
+  return `${encoded.sha256}\n${encoded.directPushBypass ? "1" : "0"}\n${encoded.target === null ? "null" : JSON.stringify(encoded.target)}\n${encoded.requiredChecks
     .map(({ name, appId }) => `${name.length}:${name}:${appId}`)
     .join("\n")}`;
 };
@@ -560,9 +624,7 @@ export const verifyCandidateAncestry = (
         allowNonZeroExit: true,
       });
       if (result.exitCode !== 0)
-        return yield* fail(
-          "Stable candidate does not contain both the current fork source and official stable target.",
-        );
+        return yield* fail("Candidate does not contain the required target ancestry.");
     }
   });
 
@@ -631,6 +693,31 @@ export interface ForkGithubAdapterShape {
     readonly actionId: string;
   }) => Effect.Effect<
     { readonly sha: string; readonly alreadyApplied: boolean },
+    ForkGithubAdapterFailure
+  >;
+  /** Server-only custom path; stable promotions never call this operation. */
+  readonly advanceCustomDirectUpdate: (input: {
+    readonly requestId: string;
+    readonly operationId: string;
+    readonly fingerprint: string;
+    readonly mode: "validated" | "custom-checkout-direct-bypass";
+    readonly snapshotIdentitySha256: string;
+    readonly expectedTargetSha: string;
+    readonly candidateSha: string;
+    readonly candidateTreeSha: string;
+    readonly repositoryRoot: string;
+    readonly validationEvidenceJson?: string;
+    readonly beforeUpdate: () => Effect.Effect<void, ForkGithubAdapterFailure>;
+  }) => Effect.Effect<
+    { readonly sha: string; readonly alreadyApplied: boolean },
+    ForkGithubAdapterFailure
+  >;
+  readonly customDirectUpdateStatus: (requestId: string) => Effect.Effect<
+    {
+      readonly requestId: string;
+      readonly status: "reserved" | "pushing" | "applied" | "failed" | "cancelled";
+      readonly sha: string | null;
+    } | null,
     ForkGithubAdapterFailure
   >;
   readonly advanceStableRef: (input: {
@@ -754,6 +841,8 @@ export const ForkGithubAdapterInert = Layer.succeed(ForkGithubAdapter, {
   publishCompatibilityCheck: disabled,
   publishPullRequestCompatibilityCheck: disabled,
   advancePullRequestBase: disabled,
+  advanceCustomDirectUpdate: disabled,
+  customDirectUpdateStatus: disabled,
   advanceStableRef: disabled,
   releaseTagTarget: disabled,
   getReleaseByTag: disabled,
@@ -774,6 +863,9 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const actions = yield* ForkGithubDurableActionStore;
   const transport = yield* ForkGithubRefUpdateTransport;
+  const customUpdateEvidenceResolver = yield* Effect.serviceOption(
+    CustomUpdateEvidenceResolver.ForkGithubCustomUpdateEvidenceResolver,
+  );
 
   const auth = Effect.fn("ForkGithubAdapter.auth")(function* (owner: string, repository: string) {
     const config = yield* credentials.resolve();
@@ -1426,12 +1518,20 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
     branch: string;
     expectedBaseSha: string;
     candidateSha: string;
-    evidence: CompatibilityEvidence;
+    evidence: CompatibilityEvidence | undefined;
+    customValidationBypassed?: boolean;
     profile: TrustedValidationProfileWithHash;
     policy: ForkGithubGatePolicySnapshot;
     actionId: string;
     repositoryRoot: string;
     expectedPR?: PullRequestSnapshot;
+    directCandidate?: {
+      readonly expectedTargetSha: string;
+      readonly candidateTreeSha: string;
+      readonly snapshotIdentitySha256: string;
+      readonly validationEvidenceSha256?: string;
+    };
+    customCheckoutEvidence?: CustomUpdateEvidenceBinding;
     beforeUpdate?: () => Effect.Effect<void, ForkGithubAdapterFailure>;
   }) =>
     Effect.gen(function* () {
@@ -1444,19 +1544,52 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
         /[ ~^:?*[\\]/.test(input.branch) ||
         !isGitSha(input.expectedBaseSha) ||
         !isGitSha(input.candidateSha) ||
-        input.candidateSha.toLowerCase() !== input.evidence.candidateSha.toLowerCase()
+        input.candidateSha.toLowerCase() !==
+          (
+            input.evidence?.candidateSha ??
+            input.expectedPR?.mergeCandidateSha ??
+            (input.customValidationBypassed
+              ? input.candidateSha
+              : input.customCheckoutEvidence?.candidateSha)
+          )?.toLowerCase()
       )
         return yield* fail("Invalid branch update identity.");
-      if (!validateEvidence(input.evidence, input.profile))
+      if (input.customValidationBypassed) {
+        if (
+          !input.directCandidate ||
+          input.directCandidate.expectedTargetSha.toLowerCase() !==
+            input.expectedBaseSha.toLowerCase() ||
+          !isGitSha(input.directCandidate.candidateTreeSha) ||
+          !input.policy.directPushBypass
+        )
+          return yield* fail(
+            "Custom validation bypass is not authorized for this exact configured-checkout operation.",
+          );
+      } else if (
+        input.customCheckoutEvidence
+          ? input.customCheckoutEvidence.status !== "ready" ||
+            !input.customCheckoutEvidence.usable ||
+            input.customCheckoutEvidence.candidateSha.toLowerCase() !==
+              input.candidateSha.toLowerCase() ||
+            input.customCheckoutEvidence.candidateTreeSha.toLowerCase() !==
+              input.directCandidate?.candidateTreeSha.toLowerCase() ||
+            input.customCheckoutEvidence.requestId !==
+              input.customCheckoutEvidence.snapshot.requestId ||
+            input.customCheckoutEvidence.snapshot.profileSha256.toLowerCase() !==
+              input.profile.sha256.toLowerCase()
+          : !input.evidence || !validateEvidence(input.evidence, input.profile)
+      ) {
         return yield* fail("Compatibility evidence failed the trusted profile check.");
+      }
       const app = yield* auth(input.owner, input.repository);
-      yield* findSuccessfulCheck(
-        app.token,
-        app.appId,
-        input.owner,
-        input.repository,
-        input.evidence,
-      );
+      if (input.evidence)
+        yield* findSuccessfulCheck(
+          app.token,
+          app.appId,
+          input.owner,
+          input.repository,
+          input.evidence,
+        );
       const verifyRequiredChecks = (policy: ForkGithubGatePolicySnapshot) =>
         requestJson(
           app.token,
@@ -1484,7 +1617,16 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
               : Effect.void;
           }),
         );
-      yield* verifyRequiredChecks(input.policy);
+      yield* verifyRequiredChecks(
+        input.customValidationBypassed || input.customCheckoutEvidence
+          ? {
+              ...input.policy,
+              requiredChecks: input.policy.requiredChecks.filter(
+                (check) => check.name !== FORK_GITHUB_COMPATIBILITY_CHECK_NAME,
+              ),
+            }
+          : input.policy,
+      );
       if (input.expectedPR) {
         const fresh = yield* inspectPullRequest({
           owner: input.owner,
@@ -1509,11 +1651,47 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
         input.branch,
         input.expectedBaseSha.toLowerCase(),
         input.candidateSha.toLowerCase(),
-        checkExternalId(input.evidence),
+        input.evidence
+          ? checkExternalId(input.evidence)
+          : `custom-checkout-direct-v1:${NodeCrypto.createHash("sha256")
+              .update(
+                encodeDirectUpdateActionIdentity({
+                  mode: input.customValidationBypassed
+                    ? "custom-checkout-direct-bypass"
+                    : "validated",
+                  target: {
+                    owner: input.owner.toLowerCase(),
+                    repository: input.repository.toLowerCase(),
+                    branch: input.branch,
+                  },
+                  policy: policyBytes(input.policy),
+                  expectedTargetSha: input.directCandidate!.expectedTargetSha.toLowerCase(),
+                  candidateSha: input.candidateSha.toLowerCase(),
+                  candidateTreeSha: input.directCandidate!.candidateTreeSha.toLowerCase(),
+                  snapshotIdentitySha256: input.directCandidate!.snapshotIdentitySha256,
+                  validationEvidenceSha256: input.directCandidate!.validationEvidenceSha256 ?? null,
+                }),
+              )
+              .digest("hex")}`,
       ].join(":");
       const actionId = input.actionId;
       const ownerId = NodeCrypto.randomUUID();
-      const policySnapshot = actionPolicySnapshot(input.profile, input.policy, input.evidence);
+      const policySnapshot = input.evidence
+        ? actionPolicySnapshot(input.profile, input.policy, input.evidence)
+        : encodeDirectUpdateActionIdentity({
+            mode: input.customValidationBypassed ? "custom-checkout-direct-bypass" : "validated",
+            target: {
+              owner: input.owner.toLowerCase(),
+              repository: input.repository.toLowerCase(),
+              branch: input.branch,
+            },
+            policy: policyBytes(input.policy),
+            expectedTargetSha: input.directCandidate!.expectedTargetSha.toLowerCase(),
+            candidateSha: input.candidateSha.toLowerCase(),
+            candidateTreeSha: input.directCandidate!.candidateTreeSha.toLowerCase(),
+            snapshotIdentitySha256: input.directCandidate!.snapshotIdentitySha256,
+            validationEvidenceSha256: input.directCandidate!.validationEvidenceSha256 ?? null,
+          });
       const now = yield* DateTime.now;
       const reservation = yield* actions.reserve({
         actionId,
@@ -1560,15 +1738,18 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
         return yield* fail(
           "Target branch moved before update; refusing stale candidate promotion.",
         );
-      yield* verifyCandidateAncestry(git.execute, {
-        repositoryRoot: input.repositoryRoot,
-        requiredParents: [input.expectedBaseSha],
-        candidateSha: input.candidateSha,
-      });
+      if (!input.directCandidate)
+        yield* verifyCandidateAncestry(git.execute, {
+          repositoryRoot: input.repositoryRoot,
+          requiredParents: [input.expectedBaseSha],
+          candidateSha: input.candidateSha,
+        });
       if (input.beforeUpdate) yield* input.beforeUpdate();
       const latestProfile = yield* validationProfile.get();
       const latestPolicy = yield* gatePolicy.get();
-      const latestEvidence = yield* evidenceResolver.resolve(input.evidence);
+      const latestEvidence = input.evidence
+        ? yield* evidenceResolver.resolve(input.evidence)
+        : undefined;
       if (
         !latestProfile ||
         !latestPolicy ||
@@ -1576,9 +1757,18 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
         latestProfile.id !== input.profile.id ||
         latestProfile.revision !== input.profile.revision ||
         latestProfile.sha256.toLowerCase() !== input.profile.sha256.toLowerCase() ||
-        !latestEvidence ||
-        !validateEvidence(latestEvidence, latestProfile) ||
-        checkExternalId(latestEvidence) !== checkExternalId(input.evidence)
+        (input.customValidationBypassed
+          ? !latestPolicy.directPushBypass || !input.directCandidate
+          : input.customCheckoutEvidence
+            ? !input.directCandidate ||
+              !input.directCandidate.validationEvidenceSha256 ||
+              input.customCheckoutEvidence.snapshot.policySha256.toLowerCase() !==
+                latestPolicy.sha256.toLowerCase() ||
+              input.customCheckoutEvidence.snapshot.profileSha256.toLowerCase() !==
+                latestProfile.sha256.toLowerCase()
+            : !latestEvidence ||
+              !validateEvidence(latestEvidence, latestProfile) ||
+              checkExternalId(latestEvidence) !== checkExternalId(input.evidence!))
       )
         return yield* fail("Trusted profile or evidence changed before the ref update.");
       const actionBeforePush = yield* actions.get(actionId);
@@ -1590,14 +1780,26 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
         return yield* fail(
           "Durable action was cancelled, expired or transferred before the ref update.",
         );
-      yield* findSuccessfulCheck(
-        app.token,
-        app.appId,
-        input.owner,
-        input.repository,
-        latestEvidence,
-      );
-      yield* verifyRequiredChecks(latestPolicy);
+      if (latestEvidence) {
+        yield* findSuccessfulCheck(
+          app.token,
+          app.appId,
+          input.owner,
+          input.repository,
+          latestEvidence,
+        );
+        yield* verifyRequiredChecks(latestPolicy);
+      } else {
+        yield* verifyRequiredChecks({
+          ...latestPolicy,
+          requiredChecks:
+            input.customValidationBypassed || input.customCheckoutEvidence
+              ? latestPolicy.requiredChecks.filter(
+                  (check) => check.name !== FORK_GITHUB_COMPATIBILITY_CHECK_NAME,
+                )
+              : latestPolicy.requiredChecks,
+        });
+      }
       yield* actions.beginPush({
         actionId,
         fingerprint,
@@ -1614,6 +1816,9 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
                 branch: input.branch,
                 expectedOldSha: input.expectedBaseSha,
                 candidateSha: input.candidateSha,
+                ...(input.directCandidate
+                  ? { candidateTreeSha: input.directCandidate.candidateTreeSha }
+                  : {}),
                 token: app.token,
               }),
             ),
@@ -1689,6 +1894,189 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
     });
   });
 
+  const advanceCustomDirectUpdate: ForkGithubAdapterShape["advanceCustomDirectUpdate"] = Effect.fn(
+    "ForkGithubAdapter.advanceCustomDirectUpdate",
+  )(function* ({
+    requestId,
+    operationId,
+    fingerprint,
+    mode,
+    snapshotIdentitySha256,
+    expectedTargetSha,
+    candidateSha,
+    candidateTreeSha,
+    repositoryRoot,
+    validationEvidenceJson,
+    beforeUpdate,
+  }) {
+    const policy = yield* gatePolicy.get();
+    const profile = yield* validationProfile.get();
+    const configuredTarget = policy?.target;
+    if (
+      !configuredTarget ||
+      !profile ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
+    )
+      return yield* fail(
+        "Custom direct update is unavailable; trusted target, profile, or request identity is not configured.",
+      );
+    if (!isGitSha(expectedTargetSha) || !isGitSha(candidateSha) || !isGitSha(candidateTreeSha))
+      return yield* fail(
+        "Custom direct update requires captured full target, candidate and tree SHAs.",
+      );
+    if (mode === "custom-checkout-direct-bypass" && !policy?.directPushBypass)
+      return yield* fail("Custom direct-update bypass is disabled by trusted policy.");
+    if (Option.isNone(customUpdateEvidenceResolver))
+      return yield* fail("Durable custom-update evidence lookup is unavailable.");
+    const accepted = yield* customUpdateEvidenceResolver.value
+      .get({ operationId, fingerprint })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new ForkGithubAdapterError({
+              reason: "Could not read durable custom-update acceptance.",
+            }),
+        ),
+      );
+    if (!accepted)
+      return yield* fail(
+        "Custom-update operation is not durably accepted or is no longer pending.",
+      );
+    const acceptedSnapshot = yield* decodeCustomUpdateSnapshotBinding(accepted.snapshotJson).pipe(
+      Effect.mapError(
+        () =>
+          new ForkGithubAdapterError({ reason: "Accepted custom-update identity is malformed." }),
+      ),
+    );
+    if (
+      acceptedSnapshot.requestId !== requestId ||
+      acceptedSnapshot.mode !== mode ||
+      acceptedSnapshot.identitySha256.toLowerCase() !== snapshotIdentitySha256.toLowerCase() ||
+      acceptedSnapshot.sourceSha.toLowerCase() !== candidateSha.toLowerCase() ||
+      acceptedSnapshot.sourceTreeSha.toLowerCase() !== candidateTreeSha.toLowerCase() ||
+      acceptedSnapshot.targetSha.toLowerCase() !== expectedTargetSha.toLowerCase()
+    )
+      return yield* fail("Custom-update request differs from its immutable durable acceptance.");
+    let customCheckoutEvidence: CustomUpdateEvidenceBinding | undefined;
+    let validationEvidenceSha256: string | undefined;
+    if (mode === "validated") {
+      if (!validationEvidenceJson || accepted.evidenceJson !== validationEvidenceJson)
+        return yield* fail(
+          "Custom direct update requires the durable validation receipt for this operation.",
+        );
+      customCheckoutEvidence = yield* decodeCustomUpdateEvidenceBinding(
+        validationEvidenceJson,
+      ).pipe(
+        Effect.mapError(
+          () =>
+            new ForkGithubAdapterError({
+              reason: "Durable custom validation receipt is malformed.",
+            }),
+        ),
+      );
+      if (
+        customCheckoutEvidence.requestId !== requestId ||
+        customCheckoutEvidence.snapshot.identitySha256.toLowerCase() !==
+          snapshotIdentitySha256.toLowerCase() ||
+        customCheckoutEvidence.snapshot.sourceSha.toLowerCase() !== candidateSha.toLowerCase() ||
+        customCheckoutEvidence.snapshot.sourceTreeSha.toLowerCase() !==
+          candidateTreeSha.toLowerCase() ||
+        customCheckoutEvidence.snapshot.targetSha.toLowerCase() !== expectedTargetSha.toLowerCase()
+      )
+        return yield* fail(
+          "Durable validation receipt does not match the accepted source and target.",
+        );
+      validationEvidenceSha256 = NodeCrypto.createHash("sha256")
+        .update(validationEvidenceJson)
+        .digest("hex");
+    } else if (validationEvidenceJson || accepted.evidenceJson !== null) {
+      return yield* fail("Bypass operation unexpectedly contains custom validation evidence.");
+    }
+    if (!beforeUpdate)
+      return yield* fail(
+        "Custom direct update requires a fresh server-owned checkout and target identity check.",
+      );
+    return yield* advance({
+      owner: configuredTarget.owner,
+      repository: configuredTarget.repository,
+      branch: configuredTarget.branch,
+      expectedBaseSha: expectedTargetSha,
+      candidateSha,
+      evidence: undefined,
+      customValidationBypassed: mode === "custom-checkout-direct-bypass",
+      profile,
+      policy,
+      actionId: `fork-custom-checkout-direct-v2:${requestId.toLowerCase()}`,
+      repositoryRoot,
+      directCandidate: {
+        expectedTargetSha,
+        candidateTreeSha,
+        snapshotIdentitySha256,
+        ...(validationEvidenceSha256 ? { validationEvidenceSha256 } : {}),
+      },
+      ...(customCheckoutEvidence ? { customCheckoutEvidence } : {}),
+      beforeUpdate,
+    });
+  });
+
+  const customDirectUpdateStatus: ForkGithubAdapterShape["customDirectUpdateStatus"] = Effect.fn(
+    "ForkGithubAdapter.customDirectUpdateStatus",
+  )(function* (requestId) {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
+    )
+      return yield* fail("Custom direct-update status requires its UUID request identity.");
+    let action = yield* actions.get(`fork-custom-checkout-direct-v2:${requestId.toLowerCase()}`);
+    if (!action) return null;
+    if (action.state === "pushing") {
+      const identity = yield* decodeDirectUpdateActionIdentity(action.policySnapshot).pipe(
+        Effect.mapError(
+          () =>
+            new ForkGithubAdapterError({
+              reason: "Uncertain custom-update action identity is invalid.",
+            }),
+        ),
+      );
+      const { owner, repository, branch } = identity.target;
+      if (
+        !/^[A-Za-z0-9-]+$/.test(owner) ||
+        !/^[A-Za-z0-9_.-]+$/.test(repository) ||
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
+        branch.endsWith("/") ||
+        branch.includes("..") ||
+        branch.includes("//") ||
+        branch.includes("@{") ||
+        /[ ~^:?*[\\]/.test(branch)
+      )
+        return yield* fail("Uncertain custom-update target identity is invalid.");
+      const app = yield* auth(owner, repository);
+      const encodedRef = `heads/${branch.split("/").map(encodeURIComponent).join("/")}`;
+      const ref = yield* requestJson(
+        app.token,
+        HttpClientRequest.get(
+          `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/git/ref/${encodedRef}`,
+        ),
+        RefJson,
+      );
+      if (ref.object.sha.toLowerCase() === identity.candidateSha.toLowerCase()) {
+        yield* actions.markApplied({
+          actionId: action.actionId,
+          fingerprint: action.fingerprint,
+          ownerId: action.ownerId,
+          resultSha: identity.candidateSha.toLowerCase(),
+          now: DateTime.formatIso(yield* DateTime.now),
+        });
+        action = yield* actions.get(action.actionId);
+      }
+    }
+    if (!action) return null;
+    return {
+      requestId: requestId.toLowerCase(),
+      status: action.state,
+      sha: action.resultSha ?? null,
+    };
+  });
+
   const advanceStableRef: ForkGithubAdapterShape["advanceStableRef"] = Effect.fn(
     "ForkGithubAdapter.advanceStableRef",
   )(function* (input) {
@@ -1751,6 +2139,8 @@ export const makeForkGithubAdapter = Effect.gen(function* () {
     publishCompatibilityCheck,
     publishPullRequestCompatibilityCheck,
     advancePullRequestBase,
+    advanceCustomDirectUpdate,
+    customDirectUpdateStatus,
     advanceStableRef,
     releaseTagTarget,
     getReleaseByTag,

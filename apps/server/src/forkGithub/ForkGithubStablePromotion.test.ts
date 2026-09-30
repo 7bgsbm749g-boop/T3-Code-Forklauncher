@@ -127,6 +127,10 @@ it.effect(
       },
       publishPullRequestCompatibilityCheck: () => Effect.die("unused"),
       advancePullRequestBase: () => Effect.die("stable promotion never uses a PR merge"),
+      advanceCustomDirectUpdate: () =>
+        Effect.die("stable promotion never uses custom direct update"),
+      customDirectUpdateStatus: () =>
+        Effect.die("stable promotion never reads custom direct update status"),
       advanceStableRef: ({ actionId, identity, candidateSha }) => {
         advanced.push({ actionId, identity });
         return Effect.succeed({ sha: candidateSha, alreadyApplied: false });

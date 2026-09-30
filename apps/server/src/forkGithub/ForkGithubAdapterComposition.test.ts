@@ -16,6 +16,10 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ForkCompatibilityStableSource from "../forkCompatibility/ForkCompatibilityStableSource.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import Migration056 from "../persistence/Migrations/056_ForkGithubActions.ts";
+import Migration063 from "../persistence/Migrations/063_ForkGithubCustomUpdateOperations.ts";
+import * as CustomCheckoutEvidence from "./ForkGithubCustomCheckoutEvidence.ts";
+import * as CustomUpdateEvidenceResolver from "./ForkGithubCustomUpdateEvidenceResolver.ts";
+import * as Operator from "./ForkGithubOperatorConfiguration.ts";
 import * as ForkGithubActionRepositoryModule from "./ForkGithubActionRepository.ts";
 import * as ForkGithubAdapter from "./ForkGithubAdapter.ts";
 import * as ForkGithubNative from "./ForkGithubNativeService.ts";
@@ -123,22 +127,48 @@ it.effect(
     let evidenceReads = 0;
     let cancelBeforePush = false;
     let nativeMode = false;
+    let directPushBypass = false;
+    let configuredTargetRepository = "project";
     let pauseNativeEvidence = false;
     let nativeEvidencePaused = false;
     let nativePolicySha = "f".repeat(64);
+    let stableEvidenceAvailable = true;
+    let movedPullRequest = false;
+    let pauseCustomCheckRead = false;
     let publishedExternalId = externalId;
     let nativeEvidenceReached = Deferred.makeUnsafe<void>();
     const nativeEvidenceContinue = Deferred.makeUnsafe<void>();
     const nativePushCompleted = Deferred.makeUnsafe<void>();
+    const customValidationFinished = Deferred.makeUnsafe<void>();
+    const customValidationStarted = Deferred.makeUnsafe<void>();
+    const releaseCustomValidation = Deferred.makeUnsafe<void>();
+    const customCheckReadReached = Deferred.makeUnsafe<void>();
+    const releaseCustomCheckRead = Deferred.makeUnsafe<void>();
+    const customRefUpdateFinished = Deferred.makeUnsafe<void>();
+    const customRequestId = "8a8b8c8d-1111-4111-8111-222222222222";
+    const customFailureRequestId = "8a8b8c8d-1111-4111-8111-333333333333";
+    const customBypassRequestId = "8a8b8c8d-1111-4111-8111-444444444444";
+    const customGitConfigCanary = NodePath.join(root, "custom-git-config-executed");
+    const customFailureFinished = Deferred.makeUnsafe<void>();
+    const customBypassFinished = Deferred.makeUnsafe<void>();
+    const customUnknownReleased = Deferred.makeUnsafe<void>();
+    let customValidationCalls = 0;
+    let customValidationFails = false;
+    let customCaptureCalls = 0;
     const nativeFinishFailed = Deferred.makeUnsafe<void>();
     let nativeReleaseCompleted = Deferred.makeUnsafe<void>();
     const nativeFinishApplied = Deferred.makeUnsafe<void>();
     const nativeStaleFinished = Deferred.makeUnsafe<void>();
     const database = makeSqlitePersistenceLive(dbPath).pipe(Layer.provide(NodeServices.layer));
-    const migrated = Layer.effectDiscard(Migration056).pipe(Layer.provideMerge(database));
+    const migrated056 = Layer.effectDiscard(Migration056).pipe(Layer.provideMerge(database));
+    const migrated = Layer.effectDiscard(Migration063).pipe(Layer.provideMerge(migrated056));
     const durable = ForkGithubActionRepositoryModule.ForkGithubDurableActionStoreLive.pipe(
       Layer.provideMerge(migrated),
     );
+    const customEvidenceLookup =
+      CustomUpdateEvidenceResolver.ForkGithubCustomUpdateEvidenceResolverLive.pipe(
+        Layer.provideMerge(migrated),
+      );
     const evidenceResolver = Layer.effect(
       ForkGithubAdapter.ForkGithubEvidenceResolver,
       Effect.gen(function* () {
@@ -173,6 +203,7 @@ it.effect(
                 yield* Deferred.succeed(nativeEvidenceReached, undefined);
                 yield* Deferred.await(nativeEvidenceContinue);
               }
+              if (identity.kind === "upstream-stable" && !stableEvidenceAvailable) return undefined;
               return identity.kind === currentEvidence.kind &&
                 identity.sourceSha === head &&
                 identity.targetSha === base &&
@@ -193,7 +224,7 @@ it.effect(
         if (request.url.endsWith("/pulls/7"))
           return {
             state: "open",
-            head: { sha: head },
+            head: { sha: movedPullRequest ? "e".repeat(40) : head },
             base: { ref: "forklauncher", sha: base },
             merge_commit_sha: candidate,
             mergeable: true,
@@ -222,10 +253,17 @@ it.effect(
           return { object: { sha: git(bare, "rev-parse", "refs/heads/forklauncher") } };
         throw new Error(`Unexpected fixture request ${request.method} ${request.url}`);
       })();
-      return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json(body)));
+      const response = HttpClientResponse.fromWeb(request, Response.json(body));
+      return request.url.includes("check-runs?") && pauseCustomCheckRead
+        ? Deferred.succeed(customCheckReadReached, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseCustomCheckRead)),
+            Effect.as(response),
+          )
+        : Effect.succeed(response);
     });
     const dependencies = Layer.mergeAll(
       evidenceResolver,
+      customEvidenceLookup,
       Layer.succeed(HttpClient.HttpClient, http),
       Layer.succeed(ForkGithubAdapter.ForkGithubCredentialResolver, {
         resolve: () => Effect.succeed({ appId, installationId: 774, privateKeyPem }),
@@ -239,10 +277,24 @@ it.effect(
             return Effect.succeed({
               sha256: nativePolicySha,
               requiredChecks: [{ name: "T3 Fork Compatibility", appId }],
+              directPushBypass,
+              target: {
+                owner: "downstream",
+                repository: configuredTargetRepository,
+                repositoryId: 111,
+                branch: "forklauncher",
+              },
             });
           const configured = {
             sha256: "f".repeat(64),
             requiredChecks: [{ name: "T3 Fork Compatibility", appId }],
+            directPushBypass,
+            target: {
+              owner: "downstream",
+              repository: configuredTargetRepository,
+              repositoryId: 111,
+              branch: "forklauncher",
+            },
           };
           if (!policyChange) return Effect.succeed(configured);
           policyReads += 1;
@@ -256,13 +308,20 @@ it.effect(
         resolveStableTagCommit: () => Effect.succeed(base),
       }),
       Layer.succeed(GitVcsDriver.GitVcsDriver, {
-        execute: () =>
-          Effect.succeed({
-            exitCode: 0,
-            stdout: "",
-            stderr: "",
-            stdoutTruncated: false,
-            stderrTruncated: false,
+        execute: (input: GitVcsDriver.ExecuteGitInput) =>
+          Effect.sync(() => {
+            const result = NodeChildProcess.spawnSync("git", [...input.args], {
+              cwd: input.cwd,
+              encoding: "utf8",
+            });
+            if (result.error) throw result.error;
+            return {
+              exitCode: result.status ?? 128,
+              stdout: result.stdout,
+              stderr: "",
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            };
           }),
       } as unknown as GitVcsDriver.GitVcsDriver["Service"]),
       Layer.succeed(ForkGithubAdapter.ForkGithubRefUpdateTransport, {
@@ -413,6 +472,79 @@ it.effect(
         sha256: "d".repeat(64),
       })),
     };
+    const makeCustomSnapshot = (
+      requestId: string,
+      mode: CustomCheckoutEvidence.ForkGithubCustomCheckoutSnapshot["mode"],
+    ): CustomCheckoutEvidence.ForkGithubCustomCheckoutSnapshot => {
+      const identity = {
+        schemaVersion: 1 as const,
+        requestId,
+        mode,
+        sourceRepository: "downstream/project",
+        sourcePathIdentitySha256: "8".repeat(64),
+        sourceRef: "refs/heads/forklauncher",
+        sourceSha: candidate,
+        sourceTreeSha: tree,
+        owner: "downstream",
+        repository: "project",
+        repositoryId: 111,
+        targetBranch: "forklauncher",
+        targetSha: base,
+        policySha256: nativePolicySha,
+        profileId: profile.id,
+        profileRevision: profile.revision,
+        profileSha256: profile.sha256,
+        commands: profile.commands,
+        toolchainSha256: "a".repeat(64),
+        storageIdentitySha256: "b".repeat(64),
+      };
+      return {
+        ...identity,
+        identitySha256: NodeCrypto.createHash("sha256")
+          .update(JSON.stringify(identity))
+          .digest("hex"),
+      };
+    };
+    const customEvidenceServiceLayer = Layer.succeed(
+      CustomCheckoutEvidence.ForkGithubCustomCheckoutEvidenceService,
+      {
+        capture: (requestId, mode = "validated") =>
+          Effect.sync(() => {
+            customCaptureCalls += 1;
+            return makeCustomSnapshot(requestId, mode);
+          }),
+        validate: (acceptedSnapshot) =>
+          Effect.gen(function* () {
+            customValidationCalls += 1;
+            yield* Deferred.succeed(customValidationStarted, undefined);
+            yield* Deferred.await(releaseCustomValidation);
+            const results = acceptedSnapshot.commands.map((command) => ({
+              ...command,
+              exitCode: 0,
+              signal: null,
+              timedOut: false,
+              stdout: "",
+              stderr: "",
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            }));
+            return {
+              schemaVersion: 1 as const,
+              requestId: acceptedSnapshot.requestId,
+              status: customValidationFails ? ("failed" as const) : ("ready" as const),
+              usable: !customValidationFails,
+              snapshot: acceptedSnapshot,
+              candidateSha: acceptedSnapshot.sourceSha,
+              candidateTreeSha: acceptedSnapshot.sourceTreeSha,
+              results,
+              error: customValidationFails ? "fixture validation exit 7" : null,
+              completedAt: "2026-09-29T00:00:00.000Z",
+            };
+          }).pipe(Effect.tap(() => Deferred.succeed(customValidationFinished, undefined))),
+        checkFreshness: () => Effect.succeed({ usable: true, reason: null }),
+        checkSnapshotFreshness: () => Effect.succeed({ usable: true, reason: null }),
+      } satisfies CustomCheckoutEvidence.ForkGithubCustomCheckoutEvidenceServiceShape,
+    );
     const nativeRepositoryBase =
       ForkGithubNativeRepository.ForkGithubNativeOperationRepositoryLive.pipe(
         Layer.provideMerge(migrated),
@@ -448,12 +580,90 @@ it.effect(
                     : Effect.void,
                 ),
               ),
+          finishCustomUpdate: (input: Parameters<typeof repository.finishCustomUpdate>[0]) =>
+            repository
+              .finishCustomUpdate(input)
+              .pipe(
+                Effect.tap(() =>
+                  input.operationId === `fork-custom-update:${customRequestId}` &&
+                  input.state === "applied"
+                    ? Deferred.succeed(customRefUpdateFinished, undefined)
+                    : input.operationId === `fork-custom-update:${customFailureRequestId}` &&
+                        input.state === "failed"
+                      ? Deferred.succeed(customFailureFinished, undefined)
+                      : input.operationId === `fork-custom-update:${customBypassRequestId}` &&
+                          input.state === "applied"
+                        ? Deferred.succeed(customBypassFinished, undefined)
+                        : Effect.void,
+                ),
+              ),
+          releaseCustomUpdate: (input: Parameters<typeof repository.releaseCustomUpdate>[0]) =>
+            repository
+              .releaseCustomUpdate(input)
+              .pipe(
+                Effect.tap(() =>
+                  input.operationId === `fork-custom-update:${customRequestId}` &&
+                  input.error !== null
+                    ? Deferred.succeed(customUnknownReleased, undefined)
+                    : Effect.void,
+                ),
+              ),
         } satisfies ForkGithubNativeRepository.NativeOperationRepositoryShape;
       }),
     ).pipe(Layer.provideMerge(nativeRepositoryBase));
     const nativeBase = Layer.mergeAll(
       fullLayer,
       nativeRepositoryLayer,
+      customEvidenceServiceLayer,
+      Layer.succeed(CustomCheckoutEvidence.ForkGithubCustomCheckoutSource, {
+        getSourceDirectory: () => Effect.succeed(work),
+      }),
+      Layer.succeed(Operator.ForkGithubOperatorConfigurationService, {
+        get: () =>
+          Effect.succeed({
+            target: { owner: "downstream", repository: "project", branch: "forklauncher" },
+            repositoryId: 111,
+            nativeAppId: appId,
+            automaticStablePromotion: false,
+            directPushBypass,
+            validationProfile: profile,
+            gatePolicy: {
+              sha256: nativePolicySha,
+              requiredChecks: [{ name: "T3 Fork Compatibility", appId }],
+              directPushBypass,
+              target: {
+                owner: "downstream",
+                repository: "project",
+                repositoryId: 111,
+                branch: "forklauncher",
+              },
+            },
+            workflow: trustedWorkflow,
+          }),
+      }),
+      Layer.succeed(Operator.ForkGithubOperatorConfigurationService, {
+        get: () =>
+          Effect.succeed({
+            target: { owner: "downstream", repository: "project", branch: "forklauncher" },
+            repositoryId: 111,
+            nativeAppId: appId,
+            automaticStablePromotion: false,
+            directPushBypass,
+            validationProfile: profile,
+            gatePolicy: {
+              sha256: nativePolicySha,
+              requiredChecks: [{ name: "T3 Fork Compatibility", appId }],
+              directPushBypass,
+              target: {
+                owner: "downstream",
+                repository: "project",
+                repositoryId: 111,
+                branch: "forklauncher",
+              },
+            },
+            workflow: trustedWorkflow,
+          }),
+      }),
       Layer.succeed(ForkRequests.ForkCompatibilityRequestRepository, requestRepository),
       Layer.succeed(ForkRuns.ForkCompatibilityRunRepository, runRepository),
       Layer.succeed(ForkRepairs.ForkCompatibilityRepairRepository, repairRepository),
@@ -515,6 +725,70 @@ it.effect(
         assert.equal(pushes, 1);
         assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), candidate);
 
+        // The adapter is not a public acceptance boundary: direct invocations without a
+        // durable NativeService row cannot reach the local ref transport.
+        git(bare, "update-ref", "refs/heads/forklauncher", base);
+        git(work, "checkout", "--detach", candidate);
+        const directUpdate = (requestId: string) =>
+          ForkGithubAdapter.ForkGithubAdapter.pipe(
+            Effect.flatMap((adapter) =>
+              adapter.advanceCustomDirectUpdate({
+                requestId,
+                operationId: `unaccepted:${requestId}`,
+                fingerprint: "a".repeat(64),
+                mode: "custom-checkout-direct-bypass",
+                snapshotIdentitySha256: "b".repeat(64),
+                expectedTargetSha: base,
+                candidateSha: candidate,
+                candidateTreeSha: tree,
+                repositoryRoot: work,
+                beforeUpdate: () => Effect.void,
+              }),
+            ),
+          );
+        const beforeDirectUpdate = pushes;
+        const gated = yield* Effect.exit(directUpdate("7a7b7c7d-1111-4111-8111-111111111111"));
+        assert.equal(gated._tag, "Failure", "adapter rejects a request with no durable acceptance");
+        assert.equal(pushes, beforeDirectUpdate, "unaccepted call cannot reach ref transport");
+        directPushBypass = true;
+        const bypassWithoutAcceptance = yield* Effect.exit(
+          directUpdate("8a8b8c8d-1111-4111-8111-111111111111"),
+        );
+        assert.equal(bypassWithoutAcceptance._tag, "Failure");
+        assert.equal(pushes, beforeDirectUpdate);
+        const beforeStale = pushes;
+        // Even with the custom bypass opted in, stable updates still require resolved native evidence.
+        stableEvidenceAvailable = false;
+        const stableWithoutEvidence = yield* Effect.exit(
+          ForkGithubAdapter.ForkGithubAdapter.pipe(
+            Effect.flatMap((adapter) =>
+              adapter.advanceStableRef({
+                owner: "downstream",
+                repository: "project",
+                repositoryRoot: work,
+                branch: "forklauncher",
+                expectedBaseSha: head,
+                targetTag: "v0.0.42",
+                targetSha: base,
+                candidateSha: candidate,
+                identity: {
+                  kind: "upstream-stable",
+                  requestId: "native-request",
+                  runId: "native-run",
+                  sourceSha: head,
+                  targetSha: base,
+                  candidateSha: candidate,
+                },
+                actionId: "stable-not-bypassed",
+              }),
+            ),
+          ),
+        );
+        stableEvidenceAvailable = true;
+        assert.equal(stableWithoutEvidence._tag, "Failure");
+        assert.equal(pushes, beforeStale);
+        const pushesAfterDirect = pushes;
+        git(bare, "update-ref", "refs/heads/forklauncher", base);
         const sql = yield* SqlClient.SqlClient;
         // Policy and evidence changes between initial validation and final pre-push reread fail closed.
         git(bare, "update-ref", "refs/heads/forklauncher", base);
@@ -523,14 +797,14 @@ it.effect(
         const policyChanged = yield* Effect.exit(advance("composed-policy-change"));
         assert.equal(policyChanged._tag, "Failure");
         policyChange = false;
-        assert.equal(pushes, 1);
+        assert.equal(pushes, pushesAfterDirect);
 
         evidenceChange = true;
         evidenceReads = 0;
         const evidenceChanged = yield* Effect.exit(advance("composed-evidence-change"));
         assert.equal(evidenceChanged._tag, "Failure");
         evidenceChange = false;
-        assert.equal(pushes, 1);
+        assert.equal(pushes, pushesAfterDirect);
 
         cancelBeforePush = true;
         evidenceReads = 0;
@@ -541,7 +815,7 @@ it.effect(
           readonly state: string;
         }>`SELECT state FROM fork_github_actions WHERE action_id='composed-cancel'`;
         assert.equal(cancelledRow[0]?.state, "cancelled");
-        assert.equal(pushes, 1);
+        assert.equal(pushes, pushesAfterDirect);
 
         // An unknown receive-pack result with no remote movement is never journaled as applied.
         git(bare, "update-ref", "refs/heads/forklauncher", base);
@@ -601,6 +875,12 @@ it.effect(
         if (recovery._tag === "Success")
           assert.deepEqual(recovery.value, { sha: candidate, alreadyApplied: true });
         assert.equal(pushes, pushesBeforeRecovery);
+        const reopenedDirectStatus = yield* ForkGithubAdapter.ForkGithubAdapter.pipe(
+          Effect.flatMap((adapter) =>
+            adapter.customDirectUpdateStatus("8a8b8c8d-1111-4111-8111-111111111111"),
+          ),
+        );
+        assert.isNull(reopenedDirectStatus, "no native acceptance means no direct-update action");
         const sql = yield* SqlClient.SqlClient;
         const applied = yield* sql<{
           readonly state: string;
@@ -738,6 +1018,133 @@ it.effect(
         assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), candidate);
       }).pipe(Effect.provide(nativeServiceLayer)),
     );
+    const customCheckoutUpdate = Effect.scoped(
+      Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          nativeMode = true;
+          directPushBypass = false;
+          configuredTargetRepository = "project";
+          const fsmonitor = NodePath.join(root, "candidate-fsmonitor");
+          NodeFS.writeFileSync(
+            fsmonitor,
+            `#!/bin/sh\nprintf called > '${customGitConfigCanary}'\n`,
+            {
+              mode: 0o700,
+            },
+          );
+          git(work, "config", "core.fsmonitor", fsmonitor);
+          git(bare, "update-ref", "refs/heads/forklauncher", base);
+          pauseCustomCheckRead = true;
+        });
+        const service = yield* ForkGithubNative.ForkGithubNativeService;
+        const configured = yield* service.configure({ enabled: true });
+        assert.equal(configured.state, "ready");
+        const beforePushes = pushes;
+        const accepted = yield* service.submitCustomUpdate({ requestId: customRequestId });
+        assert.equal(accepted.status, "pending");
+        assert.equal(accepted.mode, "validated");
+        yield* Deferred.await(customValidationStarted);
+        const repository = yield* ForkGithubNativeRepository.ForkGithubNativeOperationRepository;
+        const acceptedRow = yield* repository.getCustomUpdateByRequestId(customRequestId);
+        assert.isNotNull(acceptedRow);
+        assert.equal(acceptedRow?.input.source.commitSha, candidate);
+        assert.equal(acceptedRow?.input.target.expectedSha, base);
+        assert.include(acceptedRow?.snapshotJson ?? "", '"sourcePathIdentitySha256"');
+        assert.notInclude(acceptedRow?.snapshotJson ?? "", work);
+        const capturesAtAcceptance = customCaptureCalls;
+        const duplicate = yield* service.submitCustomUpdate({ requestId: customRequestId });
+        assert.equal(duplicate.operationId, accepted.operationId);
+        assert.equal(
+          customCaptureCalls,
+          capturesAtAcceptance,
+          "same request reuses its accepted snapshot",
+        );
+        assert.equal((yield* service.customUpdateStatus(customRequestId))?.status, "pending");
+        yield* Deferred.succeed(releaseCustomValidation, undefined);
+        yield* Deferred.await(customValidationFinished);
+        yield* Deferred.await(customCheckReadReached);
+        const evidenceRow = yield* repository.getCustomUpdateEvidence({
+          operationId: accepted.operationId,
+          fingerprint: acceptedRow!.fingerprint,
+        });
+        assert.isNotNull(
+          evidenceRow?.evidenceJson,
+          "trusted validator result is persisted before adapter consumption",
+        );
+        assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), base);
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TRIGGER fail_custom_action_applied BEFORE UPDATE OF state ON fork_github_actions
+          WHEN OLD.action_id='fork-custom-checkout-direct-v2:8a8b8c8d-1111-4111-8111-222222222222' AND NEW.state='applied'
+          BEGIN SELECT RAISE(ABORT, 'simulated uncertain custom ref result'); END`;
+        yield* Effect.sync(() => (pauseCustomCheckRead = false));
+        yield* Deferred.succeed(releaseCustomCheckRead, undefined);
+        yield* Deferred.await(customUnknownReleased);
+        assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), candidate);
+        const unknownAction = yield* sql<{
+          readonly state: string;
+        }>`SELECT state FROM fork_github_actions WHERE action_id='fork-custom-checkout-direct-v2:8a8b8c8d-1111-4111-8111-222222222222'`;
+        assert.equal(unknownAction[0]?.state, "pushing");
+        yield* sql`DROP TRIGGER fail_custom_action_applied`;
+        const recovered = yield* service.submitCustomUpdate({ requestId: customRequestId });
+        assert.equal(recovered.status, "pending");
+        yield* Deferred.await(customRefUpdateFinished);
+        const applied = yield* service.customUpdateStatus(customRequestId);
+        assert.equal(applied?.status, "applied");
+        assert.equal(applied?.validation, "passed");
+        assert.equal(applied?.sourceSha, candidate);
+        assert.equal(applied?.resultSha, candidate);
+        assert.equal(customValidationCalls, 1);
+        assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), candidate);
+        assert.isFalse(
+          NodeFS.existsSync(customGitConfigCanary),
+          "custom direct update never executes candidate-local Git config on the host",
+        );
+        assert.equal(pushes, beforePushes + 1);
+        const retry = yield* service.submitCustomUpdate({ requestId: customRequestId });
+        assert.equal(retry.status, "applied");
+        assert.equal(pushes, beforePushes + 1, "terminal same-key retry does not push again");
+
+        // Validated mode persists a real failing receipt and does not move the target.
+        git(bare, "update-ref", "refs/heads/forklauncher", base);
+        customValidationFails = true;
+        const failedAcceptance = yield* service.submitCustomUpdate({
+          requestId: customFailureRequestId,
+        });
+        assert.equal(failedAcceptance.mode, "validated");
+        yield* Deferred.await(customFailureFinished);
+        const failed = yield* service.customUpdateStatus(customFailureRequestId);
+        assert.equal(failed?.status, "failed");
+        assert.equal(failed?.validation, "failed");
+        assert.equal(pushes, beforePushes + 1);
+        assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), base);
+
+        // Operator opt-in skips only custom validation; it retains the exact leased update.
+        customValidationFails = false;
+        directPushBypass = true;
+        const validationsBeforeBypass = customValidationCalls;
+        const bypassAcceptance = yield* service.submitCustomUpdate({
+          requestId: customBypassRequestId,
+        });
+        assert.equal(bypassAcceptance.mode, "custom-checkout-direct-bypass");
+        yield* Deferred.await(customBypassFinished);
+        const bypassed = yield* service.customUpdateStatus(customBypassRequestId);
+        assert.equal(bypassed?.status, "applied");
+        assert.equal(bypassed?.validation, "not-required");
+        assert.equal(customValidationCalls, validationsBeforeBypass);
+        assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), candidate);
+        assert.equal(pushes, beforePushes + 2);
+        directPushBypass = false;
+      }).pipe(Effect.provide(nativeServiceLayer)),
+    );
+    const customCheckoutReopened = Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ForkGithubNative.ForkGithubNativeService;
+        const duplicate = yield* service.submitCustomUpdate({ requestId: customRequestId });
+        assert.equal(duplicate.status, "applied");
+        assert.equal((yield* service.customUpdateStatus(customRequestId))?.resultSha, candidate);
+        assert.equal(git(bare, "rev-parse", "refs/heads/forklauncher"), candidate);
+      }).pipe(Effect.provide(nativeServiceLayer)),
+    );
     return firstSession.pipe(
       Effect.andThen(reopenedSession),
       Effect.andThen(prepareNative),
@@ -750,6 +1157,8 @@ it.effect(
       Effect.andThen(removeCrashBoundary),
       Effect.andThen(nativeReopenedAndResubmitted),
       Effect.andThen(nativeStaleSnapshotRejected),
+      Effect.andThen(customCheckoutUpdate),
+      Effect.andThen(customCheckoutReopened),
       Effect.ensuring(Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true }))),
     );
   },

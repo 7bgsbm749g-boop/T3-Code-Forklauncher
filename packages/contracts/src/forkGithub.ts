@@ -130,6 +130,39 @@ export const ForkGithubPullRequestEvidenceStatus = Schema.Struct({
 });
 export type ForkGithubPullRequestEvidenceStatus = typeof ForkGithubPullRequestEvidenceStatus.Type;
 
+/** Non-PR update input intentionally carries only a retry key. All repository, target,
+ * validation and bypass choices come from trusted server configuration. */
+export const ForkGithubCustomUpdateSubmit = Schema.Struct({
+  requestId: Schema.String.check(
+    Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+  ),
+});
+export type ForkGithubCustomUpdateSubmit = typeof ForkGithubCustomUpdateSubmit.Type;
+
+export const ForkGithubCustomUpdateStatus = Schema.Struct({
+  requestId: Schema.String,
+  operationId: Schema.String,
+  status: Schema.Literals(["pending", "applied", "failed", "unavailable"]),
+  mode: Schema.Literals(["validated", "custom-checkout-direct-bypass"]),
+  sourceRepository: Schema.String,
+  sourceRef: Schema.String,
+  sourceSha: Schema.String,
+  sourceTreeSha: Schema.String,
+  targetRepository: Schema.String,
+  targetRepositoryId: Schema.Finite,
+  targetRef: Schema.String,
+  expectedTargetSha: Schema.String,
+  candidateSha: Schema.NullOr(Schema.String),
+  validation: Schema.Literals(["not-required", "pending", "passed", "failed", "stale"]),
+  resultSha: Schema.NullOr(Schema.String),
+  diagnostic: Schema.NullOr(
+    Schema.Literals(["pending", "failed", "unavailable", "stale", "applied"]),
+  ),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+export type ForkGithubCustomUpdateStatus = typeof ForkGithubCustomUpdateStatus.Type;
+
 /** Read-only scheduled pipeline summary. Diagnostics are fixed codes, never raw logs/errors. */
 export const ForkGithubPipelineStatus = Schema.Struct({
   status: Schema.Literals([

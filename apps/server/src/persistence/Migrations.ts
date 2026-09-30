@@ -76,6 +76,7 @@ import Migration0059 from "./Migrations/059_ForkGithubActionsBackfill.ts";
 import Migration0060 from "./Migrations/060_ForkGithubPullRequestEvidence.ts";
 import Migration0061 from "./Migrations/061_ForkGithubAutomaticPromotionIntents.ts";
 import Migration0062 from "./Migrations/062_ForkGithubCandidateBuilds.ts";
+import Migration0063 from "./Migrations/063_ForkGithubCustomUpdateOperations.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -150,6 +151,7 @@ const migrationEntries = [
   [60, "ForkGithubPullRequestEvidence", Migration0060],
   [61, "ForkGithubAutomaticPromotionIntents", Migration0061],
   [62, "ForkGithubCandidateBuilds", Migration0062],
+  [63, "ForkGithubCustomUpdateOperations", Migration0063],
 ] as const satisfies ReadonlyArray<MigrationEntry>;
 
 type MigrationEntry = readonly [number, string, typeof Migration0056];
@@ -370,6 +372,8 @@ const knownForkHistories: ReadonlyArray<ReadonlyArray<number>> = [
   [53, 54, 55, 57, 58, 59, 60, 61],
   [53, 54, 55, 56, 57, 58, 59, 60, 61, 62],
   [53, 54, 55, 57, 58, 59, 60, 61, 62],
+  [53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+  [53, 54, 55, 57, 58, 59, 60, 61, 62, 63],
 ];
 
 export class MigrationLineageError extends Schema.TaggedError<MigrationLineageError>()(

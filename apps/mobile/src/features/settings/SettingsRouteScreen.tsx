@@ -62,6 +62,9 @@ import { SettingsSection } from "./components/SettingsSection";
 import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
 import { uuidv4 } from "../../lib/uuid";
 import {
+  acknowledgeCustomUpdate,
+  customUpdateStatusMatchesRequest,
+  describeCustomUpdateStatus,
   acknowledgePullRequestEvidence,
   describePullRequestEvidenceStatus,
   describePullRequestPublication,
@@ -69,12 +72,17 @@ import {
   IdentityEpoch,
   type IdentityToken,
   type PendingPullRequestEvidence,
+  type PendingCustomUpdate,
   forgetPendingForkCheck,
   pendingForkCheckForSource,
   rememberPendingForkCheck,
   startPullRequestEvidence,
+  startCustomUpdate,
 } from "@t3tools/client-runtime/state/fork-compatibility-ui";
-import type { ForkGithubPullRequestEvidenceStatus } from "@t3tools/contracts";
+import type {
+  ForkGithubCustomUpdateStatus,
+  ForkGithubPullRequestEvidenceStatus,
+} from "@t3tools/contracts";
 import { resolveAgentAwarenessPlatformPresentation } from "./SettingsRouteScreen.logic";
 import { planAutoSettleSettingsSync, type AutoSettleSettings } from "./autoSettleSettingsSync";
 
@@ -643,6 +651,12 @@ function ForkCompatibilitySettingsRows() {
     serverEnvironment.forkGithubPullRequestEvidenceStatus,
     { reportFailure: false },
   );
+  const submitCustomUpdate = useAtomCommand(serverEnvironment.forkGithubSubmitCustomUpdate, {
+    reportFailure: false,
+  });
+  const readCustomUpdateStatus = useAtomCommand(serverEnvironment.forkGithubCustomUpdateStatus, {
+    reportFailure: false,
+  });
   const readStatus = useAtomCommand(serverEnvironment.forkCompatibilityStatus, {
     reportFailure: false,
   });
@@ -660,6 +674,9 @@ function ForkCompatibilitySettingsRows() {
     : null;
   const pullRequestRequest: PendingPullRequestEvidence | null = environmentId
     ? (preferences.forkCompatibilityPullRequestEvidence?.[environmentId] ?? null)
+    : null;
+  const customUpdateRequest: PendingCustomUpdate | null = environmentId
+    ? (preferences.forkCompatibilityCustomUpdateRequests?.[environmentId] ?? null)
     : null;
   const [pullRequestDraft, setPullRequestDraft] = useState<{
     readonly environmentId: string | null;
@@ -679,11 +696,18 @@ function ForkCompatibilitySettingsRows() {
     pullRequestRequest?.requestId ?? null,
     connectionPhase,
   ]);
+  const customUpdateIdentity = JSON.stringify([
+    environmentId,
+    customUpdateRequest?.requestId ?? null,
+    connectionPhase,
+  ]);
   const scheduleIdentity = JSON.stringify([environmentId, connectionPhase]);
   const statusEpoch = useRef(new IdentityEpoch(statusIdentity)).current;
   const statusToken = statusEpoch.update(statusIdentity);
   const pullRequestEpoch = useRef(new IdentityEpoch(pullRequestIdentity)).current;
   const pullRequestToken = pullRequestEpoch.update(pullRequestIdentity);
+  const customUpdateEpoch = useRef(new IdentityEpoch(customUpdateIdentity)).current;
+  const customUpdateToken = customUpdateEpoch.update(customUpdateIdentity);
   const scheduleEpoch = useRef(new IdentityEpoch(scheduleIdentity)).current;
   const scheduleToken = scheduleEpoch.update(scheduleIdentity);
   const preferencesRef = useRef(preferences);
@@ -752,11 +776,29 @@ function ForkCompatibilitySettingsRows() {
     readonly error: string | null;
   } | null>(null);
   const [pullRequestBusyIdentity, setPullRequestBusyIdentity] = useState<string | null>(null);
+  const [customUpdateStatusEntry, setCustomUpdateStatusEntry] = useState<{
+    readonly token: IdentityToken;
+    readonly value: ForkGithubCustomUpdateStatus | null;
+    readonly error: string | null;
+  } | null>(null);
+  const [customUpdateBusyIdentity, setCustomUpdateBusyIdentity] = useState<string | null>(null);
   const pullRequestRequestIdentity = JSON.stringify([
     environmentId,
     pullRequestRequest?.requestId ?? null,
   ]);
   const pullRequestBusy = pullRequestBusyIdentity === pullRequestRequestIdentity;
+  const customUpdateRequestIdentity = JSON.stringify([
+    environmentId,
+    customUpdateRequest?.requestId ?? null,
+  ]);
+  const customUpdateBusy = customUpdateBusyIdentity === customUpdateRequestIdentity;
+  const customUpdateStatus =
+    customUpdateStatusEntry?.token === customUpdateToken &&
+    customUpdateStatusMatchesRequest(customUpdateStatusEntry.value, customUpdateRequest)
+      ? customUpdateStatusEntry.value
+      : null;
+  const customUpdateStatusError =
+    customUpdateStatusEntry?.token === customUpdateToken ? customUpdateStatusEntry.error : null;
   const pullRequestStatus =
     pullRequestStatusEntry?.token === pullRequestToken &&
     pullRequestEvidenceStatusMatchesRequest(pullRequestStatusEntry.value, pullRequestRequest)
@@ -902,6 +944,154 @@ function ForkCompatibilitySettingsRows() {
     setPullRequestStatusEntry,
   ]);
 
+  const refreshCustomUpdateStatus = useCallback(async () => {
+    const token = customUpdateToken;
+    const targetEnvironmentId = environmentId;
+    const targetRequestId = customUpdateRequest?.requestId;
+    if (!targetEnvironmentId || !targetRequestId || connectionPhase !== "connected") return;
+    const identity = JSON.stringify([targetEnvironmentId, targetRequestId]);
+    setCustomUpdateBusyIdentity(identity);
+    try {
+      const result = await readCustomUpdateStatus({
+        environmentId: targetEnvironmentId,
+        input: { requestId: targetRequestId },
+      });
+      if (!customUpdateEpoch.isCurrent(token)) return;
+      const value = result._tag === "Success" ? result.value : null;
+      const matches =
+        value === null || customUpdateStatusMatchesRequest(value, customUpdateRequest);
+      setCustomUpdateStatusEntry((current) => {
+        if (
+          matches &&
+          result._tag === "Success" &&
+          value === null &&
+          current?.token === token &&
+          current.value
+        )
+          return current;
+        return {
+          token,
+          value: matches ? value : null,
+          error: !matches
+            ? "The server returned status for a different update request."
+            : result._tag === "Failure"
+              ? "Could not refresh update status. Reconnect and retry."
+              : value === null
+                ? "No accepted update is recorded yet. Retry with this request ID."
+                : null,
+        };
+      });
+    } catch {
+      if (customUpdateEpoch.isCurrent(token))
+        setCustomUpdateStatusEntry({
+          token,
+          value: null,
+          error: "Could not refresh update status. Reconnect and retry.",
+        });
+    } finally {
+      setCustomUpdateBusyIdentity((current) => (current === identity ? null : current));
+    }
+  }, [
+    connectionPhase,
+    customUpdateEpoch,
+    customUpdateRequest,
+    customUpdateToken,
+    environmentId,
+    readCustomUpdateStatus,
+    setCustomUpdateBusyIdentity,
+    setCustomUpdateStatusEntry,
+  ]);
+
+  const requestCustomUpdate = async (newRequest = false) => {
+    const targetEnvironmentId = environmentId;
+    if (!targetEnvironmentId || connectionPhase !== "connected") return;
+    const current =
+      preferencesRef.current.forkCompatibilityCustomUpdateRequests?.[targetEnvironmentId] ?? null;
+    const request = !newRequest && current ? current : startCustomUpdate(uuidv4);
+    const identity = JSON.stringify([targetEnvironmentId, request.requestId]);
+    setCustomUpdateBusyIdentity(identity);
+    setOperationError(null);
+    const currentByEnvironment = preferencesRef.current.forkCompatibilityCustomUpdateRequests ?? {};
+    const savedRequests = { ...currentByEnvironment, [targetEnvironmentId]: request };
+    preferencesRef.current = {
+      ...preferencesRef.current,
+      forkCompatibilityCustomUpdateRequests: savedRequests,
+    };
+    setCustomUpdateStatusEntry(null);
+    try {
+      await savePreferences({ forkCompatibilityCustomUpdateRequests: savedRequests });
+    } catch {
+      if (operationEpoch.isCurrent(operationToken))
+        setOperationError({
+          token: operationToken,
+          message: "Could not save update retry identity; no update was sent.",
+        });
+      preferencesRef.current = {
+        ...preferencesRef.current,
+        forkCompatibilityCustomUpdateRequests: currentByEnvironment,
+      };
+      setCustomUpdateBusyIdentity(null);
+      return;
+    }
+
+    try {
+      const result = await submitCustomUpdate({
+        environmentId: targetEnvironmentId,
+        input: { requestId: request.requestId },
+      });
+      if (result._tag === "Failure") {
+        if (environmentId === targetEnvironmentId)
+          setOperationError({
+            token: operationToken,
+            message:
+              "The response was not received or prerequisites are unavailable. Retry the saved request or check status.",
+          });
+        return;
+      }
+      if (environmentId !== targetEnvironmentId) return;
+      const matches = customUpdateStatusMatchesRequest(result.value, request);
+      if (!matches) {
+        setOperationError({
+          token: operationToken,
+          message: "The server response did not match this update request.",
+        });
+        return;
+      }
+      const responseToken = customUpdateEpoch.update(
+        JSON.stringify([targetEnvironmentId, request.requestId, connectionPhase]),
+      );
+      const acknowledged = acknowledgeCustomUpdate(request, request.requestId);
+      const latest = preferencesRef.current.forkCompatibilityCustomUpdateRequests ?? {};
+      const acknowledgedByEnvironment = { ...latest, [targetEnvironmentId]: acknowledged };
+      preferencesRef.current = {
+        ...preferencesRef.current,
+        forkCompatibilityCustomUpdateRequests: acknowledgedByEnvironment,
+      };
+      setCustomUpdateStatusEntry({ token: responseToken, value: result.value, error: null });
+      try {
+        await savePreferences({
+          forkCompatibilityCustomUpdateRequests: acknowledgedByEnvironment,
+        });
+      } catch {
+        // The earlier uncertain key is durable, so a lost acknowledgement remains retry-safe.
+        preferencesRef.current = {
+          ...preferencesRef.current,
+          forkCompatibilityCustomUpdateRequests: latest,
+        };
+      }
+    } catch {
+      if (environmentId === targetEnvironmentId)
+        setOperationError({
+          token: operationToken,
+          message: "The response was not received. Retry to reuse the saved request ID.",
+        });
+    } finally {
+      setCustomUpdateBusyIdentity((currentIdentity) =>
+        currentIdentity === identity ? null : currentIdentity,
+      );
+    }
+  };
+
   useEffect(() => {
     if (requestId && environment?.connection.phase === "connected") void refresh();
     // Refresh only this selected server/request identity after reconnect.
@@ -912,6 +1102,11 @@ function ForkCompatibilitySettingsRows() {
       void refreshPullRequestStatus();
     }
   }, [connectionPhase, environmentId, pullRequestRequest?.requestId, refreshPullRequestStatus]);
+
+  useEffect(() => {
+    if (customUpdateRequest?.requestId && connectionPhase === "connected")
+      void refreshCustomUpdateStatus();
+  }, [connectionPhase, environmentId, customUpdateRequest?.requestId, refreshCustomUpdateStatus]);
 
   useEffect(() => {
     void refreshScheduleStatus();
@@ -930,6 +1125,7 @@ function ForkCompatibilitySettingsRows() {
   const configured = configuredDirectory;
   const pullRequestPresentation = describePullRequestEvidenceStatus(pullRequestStatus);
   const pullRequestPublication = describePullRequestPublication(pullRequestStatus);
+  const customUpdatePresentation = describeCustomUpdateStatus(customUpdateStatus);
   const parsedPullRequestNumber = Number(pullRequestNumberText.trim());
   const validPullRequestNumber =
     /^\d+$/.test(pullRequestNumberText.trim()) &&
@@ -1283,6 +1479,96 @@ function ForkCompatibilitySettingsRows() {
           ) : null}
         </View>
       ) : null}
+      <View className="mt-4 border-t border-border-subtle px-4 pt-4">
+        <Text className="text-base font-medium text-foreground">Custom branch update</Text>
+        <Text className="mt-1 text-xs text-foreground-muted">
+          This updates the configured remote branch using the server's source checkout. It does not
+          install or replace the running server.
+        </Text>
+        <View className="mt-2 flex-row flex-wrap items-center gap-3">
+          <Pressable
+            accessibilityRole="button"
+            disabled={connectionPhase !== "connected" || customUpdateBusy}
+            className="rounded-lg bg-surface-secondary px-3 py-2 disabled:opacity-50"
+            onPress={() =>
+              void requestCustomUpdate(
+                customUpdateStatus !== null && customUpdateStatus.status !== "pending",
+              )
+            }
+          >
+            <Text className="text-sm text-foreground">
+              {customUpdateBusy
+                ? "Working…"
+                : !customUpdateRequest
+                  ? "Update configured branch"
+                  : customUpdateRequest.state === "uncertain" && !customUpdateStatus
+                    ? "Retry update"
+                    : customUpdateStatus && customUpdateStatus.status !== "pending"
+                      ? "Start new update"
+                      : "Resume update"}
+            </Text>
+          </Pressable>
+          {customUpdateRequest ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={connectionPhase !== "connected" || customUpdateBusy}
+              onPress={() => void refreshCustomUpdateStatus()}
+            >
+              <Text className="text-sm text-foreground">Refresh</Text>
+            </Pressable>
+          ) : null}
+        </View>
+        <Text accessibilityLiveRegion="polite" className="mt-2 text-sm text-foreground">
+          {customUpdateRequest?.state === "uncertain" && !customUpdateStatus
+            ? "Response uncertain"
+            : customUpdatePresentation.label}
+        </Text>
+        {customUpdateRequest ? (
+          <View className="mt-1 space-y-1">
+            <Text className="text-xs text-foreground-muted">
+              {customUpdateStatus
+                ? customUpdatePresentation.detail
+                : (customUpdateStatusError ??
+                  "The server may have accepted this update. Retry with the saved request ID or refresh status.")}
+            </Text>
+            <Text className="text-xs text-foreground-muted">
+              {customUpdatePresentation.validation}
+            </Text>
+            {customUpdateStatus ? (
+              <Text selectable className="text-xs text-foreground-muted">
+                {customUpdateStatus.sourceRepository}@{customUpdateStatus.sourceRef} ·{" "}
+                {customUpdateStatus.sourceSha} → {customUpdateStatus.targetRepository}{" "}
+                {customUpdateStatus.targetRef} (expected {customUpdateStatus.expectedTargetSha})
+              </Text>
+            ) : null}
+            {customUpdateStatus && customUpdateStatus.status !== "pending" ? (
+              <Pressable
+                accessibilityRole="button"
+                disabled={customUpdateBusy}
+                onPress={() => {
+                  const latest = preferencesRef.current.forkCompatibilityCustomUpdateRequests ?? {};
+                  const updated = { ...latest };
+                  delete updated[environmentId!];
+                  preferencesRef.current = {
+                    ...preferencesRef.current,
+                    forkCompatibilityCustomUpdateRequests: updated,
+                  };
+                  setCustomUpdateStatusEntry(null);
+                  void savePreferences({ forkCompatibilityCustomUpdateRequests: updated }).catch(
+                    () =>
+                      setOperationError({
+                        token: operationToken,
+                        message: "Could not clear the saved update request.",
+                      }),
+                  );
+                }}
+              >
+                <Text className="text-xs text-foreground">Reset request</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ) : null}
+      </View>
       <SettingsSwitchRow
         icon="clock"
         label="Automatic stable checks"

@@ -1,4 +1,7 @@
-import type { ForkGithubPullRequestEvidenceStatus } from "@t3tools/contracts";
+import type {
+  ForkGithubCustomUpdateStatus,
+  ForkGithubPullRequestEvidenceStatus,
+} from "@t3tools/contracts";
 
 export interface PendingForkCheck {
   readonly sourceDirectory: string;
@@ -12,7 +15,114 @@ export interface PendingPullRequestEvidence {
   readonly state: "uncertain" | "active";
 }
 
+export interface PendingCustomUpdate {
+  readonly requestId: string;
+  /** uncertain is saved before submit; active means the server acknowledged the durable request. */
+  readonly state: "uncertain" | "active";
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function isPendingCustomUpdate(value: unknown): value is PendingCustomUpdate {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.requestId === "string" &&
+    UUID_PATTERN.test(item.requestId) &&
+    (item.state === "uncertain" || item.state === "active")
+  );
+}
+
+export function sanitizePendingCustomUpdatesByEnvironment(
+  value: unknown,
+): Readonly<Record<string, PendingCustomUpdate>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, PendingCustomUpdate] =>
+      isPendingCustomUpdate(entry[1]),
+    ),
+  );
+}
+
+export function startCustomUpdate(createRequestId: () => string): PendingCustomUpdate {
+  return { requestId: createRequestId(), state: "uncertain" };
+}
+
+export function acknowledgeCustomUpdate(
+  current: PendingCustomUpdate,
+  requestId: string,
+): PendingCustomUpdate {
+  return current.requestId === requestId ? { ...current, state: "active" } : current;
+}
+
+export function customUpdateStatusMatchesRequest(
+  status: ForkGithubCustomUpdateStatus | null,
+  request: PendingCustomUpdate | null | undefined,
+): status is ForkGithubCustomUpdateStatus {
+  return Boolean(
+    status &&
+    request &&
+    status.requestId === request.requestId &&
+    status.operationId === `fork-custom-update:${request.requestId.toLowerCase()}` &&
+    status.sourceRepository.length > 0 &&
+    status.targetRepository.length > 0 &&
+    status.targetRef.startsWith("refs/heads/") &&
+    (status.candidateSha === null || status.candidateSha === status.sourceSha) &&
+    (status.status !== "applied" ||
+      (status.resultSha !== null && status.resultSha === status.candidateSha)),
+  );
+}
+
+export function describeCustomUpdateStatus(status: ForkGithubCustomUpdateStatus | null): {
+  readonly label: string;
+  readonly detail: string;
+  readonly validation: string;
+} {
+  if (!status) {
+    return {
+      label: "Status not available",
+      detail: "Reconnect or refresh to check whether the server accepted this branch update.",
+      validation: "The server-selected validation mode is not yet known.",
+    };
+  }
+  const validation =
+    status.mode === "custom-checkout-direct-bypass"
+      ? "Compatibility commands were skipped under the server operator's explicit bypass policy."
+      : status.validation === "passed"
+        ? "Trusted compatibility validation passed."
+        : status.validation === "failed"
+          ? "Trusted compatibility validation failed."
+          : status.validation === "stale"
+            ? "The validation snapshot became stale."
+            : "Trusted compatibility validation is pending.";
+  switch (status.status) {
+    case "pending":
+      return {
+        label: "Update pending",
+        detail: `${status.targetRepository} ${status.targetRef} is being updated from ${status.sourceRepository} at ${status.candidateSha ?? status.sourceSha}.`,
+        validation,
+      };
+    case "applied":
+      return {
+        label: "Branch updated",
+        detail: `${status.targetRepository} ${status.targetRef} now points to ${status.resultSha}. This did not install or replace the running server.`,
+        validation,
+      };
+    case "failed":
+      return {
+        label: "Update failed",
+        detail:
+          "The configured branch was not confirmed updated. Review server status before starting a new request.",
+        validation,
+      };
+    case "unavailable":
+      return {
+        label: "Update unavailable",
+        detail: "The server could not safely run or complete this configured branch update.",
+        validation,
+      };
+  }
+}
 
 export function isPendingPullRequestEvidence(value: unknown): value is PendingPullRequestEvidence {
   if (typeof value !== "object" || value === null) return false;

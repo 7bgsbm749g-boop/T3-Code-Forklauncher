@@ -1163,6 +1163,22 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => JSON.stringify([environmentId, input.requestId]),
       },
     }),
+    forkGithubSubmitCustomUpdate: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-submit-custom-update",
+      tag: WS_METHODS.forkGithubSubmitCustomUpdate,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.requestId]),
+      },
+    }),
+    forkGithubCustomUpdateStatus: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:fork-github-custom-update-status",
+      tag: WS_METHODS.forkGithubCustomUpdateStatus,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.requestId]),
+      },
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

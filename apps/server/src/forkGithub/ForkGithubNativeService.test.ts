@@ -22,8 +22,10 @@ import type { ForkCompatibilityRun } from "../forkCompatibility/model.ts";
 import * as Native from "./ForkGithubNativeService.ts";
 import * as NativeRepository from "./ForkGithubNativeOperationRepository.ts";
 import * as PullRequestEvidence from "./ForkGithubPullRequestEvidence.ts";
+import * as CustomCheckoutEvidence from "./ForkGithubCustomCheckoutEvidence.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import Migration056 from "../persistence/Migrations/056_ForkGithubActions.ts";
+import Migration063 from "../persistence/Migrations/063_ForkGithubCustomUpdateOperations.ts";
 
 const decodeResult = Schema.decodeUnknownSync(Schema.Struct({ sha: Schema.String }));
 
@@ -254,7 +256,8 @@ it.effect(
       get: () => Effect.succeed(null),
     };
     const database = makeSqlitePersistenceLive(dbPath).pipe(Layer.provide(NodeServices.layer));
-    const migrated = Layer.effectDiscard(Migration056).pipe(Layer.provideMerge(database));
+    const migrated056 = Layer.effectDiscard(Migration056).pipe(Layer.provideMerge(database));
+    const migrated = Layer.effectDiscard(Migration063).pipe(Layer.provideMerge(migrated056));
     const baseRepositoryLayer = NativeRepository.ForkGithubNativeOperationRepositoryLive.pipe(
       Layer.provideMerge(migrated),
     );
@@ -310,6 +313,10 @@ it.effect(
               ? { appId: credentialAppId, installationId: 2, privateKeyPem: "fixture-only" }
               : undefined,
           ),
+      }),
+      Github.ForkGithubAdapterInert,
+      Layer.succeed(CustomCheckoutEvidence.ForkGithubCustomCheckoutSource, {
+        getSourceDirectory: () => Effect.succeed(null),
       }),
       Layer.succeed(Github.ForkGithubValidationProfile, {
         get: () => Effect.succeed(providersReady ? profile : undefined),

@@ -8,6 +8,35 @@ import type { ForkGithubOperationStatus } from "../../../../packages/contracts/s
 import { ForkGithubAdapterError } from "./ForkGithubAdapter.ts";
 import { automaticStableOperationId } from "./ForkGithubAutomaticPromotionIntentRepository.ts";
 
+const GitObjectId = Schema.String.check(Schema.isPattern(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/));
+const Sha256 = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/));
+export const CustomUpdateOperationInputSchema = Schema.Struct({
+  operationId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  kind: Schema.Literal("custom-update"),
+  requestId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+  source: Schema.Struct({
+    repository: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+    ref: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+    commitSha: GitObjectId,
+    treeSha: GitObjectId,
+  }),
+  target: Schema.Struct({
+    repository: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+    repositoryId: Schema.Number.check(Schema.isFinite(), Schema.isInt(), Schema.isGreaterThan(0)),
+    ref: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+    expectedSha: GitObjectId,
+  }),
+  policySha256: Sha256,
+  profileSha256: Sha256,
+  toolchainSha256: Sha256,
+  storageIdentitySha256: Sha256,
+  mode: Schema.Literals(["validated", "custom-checkout-direct-bypass"]),
+});
+const CustomUpdateOperationInputJson = Schema.fromJsonString(CustomUpdateOperationInputSchema);
+const encodeCustomUpdateOperationInput = Schema.encodeUnknownEffect(CustomUpdateOperationInputJson);
+const decodeCustomUpdateOperationInput = Schema.decodeUnknownEffect(CustomUpdateOperationInputJson);
+const customUpdateFail = (reason: string) => new ForkGithubAdapterError({ reason });
+
 const AutomaticPromotionInputJson = Schema.fromJsonString(
   Schema.Struct({
     operationId: Schema.String,
@@ -116,6 +145,97 @@ export interface NativeOperationRepositoryShape {
     readonly error: string | null;
     readonly now: string;
   }) => Effect.Effect<void, SqlError.SqlError | ForkGithubAdapterError>;
+  /** Additive custom-update journal. Kept separate from the promotion/draft row type so
+   * existing native operation dispatch remains exhaustive until its integration lands. */
+  readonly acceptCustomUpdate: (input: {
+    readonly operation: typeof CustomUpdateOperationInputSchema.Type;
+    readonly fingerprint: string;
+    readonly snapshotJson: string;
+    readonly now: string;
+  }) => Effect.Effect<CustomUpdateOperationRow, SqlError.SqlError | ForkGithubAdapterError>;
+  readonly getCustomUpdate: (
+    operationId: string,
+  ) => Effect.Effect<CustomUpdateOperationRow | null, SqlError.SqlError | ForkGithubAdapterError>;
+  readonly getCustomUpdateByRequestId: (
+    requestId: string,
+  ) => Effect.Effect<CustomUpdateOperationRow | null, SqlError.SqlError | ForkGithubAdapterError>;
+  /** Stores server-produced validator evidence while the accepted operation is still pending. */
+  readonly recordCustomUpdateEvidence: (input: {
+    readonly operationId: string;
+    readonly fingerprint: string;
+    readonly ownerId: string;
+    readonly evidenceJson: string;
+    readonly now: string;
+  }) => Effect.Effect<void, SqlError.SqlError | ForkGithubAdapterError>;
+  readonly getCustomUpdateEvidence: (input: {
+    readonly operationId: string;
+    readonly fingerprint: string;
+  }) => Effect.Effect<
+    { readonly snapshotJson: string; readonly evidenceJson: string } | null,
+    SqlError.SqlError | ForkGithubAdapterError
+  >;
+  readonly pendingCustomUpdates: () => Effect.Effect<
+    ReadonlyArray<CustomUpdateOperationRow>,
+    SqlError.SqlError | ForkGithubAdapterError
+  >;
+  readonly claimCustomUpdate: (input: {
+    readonly operationId: string;
+    readonly fingerprint: string;
+    readonly ownerId: string;
+    readonly ownerPid: number;
+    readonly expectedOwnerId: string | null;
+    readonly expectedOwnerPid: number | null;
+    readonly expectedLeaseExpiresAt: string | null;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  }) => Effect.Effect<CustomUpdateOperationRow | null, SqlError.SqlError | ForkGithubAdapterError>;
+  readonly renewCustomUpdate: (input: {
+    readonly operationId: string;
+    readonly fingerprint: string;
+    readonly ownerId: string;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  }) => Effect.Effect<boolean, SqlError.SqlError>;
+  readonly releaseCustomUpdate: (input: {
+    readonly operationId: string;
+    readonly fingerprint: string;
+    readonly ownerId: string;
+    readonly error: string | null;
+    readonly now: string;
+  }) => Effect.Effect<void, SqlError.SqlError>;
+  readonly finishCustomUpdate: (input: {
+    readonly operationId: string;
+    readonly fingerprint: string;
+    readonly ownerId: string;
+    readonly state: CustomUpdateTerminalState;
+    readonly resultJson: string | null;
+    readonly error: string | null;
+    readonly now: string;
+  }) => Effect.Effect<void, SqlError.SqlError | ForkGithubAdapterError>;
+}
+
+export type CustomUpdateTerminalState = Extract<
+  ForkGithubOperationStatus,
+  "applied" | "failed" | "unavailable"
+>;
+
+export interface CustomUpdateOperationRow {
+  readonly operationId: string;
+  readonly requestId: string;
+  readonly kind: "custom-update";
+  readonly fingerprint: string;
+  readonly inputJson: string;
+  readonly input: typeof CustomUpdateOperationInputSchema.Type;
+  readonly snapshotJson: string;
+  readonly evidenceJson: string | null;
+  readonly state: "pending" | CustomUpdateTerminalState;
+  readonly ownerId: string | null;
+  readonly ownerPid: number | null;
+  readonly leaseExpiresAt: string | null;
+  readonly resultJson: string | null;
+  readonly error: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 export class ForkGithubNativeOperationRepository extends Context.Service<
   ForkGithubNativeOperationRepository,
@@ -123,6 +243,11 @@ export class ForkGithubNativeOperationRepository extends Context.Service<
 >()("t3/forkGithub/ForkGithubNativeOperationRepository") {}
 
 const select = `operation_id AS "operationId", kind, fingerprint, input_json AS "inputJson", snapshot_json AS "snapshotJson", state, owner_id AS "ownerId", owner_pid AS "ownerPid", lease_expires_at AS "leaseExpiresAt", result_json AS "resultJson", error, created_at AS "createdAt", updated_at AS "updatedAt"`;
+const selectCustom = `operation_id AS "operationId", request_id AS "requestId", fingerprint, input_json AS "inputJson", snapshot_json AS "snapshotJson", evidence_json AS "evidenceJson", state, owner_id AS "ownerId", owner_pid AS "ownerPid", lease_expires_at AS "leaseExpiresAt", result_json AS "resultJson", error, created_at AS "createdAt", updated_at AS "updatedAt"`;
+type CustomUpdateOperationStoredRow = Omit<CustomUpdateOperationRow, "input" | "kind">;
+const JsonObject = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown));
+const decodeJsonObject = Schema.decodeUnknownEffect(JsonObject);
+const decodeSha256 = Schema.decodeUnknownEffect(Sha256);
 
 export const ForkGithubNativeOperationRepositoryLive = Layer.effect(
   ForkGithubNativeOperationRepository,
@@ -133,6 +258,36 @@ export const ForkGithubNativeOperationRepositoryLive = Layer.effect(
         const rows =
           yield* sql<NativeOperationRow>`SELECT ${sql.unsafe(select)} FROM fork_github_native_operations WHERE operation_id=${operationId} LIMIT 1`;
         return rows[0] ?? null;
+      });
+    const getCustomUpdateRaw = (operationId: string) =>
+      Effect.gen(function* () {
+        const rows =
+          yield* sql<CustomUpdateOperationStoredRow>`SELECT ${sql.unsafe(selectCustom)} FROM fork_github_custom_update_operations WHERE operation_id=${operationId} LIMIT 1`;
+        return rows[0] ?? null;
+      });
+    const decodeCustomUpdateRow = (row: CustomUpdateOperationStoredRow) =>
+      decodeCustomUpdateOperationInput(row.inputJson).pipe(
+        Effect.mapError(() =>
+          customUpdateFail("Stored custom-update identity payload is invalid."),
+        ),
+        Effect.flatMap((input) =>
+          input.operationId === row.operationId && input.requestId === row.requestId
+            ? Effect.succeed({ ...row, input, kind: input.kind } satisfies CustomUpdateOperationRow)
+            : Effect.fail(
+                customUpdateFail("Stored custom-update identity does not match its row."),
+              ),
+        ),
+      );
+    const getCustomUpdate = (operationId: string) =>
+      getCustomUpdateRaw(operationId).pipe(
+        Effect.flatMap((row) => (row ? decodeCustomUpdateRow(row) : Effect.succeed(null))),
+      );
+    const getCustomUpdateByRequestId = (requestId: string) =>
+      Effect.gen(function* () {
+        const rows = yield* sql<{
+          readonly operationId: string;
+        }>`SELECT operation_id AS "operationId" FROM fork_github_custom_update_operations WHERE request_id=${requestId} LIMIT 1`;
+        return rows[0] ? yield* getCustomUpdate(rows[0].operationId) : null;
       });
     return {
       configuration: () =>
@@ -383,6 +538,114 @@ export const ForkGithubNativeOperationRepositoryLive = Layer.effect(
                   new ForkGithubAdapterError({
                     reason: "Native operation lease was lost before its outcome could be recorded.",
                   }),
+                ),
+          ),
+        ),
+      acceptCustomUpdate: (input) =>
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const [encodedInput] = yield* Effect.all([
+              encodeCustomUpdateOperationInput(input.operation).pipe(
+                Effect.mapError(() =>
+                  customUpdateFail("Custom-update identity payload is invalid."),
+                ),
+              ),
+              decodeJsonObject(input.snapshotJson).pipe(
+                Effect.mapError(() =>
+                  customUpdateFail("Custom-update policy snapshot is invalid JSON."),
+                ),
+              ),
+              decodeSha256(input.fingerprint).pipe(
+                Effect.mapError(() =>
+                  customUpdateFail("Custom-update fingerprint must be SHA-256."),
+                ),
+              ),
+            ]);
+            const requestRows = yield* sql<{
+              readonly operationId: string;
+            }>`SELECT operation_id AS "operationId" FROM fork_github_custom_update_operations WHERE request_id=${input.operation.requestId} LIMIT 1`;
+            if (requestRows[0] && requestRows[0].operationId !== input.operation.operationId)
+              return yield* customUpdateFail(
+                "Custom-update request ID is already bound to a different operation.",
+              );
+            yield* sql`INSERT INTO fork_github_custom_update_operations(operation_id,request_id,fingerprint,input_json,snapshot_json,evidence_json,state,owner_id,owner_pid,lease_expires_at,result_json,error,created_at,updated_at)
+            VALUES(${input.operation.operationId},${input.operation.requestId},${input.fingerprint},${encodedInput},${input.snapshotJson},NULL,'pending',NULL,NULL,NULL,NULL,NULL,${input.now},${input.now})
+            ON CONFLICT(operation_id) DO NOTHING`;
+            const saved = yield* getCustomUpdate(input.operation.operationId);
+            if (
+              !saved ||
+              saved.fingerprint !== input.fingerprint ||
+              saved.inputJson !== encodedInput ||
+              saved.snapshotJson !== input.snapshotJson
+            )
+              return yield* customUpdateFail(
+                "Custom-update operation ID was accepted with different immutable identity or policy.",
+              );
+            return saved;
+          }),
+        ),
+      getCustomUpdate,
+      getCustomUpdateByRequestId,
+      recordCustomUpdateEvidence: (input) =>
+        Effect.gen(function* () {
+          yield* decodeJsonObject(input.evidenceJson).pipe(
+            Effect.mapError(() => customUpdateFail("Custom-update evidence is invalid JSON.")),
+          );
+          const rows =
+            yield* sql`UPDATE fork_github_custom_update_operations SET evidence_json=${input.evidenceJson},updated_at=${input.now}
+            WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} AND owner_id=${input.ownerId} AND state='pending' AND lease_expires_at>${input.now} RETURNING operation_id`;
+          if (rows.length === 0)
+            return yield* customUpdateFail(
+              "Custom-update owner lease was lost before evidence was recorded.",
+            );
+        }),
+      getCustomUpdateEvidence: (input) =>
+        Effect.gen(function* () {
+          const rows = yield* sql<{
+            readonly snapshotJson: string;
+            readonly evidenceJson: string | null;
+            readonly state: string;
+          }>`SELECT snapshot_json AS "snapshotJson",evidence_json AS "evidenceJson",state FROM fork_github_custom_update_operations WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} LIMIT 1`;
+          const row = rows[0];
+          return row?.state === "pending" && row.evidenceJson !== null
+            ? { snapshotJson: row.snapshotJson, evidenceJson: row.evidenceJson }
+            : null;
+        }),
+      pendingCustomUpdates: () =>
+        sql<CustomUpdateOperationStoredRow>`SELECT ${sql.unsafe(selectCustom)} FROM fork_github_custom_update_operations WHERE state='pending' ORDER BY created_at,operation_id`.pipe(
+          Effect.flatMap((rows) => Effect.forEach(rows, decodeCustomUpdateRow)),
+        ),
+      claimCustomUpdate: (input) =>
+        Effect.gen(function* () {
+          const rows =
+            input.expectedOwnerId === null
+              ? yield* sql<CustomUpdateOperationStoredRow>`UPDATE fork_github_custom_update_operations SET owner_id=${input.ownerId},owner_pid=${input.ownerPid},lease_expires_at=${input.leaseExpiresAt},error=NULL,updated_at=${input.now}
+                WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} AND state='pending' AND owner_id IS NULL RETURNING ${sql.unsafe(selectCustom)}`
+              : yield* sql<CustomUpdateOperationStoredRow>`UPDATE fork_github_custom_update_operations SET owner_id=${input.ownerId},owner_pid=${input.ownerPid},lease_expires_at=${input.leaseExpiresAt},error=NULL,updated_at=${input.now}
+                WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} AND state='pending' AND owner_id=${input.expectedOwnerId} AND owner_pid IS ${input.expectedOwnerPid} AND lease_expires_at IS ${input.expectedLeaseExpiresAt} RETURNING ${sql.unsafe(selectCustom)}`;
+          return rows[0] ? yield* decodeCustomUpdateRow(rows[0]) : null;
+        }),
+      renewCustomUpdate: (input) =>
+        sql`UPDATE fork_github_custom_update_operations SET lease_expires_at=${input.leaseExpiresAt},updated_at=${input.now}
+          WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} AND owner_id=${input.ownerId}
+          AND state='pending' AND lease_expires_at>${input.now} RETURNING operation_id`.pipe(
+          Effect.map((rows) => rows.length > 0),
+        ),
+      releaseCustomUpdate: (input) =>
+        sql`UPDATE fork_github_custom_update_operations SET owner_id=NULL,owner_pid=NULL,lease_expires_at=NULL,error=${input.error},updated_at=${input.now}
+          WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} AND owner_id=${input.ownerId} AND state='pending'`.pipe(
+          Effect.asVoid,
+        ),
+      finishCustomUpdate: (input) =>
+        sql`UPDATE fork_github_custom_update_operations SET state=${input.state},owner_id=NULL,owner_pid=NULL,lease_expires_at=NULL,result_json=${input.resultJson},error=${input.error},updated_at=${input.now}
+          WHERE operation_id=${input.operationId} AND fingerprint=${input.fingerprint} AND owner_id=${input.ownerId} AND state='pending' AND lease_expires_at>${input.now} RETURNING operation_id`.pipe(
+          Effect.flatMap((rows) =>
+            rows.length > 0
+              ? Effect.void
+              : Effect.fail(
+                  customUpdateFail(
+                    "Custom-update operation lease was lost before recording its outcome.",
+                  ),
                 ),
           ),
         ),

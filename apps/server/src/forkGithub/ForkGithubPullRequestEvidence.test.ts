@@ -64,6 +64,8 @@ const adapter = (
   publishCompatibilityCheck: () => Effect.die("unused"),
   publishPullRequestCompatibilityCheck,
   advancePullRequestBase: () => Effect.die("unused"),
+  advanceCustomDirectUpdate: () => Effect.die("unused"),
+  customDirectUpdateStatus: () => Effect.die("unused"),
   advanceStableRef: () => Effect.die("unused"),
   releaseTagTarget: () => Effect.die("unused"),
   getReleaseByTag: () => Effect.die("unused"),

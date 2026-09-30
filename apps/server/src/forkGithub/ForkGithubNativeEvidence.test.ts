@@ -43,6 +43,7 @@ import {
 import * as StableSource from "../forkCompatibility/ForkCompatibilityStableSource.ts";
 import * as Evidence from "./ForkGithubNativeEvidence.ts";
 import * as Github from "./ForkGithubAdapter.ts";
+import * as CustomCheckoutEvidence from "./ForkGithubCustomCheckoutEvidence.ts";
 import * as ActionRepository from "./ForkGithubActionRepository.ts";
 import * as Promotion from "./ForkGithubStablePromotion.ts";
 import * as Native from "./ForkGithubNativeService.ts";
@@ -1080,6 +1081,7 @@ it.effect(
         repositoryId: 1,
         nativeAppId: appId,
         automaticStablePromotion: true,
+        directPushBypass: false,
         validationProfile: {
           ...trustedValidationProfile,
           sha256: Github.validationProfileSha256(trustedValidationProfile),
@@ -1334,19 +1336,24 @@ it.effect(
       const nativeServiceLayer = Layer.effect(
         Native.ForkGithubNativeService,
         Native.makeForkGithubNativeService,
-      ).pipe(
-        Layer.provideMerge(
-          Layer.mergeAll(
-            trackedOperationRepository,
-            runtime,
-            promotionLayer,
-            candidateReleasePreparationLayer,
-            adapterDependencies,
-            trustLayer,
-            targetLayer,
+      )
+        .pipe(
+          Layer.provideMerge(
+            Layer.mergeAll(
+              trackedOperationRepository,
+              runtime,
+              promotionLayer,
+              candidateReleasePreparationLayer,
+              adapterDependencies,
+              trustLayer,
+              targetLayer,
+              Layer.succeed(CustomCheckoutEvidence.ForkGithubCustomCheckoutSource, {
+                getSourceDirectory: () => Effect.succeed(null),
+              }),
+            ),
           ),
-        ),
-      );
+        )
+        .pipe(Layer.provideMerge(adapterLayer));
       const buildRepository = CandidateBuildRepository.ForkGithubCandidateBuildRepositoryLive.pipe(
         Layer.provideMerge(migrations),
       );
@@ -1359,7 +1366,6 @@ it.effect(
             buildRepository,
             nativeServiceLayer,
             runtime,
-            adapterDependencies,
             operatorLayer,
             candidateWorkflowAdapter,
             promotionLayer,

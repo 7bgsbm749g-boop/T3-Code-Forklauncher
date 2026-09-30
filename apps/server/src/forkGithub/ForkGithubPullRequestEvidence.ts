@@ -244,7 +244,7 @@ const copyCandidateObjects = (source: string, destination: string): void => {
 };
 
 /** Rehomes a detached worktree's object/index data into candidate-local metadata. */
-const materializeCandidateLocalGitMetadata = (input: {
+export const materializeCandidateLocalGitMetadata = (input: {
   readonly candidateRoot: string;
   readonly worktreePath: string;
   readonly bareRepositoryPath: string;

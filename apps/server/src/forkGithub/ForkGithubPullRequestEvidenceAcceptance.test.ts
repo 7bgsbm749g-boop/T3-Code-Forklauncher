@@ -82,6 +82,8 @@ it.effect(
           publishCompatibilityCheck: () => Effect.die("unused"),
           publishPullRequestCompatibilityCheck: () => Effect.die("unused"),
           advancePullRequestBase: () => Effect.die("unused"),
+          advanceCustomDirectUpdate: () => Effect.die("unused"),
+          customDirectUpdateStatus: () => Effect.die("unused"),
           advanceStableRef: () => Effect.die("unused"),
           releaseTagTarget: () => Effect.die("unused"),
           getReleaseByTag: () => Effect.die("unused"),

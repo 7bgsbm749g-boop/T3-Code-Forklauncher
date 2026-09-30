@@ -41,7 +41,11 @@ const fixture = (scenario: "unchanged" | "divergent" | "ancestor") => {
 
 it("advances an unchanged ref to an exact descendant without rewriting history", async () => {
   const f = fixture("unchanged");
+  const canary = NodePath.join(f.dir, "fsmonitor-canary");
+  const fsmonitor = NodePath.join(f.dir, "candidate-fsmonitor");
   try {
+    NodeFS.writeFileSync(fsmonitor, `#!/bin/sh\nprintf called > '${canary}'\n`, { mode: 0o700 });
+    git(f.work, "config", "core.fsmonitor", fsmonitor);
     const result = await pushExactLeaseForLocalFixture({
       cwd: f.work,
       remoteUrl: NodeURL.pathToFileURL(f.bare).href,
@@ -52,8 +56,31 @@ it("advances an unchanged ref to an exact descendant without rewriting history",
     });
     assert.isTrue(result.ok);
     assert.isFalse(result.unknown);
+    assert.isFalse(
+      NodeFS.existsSync(canary),
+      "candidate local Git config is never executed on host",
+    );
     assert.equal(git(f.bare, "rev-parse", "refs/heads/main"), f.candidate);
     assert.equal(git(f.bare, "merge-base", "refs/heads/main", f.base), f.base);
+  } finally {
+    NodeFS.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+it("rejects a mismatched candidate tree in the isolated bare object view", async () => {
+  const f = fixture("unchanged");
+  try {
+    const result = await pushExactLeaseForLocalFixture({
+      cwd: f.work,
+      remoteUrl: NodeURL.pathToFileURL(f.bare).href,
+      branch: "main",
+      expectedOldSha: f.base,
+      candidateSha: f.candidate,
+      candidateTreeSha: "0".repeat(40),
+      platform: "linux",
+    });
+    assert.isFalse(result.ok);
+    assert.equal(git(f.bare, "rev-parse", "refs/heads/main"), f.base);
   } finally {
     NodeFS.rmSync(f.dir, { recursive: true, force: true });
   }
@@ -136,7 +163,7 @@ it("ignores candidate Git config and inherited Git credential/trace configuratio
       });
       assert.isTrue(result.ok);
       const observed = NodeFS.readFileSync(observedEnv, "utf8").trim().split("\n");
-      assert.isTrue(observed.length >= 4);
+      assert.isTrue(observed.length >= 3);
       assert.isTrue(observed.every((line) => line.startsWith("github= gh= trace= app-token=")));
       assert.isTrue(observed.some((line) => line.endsWith("app-token=set")));
       assert.notInclude(observed.join("\n"), "fixture-secret");
