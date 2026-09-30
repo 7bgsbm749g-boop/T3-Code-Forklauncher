@@ -1,7 +1,11 @@
 import * as NodeAssert from "node:assert/strict";
 import * as NodeFS from "node:fs";
 import * as NodeTest from "node:test";
-import { buildForkRuleset, planForkRuleset } from "./fork-ruleset.mjs";
+import {
+  buildForkRuleset,
+  evaluateForkRulesetPreflight,
+  planForkRuleset,
+} from "./fork-ruleset.mjs";
 
 const policy = {
   repository: "7bgsbm749g-boop/T3-Code-Forklauncher",
@@ -127,4 +131,113 @@ NodeTest.test("ruleset setup planning is idempotent and refuses ambiguous duplic
       ),
     /multiple/,
   );
+});
+
+NodeTest.test(
+  "preflight binds the exact open PR merge candidate to the configured App check",
+  () => {
+    const configured = {
+      ...policy,
+      aggregateCheck: { ...policy.aggregateCheck, appId: 424242 },
+      compatibilityEvidence: { ...policy.compatibilityEvidence, trustedAppId: 424242 },
+      nativeIntegration: { appId: 424242 },
+    };
+    const candidateSha = "a".repeat(40);
+    const pullRequest = {
+      number: 17,
+      state: "open",
+      merge_commit_sha: candidateSha,
+      base: {
+        ref: "forklauncher",
+        repo: { full_name: "7bgsbm749g-boop/T3-Code-Forklauncher" },
+      },
+    };
+    const checkRuns = [
+      {
+        name: "T3 Fork Compatibility",
+        head_sha: candidateSha,
+        app: { id: 424242 },
+        status: "completed",
+        conclusion: "success",
+      },
+    ];
+    const repository = { full_name: "7bgsbm749g-boop/T3-Code-Forklauncher" };
+    const ready = evaluateForkRulesetPreflight(configured, { repository, pullRequest, checkRuns });
+    NodeAssert.equal(ready.configurationAndCheckIdentityMatch, true);
+    NodeAssert.equal(ready.canApply, false);
+    NodeAssert.equal(ready.strictUpToDate, true);
+    NodeAssert.equal(ready.candidateSha, candidateSha);
+    NodeAssert.ok(
+      ready.activationPrerequisitesMissing.includes(
+        "installed_app_statuses_write_and_required_check_association_not_verified",
+      ),
+    );
+
+    for (const badRun of [
+      { ...checkRuns[0], app: { id: 7 } },
+      { ...checkRuns[0], head_sha: "b".repeat(40) },
+      { ...checkRuns[0], conclusion: "cancelled" },
+      { ...checkRuns[0], name: "CI" },
+    ]) {
+      const blocked = evaluateForkRulesetPreflight(configured, {
+        repository,
+        pullRequest,
+        checkRuns: [badRun],
+      });
+      NodeAssert.equal(blocked.configurationAndCheckIdentityMatch, false);
+      NodeAssert.ok(blocked.blockers.includes("successful_check_from_configured_app_not_found"));
+    }
+    const movedTarget = evaluateForkRulesetPreflight(configured, {
+      repository,
+      pullRequest: { ...pullRequest, base: { ...pullRequest.base, ref: "other" } },
+      checkRuns,
+    });
+    NodeAssert.ok(movedTarget.blockers.includes("pull_request_target_or_state_mismatch"));
+    NodeAssert.equal(movedTarget.canApply, false);
+    const wrongRepo = evaluateForkRulesetPreflight(configured, {
+      repository: { full_name: "other/repo" },
+      pullRequest,
+      checkRuns,
+    });
+    NodeAssert.ok(wrongRepo.blockers.includes("repository_identity_mismatch"));
+  },
+);
+
+NodeTest.test("payload rejects duplicate required-check contexts", () => {
+  NodeAssert.throws(
+    () =>
+      buildForkRuleset({
+        ...policy,
+        aggregateCheck: {
+          ...policy.aggregateCheck,
+          requiredChecks: [policy.aggregateCheck, policy.aggregateCheck],
+        },
+      }),
+    /sole required context/,
+  );
+});
+
+NodeTest.test("ruleset targets reject malformed refs before producing a payload", () => {
+  for (const targetBranch of [
+    "",
+    "/forklauncher",
+    "forklauncher/",
+    "a//b",
+    "a..b",
+    ".hidden",
+    "topic/.hidden",
+    "topic.lock",
+    "trailing.",
+  ]) {
+    NodeAssert.throws(
+      () => buildForkRuleset({ ...policy, targetBranch }),
+      /valid owner\/repository and target branch/,
+    );
+  }
+  for (const repository of ["../repo", "owner/..", "owner/repo/extra", "owner name/repo"]) {
+    NodeAssert.throws(
+      () => buildForkRuleset({ ...policy, repository }),
+      /valid owner\/repository and target branch/,
+    );
+  }
 });

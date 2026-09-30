@@ -44,3 +44,40 @@ export interface ForkRulesetProjection {
 }
 
 export function buildForkRuleset(policy: ForkRulesetProjectionInput): ForkRulesetProjection;
+
+export interface ForkRulesetPreflight {
+  readonly repository: string | null;
+  readonly targetBranch: string | null;
+  readonly requiredContext: string;
+  readonly expectedAppId: number | null;
+  readonly pullRequestNumber: number | null;
+  readonly candidateSha: string | null;
+  readonly strictUpToDate: true;
+  readonly blockers: ReadonlyArray<string>;
+  readonly configurationAndCheckIdentityMatch: boolean;
+  readonly activationPrerequisitesMissing: ReadonlyArray<string>;
+  readonly canApply: false;
+}
+
+export function evaluateForkRulesetPreflight(
+  policy: ForkRulesetProjectionInput,
+  input: {
+    readonly repository: { readonly full_name?: string };
+    readonly pullRequest?: {
+      readonly number?: number;
+      readonly state?: string;
+      readonly merge_commit_sha?: string | null;
+      readonly base?: {
+        readonly ref?: string;
+        readonly repo?: { readonly full_name?: string };
+      };
+    };
+    readonly checkRuns?: ReadonlyArray<{
+      readonly name?: string;
+      readonly head_sha?: string;
+      readonly app?: { readonly id?: number };
+      readonly status?: string;
+      readonly conclusion?: string | null;
+    }>;
+  },
+): ForkRulesetPreflight;

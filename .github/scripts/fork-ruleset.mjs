@@ -4,14 +4,24 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
 const RULESET_NAME = "T3 Fork Compatibility";
-const CUSTOM_PR_EVIDENCE_PRODUCER_SUPPORTED = false;
 
 export function buildForkRuleset(policy) {
   if (
     typeof policy?.repository !== "string" ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(policy.repository) ||
+    policy.repository.split("/").some((segment) => segment === "." || segment === "..") ||
     typeof policy.targetBranch !== "string" ||
-    !/^[A-Za-z0-9._/-]+$/.test(policy.targetBranch)
+    !/^[A-Za-z0-9._/-]+$/.test(policy.targetBranch) ||
+    policy.targetBranch.startsWith("/") ||
+    policy.targetBranch.endsWith("/") ||
+    policy.targetBranch.includes("//") ||
+    policy.targetBranch.includes("..") ||
+    policy.targetBranch.includes("@{") ||
+    policy.targetBranch
+      .split("/")
+      .some(
+        (segment) => segment.startsWith(".") || segment.endsWith(".") || segment.endsWith(".lock"),
+      )
   ) {
     throw new Error("ruleset policy must identify a valid owner/repository and target branch");
   }
@@ -19,9 +29,7 @@ export function buildForkRuleset(policy) {
     throw new Error("directPushBypass must be an explicit boolean");
   const appId = policy.nativeIntegration?.appId;
   if (!Number.isSafeInteger(appId) || appId <= 0) {
-    throw new Error(
-      "native GitHub App identity is not provisioned; refusing active ruleset payload",
-    );
+    throw new Error("native GitHub App identity is not provisioned; refusing ruleset payload");
   }
   if (
     policy.aggregateCheck?.name !== RULESET_NAME ||
@@ -34,10 +42,12 @@ export function buildForkRuleset(policy) {
   const requiredChecks = policy.aggregateCheck.requiredChecks ?? [policy.aggregateCheck];
   if (
     !Array.isArray(requiredChecks) ||
-    requiredChecks.length === 0 ||
+    requiredChecks.length !== 1 ||
     requiredChecks.some((check) => check.name !== RULESET_NAME || check.appId !== appId)
   ) {
-    throw new Error("required contexts must match the native compatibility check and App identity");
+    throw new Error(
+      "the sole required context must match the native compatibility check and App identity",
+    );
   }
   if (policy.directPushBypass && policy.directPushActorId !== appId) {
     throw new Error("direct-push bypass must name the same native integration App");
@@ -45,9 +55,8 @@ export function buildForkRuleset(policy) {
   return {
     name: RULESET_NAME,
     target: "branch",
-    // No custom-PR evidence producer exists yet. Keep even provisioned payloads
-    // reviewable but inactive until that native path is implemented and tested.
-    enforcement: CUSTOM_PR_EVIDENCE_PRODUCER_SUPPORTED ? "active" : "disabled",
+    // Payloads remain inactive; this tool is read-only and cannot activate a gate.
+    enforcement: "disabled",
     // Only the dedicated coordinator App may write this ref. It must mediate
     // all PR merges and direct updates through the exact-SHA policy helper.
     bypass_actors: [{ actor_id: appId, actor_type: "Integration", bypass_mode: "always" }],
@@ -80,6 +89,77 @@ export function buildForkRuleset(policy) {
         },
       },
     ],
+  };
+}
+
+const FULL_SHA = /^[a-f0-9]{40}$/i;
+
+/** Read-only preflight; a matching check is not itself authorization to activate a gate. */
+export function evaluateForkRulesetPreflight(policy, { repository, pullRequest, checkRuns }) {
+  const appId = policy?.nativeIntegration?.appId;
+  const repositorySlug =
+    typeof policy?.repository === "string" ? policy.repository.toLowerCase() : "";
+  const candidateSha = pullRequest?.merge_commit_sha;
+  const identityBlockers = [];
+  if (
+    typeof repository?.full_name !== "string" ||
+    repository.full_name.toLowerCase() !== repositorySlug
+  ) {
+    identityBlockers.push("repository_identity_mismatch");
+  }
+  if (!Number.isSafeInteger(appId) || appId <= 0)
+    identityBlockers.push("native_app_not_configured");
+  try {
+    buildForkRuleset(policy);
+  } catch {
+    identityBlockers.push("required_check_or_policy_identity_invalid");
+  }
+  if (
+    !Number.isSafeInteger(pullRequest?.number) ||
+    pullRequest.number <= 0 ||
+    pullRequest?.state !== "open" ||
+    typeof pullRequest?.base?.repo?.full_name !== "string" ||
+    pullRequest.base.repo.full_name.toLowerCase() !== repositorySlug ||
+    pullRequest?.base?.ref !== policy?.targetBranch
+  ) {
+    identityBlockers.push("pull_request_target_or_state_mismatch");
+  }
+  if (typeof candidateSha !== "string" || !FULL_SHA.test(candidateSha)) {
+    identityBlockers.push("exact_candidate_sha_required");
+  } else {
+    const matchingCheck =
+      Array.isArray(checkRuns) &&
+      checkRuns.some(
+        (run) =>
+          run?.name === RULESET_NAME &&
+          typeof run?.head_sha === "string" &&
+          run.head_sha.toLowerCase() === candidateSha.toLowerCase() &&
+          run?.app?.id === appId &&
+          run?.status === "completed" &&
+          run?.conclusion === "success",
+      );
+    if (!matchingCheck) identityBlockers.push("successful_check_from_configured_app_not_found");
+  }
+  const activationPrerequisitesMissing = [
+    "installed_app_statuses_write_and_required_check_association_not_verified",
+    "authenticated_native_validation_to_publication_not_live_proven",
+    "separate_operator_activation_review_required",
+  ];
+  return {
+    repository: policy?.repository ?? null,
+    targetBranch: policy?.targetBranch ?? null,
+    requiredContext: RULESET_NAME,
+    expectedAppId: Number.isSafeInteger(appId) ? appId : null,
+    pullRequestNumber: Number.isSafeInteger(pullRequest?.number) ? pullRequest.number : null,
+    candidateSha:
+      typeof candidateSha === "string" && FULL_SHA.test(candidateSha)
+        ? candidateSha.toLowerCase()
+        : null,
+    strictUpToDate: true,
+    blockers: [...new Set(identityBlockers)],
+    configurationAndCheckIdentityMatch: identityBlockers.length === 0,
+    activationPrerequisitesMissing,
+    canApply: false,
   };
 }
 
@@ -126,44 +206,63 @@ async function main(args) {
   const apply = args.includes("--apply");
   const verify = args.includes("--verify");
   const payload = args.includes("--payload");
-  if (apply && !CUSTOM_PR_EVIDENCE_PRODUCER_SUPPORTED) {
+  const preflight = args.includes("--preflight");
+  if (apply) {
     throw new Error(
-      "ruleset apply is disabled until the native custom-PR evidence producer is implemented",
+      "ruleset apply is intentionally unavailable; preflight and separate explicit activation authorization are required",
     );
   }
-  if (payload || apply) {
+  if (payload) {
     const desired = buildForkRuleset(policy);
-    if (payload) {
-      console.log(JSON.stringify(desired, null, 2));
-      return;
-    }
-    if (!args.includes(`--confirm-repository=${policy.repository}`)) {
-      throw new Error(`apply requires --confirm-repository=${policy.repository}`);
-    }
-    const apiPath = `repos/${policy.repository}/rulesets?includes_parents=true`;
-    const existing = ghJson([apiPath]);
-    const plan = planForkRuleset(existing, desired);
-    if (plan.action === "noop") {
-      console.log("ruleset already matches policy");
-      return;
-    }
-    const endpoint =
-      plan.action === "create"
-        ? `repos/${policy.repository}/rulesets`
-        : `repos/${policy.repository}/rulesets/${plan.existing.id}`;
-    const result = ghJson(
-      [endpoint, "--method", plan.action === "create" ? "POST" : "PUT", "--input", "-"],
-      JSON.stringify(desired),
+    console.log(JSON.stringify(desired, null, 2));
+    return;
+  }
+  if (!verify && !preflight)
+    throw new Error("choose --payload, --preflight --pr-number=<number>, or --verify");
+  const apiPath = `repos/${policy.repository}/rulesets?includes_parents=true`;
+  const existing = ghJson([apiPath]);
+  const repository = ghJson([`repos/${policy.repository}`]);
+  const pullRequestValue = args.find((arg) => arg.startsWith("--pr-number="))?.split("=", 2)[1];
+  const pullRequestNumber = Number(pullRequestValue);
+  const pullRequest =
+    preflight && Number.isSafeInteger(pullRequestNumber) && pullRequestNumber > 0
+      ? ghJson([`repos/${policy.repository}/pulls/${pullRequestNumber}`])
+      : undefined;
+  const candidateSha = pullRequest?.merge_commit_sha;
+  let checkRuns;
+  if (
+    preflight &&
+    typeof candidateSha === "string" &&
+    FULL_SHA.test(candidateSha) &&
+    Number.isSafeInteger(policy.nativeIntegration?.appId)
+  ) {
+    const checkResponse = ghJson([
+      `repos/${policy.repository}/commits/${candidateSha}/check-runs?check_name=${encodeURIComponent(RULESET_NAME)}&per_page=100`,
+    ]);
+    checkRuns = checkResponse?.check_runs ?? [];
+  }
+  if (preflight) {
+    const readiness = evaluateForkRulesetPreflight(policy, { repository, pullRequest, checkRuns });
+    const activeNamedRulesets = existing.filter(
+      (ruleset) =>
+        ruleset.name === RULESET_NAME &&
+        ruleset.source_type === "Repository" &&
+        ruleset.enforcement === "active",
     );
     console.log(
-      JSON.stringify({ action: plan.action, repository: policy.repository, result }, null, 2),
+      JSON.stringify(
+        {
+          ...readiness,
+          activeNamedRulesetIds: activeNamedRulesets.map((ruleset) => ruleset.id),
+          applySupported: false,
+          activationRequiresSeparateReview: true,
+        },
+        null,
+        2,
+      ),
     );
     return;
   }
-  if (!apply && !verify)
-    throw new Error("choose --payload, --verify, or --apply --confirm-repository <repository>");
-  const apiPath = `repos/${policy.repository}/rulesets?includes_parents=true`;
-  const existing = ghJson([apiPath]);
   if (verify) {
     const matching = existing.filter(
       (ruleset) => ruleset.name === RULESET_NAME && ruleset.source_type === "Repository",
@@ -178,8 +277,7 @@ async function main(args) {
           actionablePayload: false,
           existingRepositoryRulesets: matching,
           activeBranchRules: activeBranchRules ?? [],
-          reason:
-            "native integration identity is not provisioned; active policy comparison is unavailable",
+          reason: "read-only inspection only; this script does not apply branch enforcement",
         },
         null,
         2,
