@@ -30,6 +30,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -1318,6 +1319,8 @@ export const makeCodexSessionRuntime = (
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
+    const terminalEventRef = yield* Ref.make(false);
+    const terminalEventLock = yield* Semaphore.make(1);
     /** The `additionalContext` of the latest `turn/start`, restored after compaction. */
     const lastAdditionalContextRef =
       yield* Ref.make<CodexTurnStartParamsWithCollaborationMode["additionalContext"]>(undefined);
@@ -1404,10 +1407,11 @@ export const makeCodexSessionRuntime = (
           ...event,
         });
       });
-    const emitSessionEvent = (method: string, message: string) =>
+    const emitSessionEvent = (method: string, message: string, turnId?: TurnId) =>
       emitEvent({
         kind: "session",
         threadId: options.threadId,
+        ...(turnId ? { turnId } : {}),
         method,
         message,
       });
@@ -2453,24 +2457,27 @@ export const makeCodexSessionRuntime = (
 
     yield* child.exitCode.pipe(
       Effect.flatMap((exitCode) =>
-        Ref.get(closedRef).pipe(
-          Effect.flatMap((closed) => {
-            if (closed) {
-              return Effect.void;
-            }
+        terminalEventLock.withPermit(
+          Effect.gen(function* () {
+            if (yield* Ref.get(closedRef)) return;
+            const alreadyReported = yield* Ref.getAndSet(terminalEventRef, true);
+            if (alreadyReported) return;
+
+            const session = yield* Ref.get(sessionRef);
             const nextStatus = exitCode === 0 ? "closed" : "error";
-            return updateSession(sessionRef, {
+            yield* updateSession(sessionRef, {
               status: nextStatus,
               activeTurnId: undefined,
-            }).pipe(
-              Effect.andThen(
-                emitSessionEvent(
-                  "session/exited",
-                  exitCode === 0
-                    ? "Codex App Server exited."
-                    : `Codex App Server exited with code ${exitCode}.`,
-                ),
-              ),
+            });
+            // A clean idle shutdown is graceful. A clean exit during a captured
+            // turn is still unexpected so ingestion can fail that exact turn.
+            const graceful = exitCode === 0 && session.activeTurnId == null;
+            yield* emitSessionEvent(
+              graceful ? "session/closed" : "session/exited",
+              exitCode === 0
+                ? "Codex App Server exited."
+                : `Codex App Server exited with code ${exitCode}.`,
+              session.activeTurnId,
             );
           }),
         ),
@@ -2520,21 +2527,27 @@ export const makeCodexSessionRuntime = (
     });
 
     const close = Effect.gen(function* () {
-      const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
-      if (alreadyClosed) {
-        return;
-      }
+      const shouldCleanup = yield* terminalEventLock.withPermit(
+        Effect.gen(function* () {
+          const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
+          if (alreadyClosed) return false;
+          const alreadyReported = yield* Ref.getAndSet(terminalEventRef, true);
+          if (alreadyReported) return true;
+          yield* updateSession(sessionRef, {
+            status: "closed",
+            activeTurnId: undefined,
+          });
+          yield* emitSessionEvent("session/closed", "Session stopped").pipe(
+            Effect.catch((cause) =>
+              Effect.logError("Failed to emit Codex session closed event.", { cause }),
+            ),
+          );
+          return true;
+        }),
+      );
+      if (!shouldCleanup) return;
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
-      yield* updateSession(sessionRef, {
-        status: "closed",
-        activeTurnId: undefined,
-      });
-      yield* emitSessionEvent("session/closed", "Session stopped").pipe(
-        Effect.catch((cause) =>
-          Effect.logError("Failed to emit Codex session closed event.", { cause }),
-        ),
-      );
       yield* Scope.close(runtimeScope, Exit.void);
       yield* Queue.shutdown(serverNotifications);
       yield* Queue.shutdown(events);

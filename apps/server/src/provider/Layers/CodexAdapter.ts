@@ -111,6 +111,7 @@ export interface CodexAdapterLiveOptions {
 
 interface CodexAdapterSessionContext {
   readonly threadId: ThreadId;
+  readonly generation: symbol;
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
@@ -1502,14 +1503,28 @@ function mapToRuntimeEvents(
     ];
   }
 
-  if (event.method === "session/exited" || event.method === "session/closed") {
+  if (event.method === "session/exited") {
+    const reason = event.message ?? "Codex App Server exited unexpectedly.";
+    return [
+      {
+        ...runtimeEventBase(event, canonicalThreadId),
+        type: "session.state.changed",
+        payload: {
+          state: "error",
+          reason,
+        },
+      },
+    ];
+  }
+
+  if (event.method === "session/closed") {
     return [
       {
         ...runtimeEventBase(event, canonicalThreadId),
         type: "session.exited",
         payload: {
           ...(event.message ? { reason: event.message } : {}),
-          ...(event.method === "session/closed" ? { exitKind: "graceful" } : {}),
+          exitKind: "graceful",
         },
       },
     ];
@@ -2259,8 +2274,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       : undefined);
   const managedNativeEventLogger =
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
-  const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventQueue = yield* Queue.unbounded<{
+    readonly threadId: ThreadId;
+    readonly generation: symbol;
+    readonly event: ProviderRuntimeEvent;
+  }>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const sessionGenerations = new Map<ThreadId, symbol>();
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2273,6 +2293,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           });
         }
 
+        const generation = Symbol();
+        sessionGenerations.set(input.threadId, generation);
         const existing = sessions.get(input.threadId);
         if (existing && !existing.stopped) {
           yield* Effect.suspend(() => stopSessionInternal(existing));
@@ -2514,7 +2536,14 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               });
               return;
             }
-            yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
+            yield* Queue.offerAll(
+              runtimeEventQueue,
+              runtimeEvents.map((event) => ({
+                threadId: input.threadId,
+                generation,
+                event,
+              })),
+            );
           }),
         ).pipe(Effect.forkIn(sessionScope));
 
@@ -2539,6 +2568,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
         sessions.set(input.threadId, {
           threadId: input.threadId,
+          generation,
           scope: sessionScope,
           runtime,
           eventFiber,
@@ -2764,6 +2794,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     yield* session.runtime.close.pipe(Effect.ignore);
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+    if (sessionGenerations.get(session.threadId) === session.generation) {
+      sessionGenerations.delete(session.threadId);
+    }
   });
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
@@ -2819,7 +2852,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     hasSession,
     stopAll,
     get streamEvents() {
-      return Stream.fromQueue(runtimeEventQueue);
+      return Stream.fromQueue(runtimeEventQueue).pipe(
+        Stream.filter(({ threadId, generation }) => {
+          const current = sessionGenerations.get(threadId);
+          return current === undefined || current === generation;
+        }),
+        Stream.map(({ event }) => event),
+      );
     },
   } satisfies CodexAdapterShape;
 });

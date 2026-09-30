@@ -3,6 +3,8 @@ import * as NodeAssert from "node:assert/strict";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeProcess from "node:process";
+import * as NodeURL from "node:url";
 import {
   ApprovalRequestId,
   CodexSettings,
@@ -23,6 +25,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -1790,6 +1793,173 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       NodeAssert.equal(firstEvent.value.threadId, "thread-1");
       NodeAssert.equal(firstEvent.value.payload.reason, "Session stopped");
     }),
+  );
+
+  it.effect("maps an unexpected Codex process exit to a turn-bound session error", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* runtime.emit({
+        id: asEventId("evt-session-exited"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-process-exit"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "session/exited",
+        message: "Codex App Server exited with code 7.",
+      } satisfies ProviderEvent);
+      const event = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(event._tag, "Some");
+      if (event._tag !== "Some" || event.value.type !== "session.state.changed") return;
+      NodeAssert.equal(event.value.threadId, "thread-1");
+      NodeAssert.equal(event.value.turnId, "turn-process-exit");
+      NodeAssert.deepEqual(event.value.payload, {
+        state: "error",
+        reason: "Codex App Server exited with code 7.",
+      });
+    }),
+  );
+
+  it.effect("drops queued lifecycle events from a replaced Codex session", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime: oldRuntime } = yield* startLifecycleRuntime();
+      yield* oldRuntime.emit({
+        id: asEventId("evt-old-session-exit"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("old-turn"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "session/exited",
+        message: "Old Codex process exited.",
+      });
+      // Give the session event pump a scheduling opportunity before replacing
+      // the runtime; any already-enqueued event must still be generation-bound.
+      yield* Effect.yieldNow;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access",
+      });
+      const currentRuntime = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(currentRuntime && currentRuntime !== oldRuntime);
+      yield* currentRuntime.emit({
+        id: asEventId("evt-current-session-ready"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        method: "session/ready",
+      });
+      const nextEvent = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.timeout("10 seconds"),
+      );
+      NodeAssert.ok(nextEvent?._tag === "Some");
+      if (nextEvent?._tag !== "Some") return;
+      NodeAssert.equal(nextEvent.value.type, "session.state.changed");
+      if (nextEvent.value.type === "session.state.changed") {
+        NodeAssert.equal(nextEvent.value.payload.state, "ready");
+      }
+    }),
+  );
+
+  it.effect("treats a clean Codex process exit after turn completion as graceful", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-codex-clean-exit-"));
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(root, { recursive: true })),
+        );
+        const fixturePath = NodeURL.fileURLToPath(
+          new URL("../testFixtures/codexMultiAgentWire.json", import.meta.url),
+        );
+        const peerPath = NodePath.join(root, "peer.mjs");
+        const launcherPath = NodePath.join(root, "codex");
+        const peerSource = `
+import * as fs from "node:fs";
+import * as readline from "node:readline";
+const fixture = JSON.parse(fs.readFileSync(process.env.T3_FAKE_CODEX_FIXTURE, "utf8"));
+const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    write({ id: message.id, result: { userAgent: "synthetic-appserver", codexHome: "/tmp", platformFamily: "unix", platformOs: "linux" } });
+  } else if (message.method === "thread/start") {
+    write({ id: message.id, result: fixture.responses.threadStart });
+  } else if (message.method === "turn/start") {
+    write({ id: message.id, result: fixture.responses.turnStart });
+    const threadId = fixture.responses.threadStart.thread.id;
+    const turnId = fixture.responses.turnStart.turn.id;
+    const started = fixture.notifications.find((entry) => entry.method === "turn/started" && entry.params.threadId === threadId);
+    const completed = fixture.notifications.find((entry) => entry.method === "turn/completed");
+    write({ jsonrpc: "2.0", method: "turn/started", params: started.params });
+    write({ jsonrpc: "2.0", method: "turn/completed", params: { ...completed.params, threadId, turn: { ...completed.params.turn, id: turnId } } });
+  } else if (message.method === "thread/compact/start") {
+    write({ id: message.id, result: {} });
+    process.exit(0);
+  }
+});
+`;
+        const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+        NodeFS.writeFileSync(peerPath, peerSource, { mode: 0o600 });
+        NodeFS.writeFileSync(
+          launcherPath,
+          `#!/bin/sh\nexec ${shellQuote(NodeProcess.execPath)} ${shellQuote(peerPath)}\n`,
+          { mode: 0o700 },
+        );
+        NodeFS.chmodSync(launcherPath, 0o700);
+
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({ binaryPath: launcherPath }), {
+          environment: {
+            PATH: NodeProcess.env.PATH ?? "",
+            T3_FAKE_CODEX_FIXTURE: fixturePath,
+          },
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ServerConfig.layerTest(process.cwd(), process.cwd()),
+              ServerSettingsService.layerTest(),
+              providerSessionDirectoryTestLayer,
+            ).pipe(Layer.provideMerge(NodeServices.layer)),
+          ),
+        );
+        yield* Effect.addFinalizer(() => adapter.stopAll().pipe(Effect.ignore));
+        const gracefulExit = yield* Deferred.make<ProviderRuntimeEvent>();
+        const completedTurn = yield* Deferred.make<ProviderRuntimeEvent>();
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            if (event.type === "turn.completed") yield* Deferred.succeed(completedTurn, event);
+            if (event.type === "session.exited") yield* Deferred.succeed(gracefulExit, event);
+          }),
+        ).pipe(Effect.forkChild);
+
+        const threadId = asThreadId("thread-clean-exit");
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          cwd: root,
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({ threadId, input: "complete fixture turn", attachments: [] });
+        const turnEvent = yield* Deferred.await(completedTurn).pipe(Effect.timeout("10 seconds"));
+        NodeAssert.ok(turnEvent);
+        NodeAssert.equal(turnEvent?.type, "turn.completed");
+        if (turnEvent?.type === "turn.completed")
+          NodeAssert.equal(turnEvent.payload.state, "completed");
+        NodeAssert.equal(adapter.compaction.type, "native");
+        if (adapter.compaction.type !== "native") return;
+        yield* adapter.compaction.start(threadId);
+        const event = yield* Deferred.await(gracefulExit).pipe(Effect.timeout("10 seconds"));
+        NodeAssert.ok(event);
+        NodeAssert.equal(event?.type, "session.exited");
+        if (event?.type === "session.exited") {
+          NodeAssert.equal(event.threadId, threadId);
+          NodeAssert.equal(event.payload.exitKind, "graceful");
+        }
+      }),
+    ),
   );
 
   it.effect("maps retryable Codex error notifications to runtime.warning", () =>

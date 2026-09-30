@@ -3,13 +3,17 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import * as NodeProcess from "node:process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as PubSub from "effect/PubSub";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -20,9 +24,14 @@ import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   CommandId,
+  CodexSettings,
+  EventId,
   ForkCompatibilityRepairEligibility as RepairEligibilitySchema,
+  ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeRequestId,
   TurnId,
+  type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
 import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
@@ -32,12 +41,16 @@ import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/Pro
 import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProviderRuntimeIngestionLive } from "../orchestration/Layers/ProviderRuntimeIngestion.ts";
+import { ProviderRuntimeIngestionService } from "../orchestration/Services/ProviderRuntimeIngestion.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as Coordinator from "./ForkCompatibilityCoordinator.ts";
 import * as Native from "./ForkCompatibilityNativeService.ts";
@@ -47,6 +60,12 @@ import * as RequestRepository from "./ForkCompatibilityRequestRepository.ts";
 import * as RunRepository from "./ForkCompatibilityRunRepository.ts";
 import * as StableSource from "./ForkCompatibilityStableSource.ts";
 import * as ScheduleRepository from "./ForkCompatibilityScheduleRepository.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
+import type { ProviderServiceShape } from "../provider/Services/ProviderService.ts";
+import { makeCodexAdapter } from "../provider/Layers/CodexAdapter.ts";
+import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
+import { ServerActivation } from "../serverActivation.ts";
 import { forkCompatibilityError } from "./ForkCompatibilityError.ts";
 import { forkCompatibilityRepairPolicyDigest } from "./ForkCompatibilityRepairEligibility.ts";
 import type { ValidationProfile } from "./model.ts";
@@ -54,6 +73,7 @@ import type { ValidationProfile } from "./model.ts";
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   NodeChildProcess.execFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
 const repairEligibilityJson = Schema.fromJsonString(RepairEligibilitySchema);
+const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
 const makeGitFixture = () => {
   const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-fork-repair-integration-"));
@@ -104,6 +124,33 @@ const validationProfile: ValidationProfile = {
   ],
 };
 
+const unavailableProviderService: ProviderServiceShape = {
+  startSession: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  sendTurn: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  compactThread: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  interruptTurn: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  respondToRequest: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  respondToUserInput: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  stopSession: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  listSessions: () => Effect.succeed([]),
+  getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+  assertConversationRollbackSupported: () =>
+    Effect.die(new Error("Unexpected provider operation")) as never,
+  getInstanceInfo: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  rollbackConversation: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  uploadFeedback: () => Effect.die(new Error("Unexpected provider operation")) as never,
+  streamEvents: Stream.empty,
+};
+
+const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
+  upsert: () => Effect.void,
+  recordImportedTranscript: () => Effect.die("unused"),
+  getProvider: () => Effect.die("unused"),
+  getBinding: () => Effect.succeedNone,
+  listThreadIds: () => Effect.succeed([]),
+  listBindings: () => Effect.succeed([]),
+});
+
 const makeIntegratedLayer = (input: {
   readonly dbPath: string;
   readonly candidateRoot: string;
@@ -120,6 +167,7 @@ const makeIntegratedLayer = (input: {
   ) => ScheduleRepository.ForkCompatibilityScheduleRepository["Service"];
   readonly onDispatch?: (attempt: RepairRepository.RepairAttempt) => Effect.Effect<void>;
   readonly beforeValidation?: () => Effect.Effect<void>;
+  readonly providerService?: ProviderServiceShape;
 }) => {
   const persistence = makeSqlitePersistenceLive(input.dbPath);
   const orchestration = Layer.mergeAll(
@@ -130,7 +178,7 @@ const makeIntegratedLayer = (input: {
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
     Layer.provideMerge(ThreadBackgroundLiveness.layer),
-    Layer.provide(ThreadPlanProgress.layer),
+    Layer.provideMerge(ThreadPlanProgress.layer),
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
@@ -197,7 +245,7 @@ const makeIntegratedLayer = (input: {
     processLayer,
     stableSource,
   ).pipe(Layer.provideMerge(Layer.mergeAll(NodeFileSystem.layer, NodePathService.layer)));
-  const repair = Repair.ForkCompatibilityRepairServiceLive.pipe(Layer.provideMerge(dependencies));
+  const repair = Repair.ForkCompatibilityRepairServiceLive;
   const observedRepair = Layer.effect(
     Repair.ForkCompatibilityRepairService,
     Effect.gen(function* () {
@@ -213,7 +261,7 @@ const makeIntegratedLayer = (input: {
   ).pipe(Layer.provideMerge(repair));
   const coordinator = Coordinator.ForkCompatibilityCoordinatorLive({
     candidateRoot: input.candidateRoot,
-  }).pipe(Layer.provideMerge(dependencies));
+  });
   const observedCoordinator = Layer.effect(
     Coordinator.ForkCompatibilityCoordinator,
     Effect.gen(function* () {
@@ -227,17 +275,68 @@ const makeIntegratedLayer = (input: {
       });
     }),
   ).pipe(Layer.provideMerge(coordinator));
-  return Native.ForkCompatibilityNativeServiceLiveWith({
+  const native = Native.ForkCompatibilityNativeServiceLiveWith({
     upstreamRemote: input.upstreamRemote,
     profile: input.profile ?? validationProfile,
-  }).pipe(
-    Layer.provideMerge(observedRepair),
-    Layer.provideMerge(observedCoordinator),
+  }).pipe(Layer.provideMerge(observedRepair), Layer.provideMerge(observedCoordinator));
+  const ingestion = ProviderRuntimeIngestionLive.pipe(
+    Layer.provideMerge(
+      Layer.succeed(ProviderService, input.providerService ?? unavailableProviderService),
+    ),
+  );
+  return Layer.merge(native, ingestion).pipe(
     Layer.provideMerge(dependencies),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(CheckpointStore.layer.pipe(Layer.provide(VcsDriverRegistry.layer))),
+    Layer.provideMerge(vcsProcess),
     Layer.provideMerge(NodeFileSystem.layer),
     Layer.provideMerge(NodePathService.layer),
+    Layer.provideMerge(NodeServices.layer),
   );
 };
+
+function makeSyntheticProviderAdapter() {
+  return Effect.gen(function* () {
+    const events = yield* PubSub.unbounded<{
+      readonly event: ProviderRuntimeEvent;
+      readonly consumed: Deferred.Deferred<void>;
+    }>();
+    const unsupported = () =>
+      Effect.die(new Error("Unexpected synthetic provider operation")) as never;
+    const service: ProviderServiceShape = {
+      startSession: unsupported,
+      sendTurn: unsupported,
+      compactThread: unsupported,
+      interruptTurn: unsupported,
+      respondToRequest: unsupported,
+      respondToUserInput: unsupported,
+      stopSession: unsupported,
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+      assertConversationRollbackSupported: unsupported,
+      getInstanceInfo: unsupported,
+      rollbackConversation: unsupported,
+      uploadFeedback: unsupported,
+      streamEvents: Stream.fromPubSub(events).pipe(
+        Stream.flatMap(({ event, consumed }) =>
+          Stream.concat(
+            Stream.succeed(event),
+            Stream.fromEffect(Deferred.succeed(consumed, undefined)).pipe(Stream.drain),
+          ),
+        ),
+      ),
+    };
+    return {
+      service,
+      emitAndWait: (event: ProviderRuntimeEvent) =>
+        Effect.gen(function* () {
+          const consumed = yield* Deferred.make<void>();
+          yield* PubSub.publish(events, { event, consumed });
+          yield* Deferred.await(consumed);
+        }),
+    };
+  });
+}
 
 it.effect(
   "repairs a failed real Git validation through native orchestration and publishes exact fresh evidence",
@@ -395,6 +494,202 @@ it.effect(
         }).pipe(Effect.provide(appLayer));
       }),
     ),
+);
+
+it.effect(
+  "keeps approval waits pending, then terminalizes only the ingested error for the bound provider turn",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = makeGitFixture();
+        const databasePath = NodePath.join(fixture.root, "provider-stop.sqlite");
+        const candidateRoot = NodePath.join(fixture.root, "provider-stop-candidates");
+        const dispatched = yield* Deferred.make<RepairRepository.RepairAttempt>();
+        const provider = yield* makeSyntheticProviderAdapter();
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+        );
+
+        const firstScope = Effect.scoped(
+          Effect.gen(function* () {
+            const service = yield* Native.ForkCompatibilityNativeService;
+            const repairs = yield* RepairRepository.ForkCompatibilityRepairRepository;
+            const repairService = yield* Repair.ForkCompatibilityRepairService;
+            const requests = yield* RequestRepository.ForkCompatibilityRequestRepository;
+            const projections = yield* ProjectionSnapshotQuery;
+            const ingestion = yield* ProviderRuntimeIngestionService;
+            yield* ingestion.start().pipe(Effect.provideService(ServerActivation, undefined));
+
+            const accepted = yield* service.accept({
+              idempotencyKey: "synthetic-provider-stop",
+              repositoryRoot: fixture.repositoryRoot,
+              repairPolicy: {
+                enabled: true,
+                preservedIntent: "Keep fork behavior and diagnose provider termination.",
+                maxAttempts: 1,
+                allowedPaths: ["README.md"],
+                projectId: null,
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "synthetic-fixture-model",
+                },
+              },
+            });
+            const attempt = yield* Deferred.await(dispatched);
+            assert.equal(attempt.runtimeMode, "approval-required");
+            const turnId = TurnId.make("synthetic-provider-stop-turn");
+            const eventBase = {
+              provider: ProviderDriverKind.make("codex"),
+              threadId: attempt.threadId,
+              turnId,
+              createdAt: "2026-09-30T00:00:01.000Z",
+            } as const;
+            const send = (event: ProviderRuntimeEvent) =>
+              provider.emitAndWait(event).pipe(Effect.andThen(ingestion.drain));
+
+            // This adapter event comes from a synthetic provider process after
+            // the native repair command has been accepted. Production ingestion
+            // owns all projection writes in this test.
+            yield* send({
+              ...eventBase,
+              type: "turn.started",
+              eventId: EventId.make("synthetic-provider-turn-started"),
+              payload: {},
+            });
+            const started = yield* repairService.refresh(accepted.requestId, 1);
+            assert.equal(started?.status, "turn-bound");
+            assert.equal(started?.providerTurnId, turnId);
+
+            yield* send({
+              ...eventBase,
+              type: "request.opened",
+              eventId: EventId.make("synthetic-provider-approval-opened"),
+              requestId: RuntimeRequestId.make("synthetic-command-approval"),
+              payload: {
+                requestType: "command_execution_approval",
+                detail: "Synthetic command awaiting approval",
+              },
+            });
+            const approvalThread = Option.getOrThrow(
+              yield* projections.getThreadDetailById(attempt.threadId),
+            );
+            assert.equal(approvalThread.session?.status, "running");
+            assert.equal(approvalThread.session?.activeTurnId, turnId);
+            assert.equal(approvalThread.latestTurn?.state, "running");
+            assert.ok(
+              approvalThread.activities.some((activity) => activity.kind === "approval.requested"),
+            );
+            assert.equal((yield* requests.get(accepted.requestId))?.status, "running");
+            assert.equal(
+              (yield* repairService.refresh(accepted.requestId, 1))?.status,
+              "turn-bound",
+            );
+
+            // The synthetic adapter independently reports its process exit as
+            // a terminal session error. This is distinct from an approval wait
+            // or interruption of the repair observer.
+            const processError = "Synthetic provider process exited with code 7.";
+            yield* send({
+              ...eventBase,
+              type: "session.state.changed",
+              eventId: EventId.make("synthetic-provider-process-stopped"),
+              payload: { state: "error", reason: processError },
+            });
+            const stoppedThread = Option.getOrThrow(
+              yield* projections.getThreadDetailById(attempt.threadId),
+            );
+            assert.equal(stoppedThread.session?.status, "error");
+            assert.equal(stoppedThread.session?.activeTurnId, null);
+            assert.equal(stoppedThread.session?.lastError, processError);
+            // Production ingestion closes the still-running turn when the
+            // provider session leaves running with an error.
+            assert.equal(stoppedThread.latestTurn?.state, "error");
+
+            yield* service.awaitCompletion(accepted.requestId);
+            const terminalAttempt = yield* repairs.get(accepted.requestId, 1);
+            const terminalRequest = yield* requests.get(accepted.requestId);
+            assert.equal(terminalAttempt?.status, "failed");
+            assert.equal(terminalAttempt?.providerTurnId, turnId);
+            assert.equal(terminalAttempt?.error, processError);
+            assert.equal(terminalAttempt?.repairedSha, null);
+            assert.equal(terminalAttempt?.validatedRunId, null);
+            assert.equal(terminalAttempt?.eligibility, null);
+            assert.equal(terminalRequest?.status, "failed");
+            assert.equal(terminalRequest?.error, processError);
+
+            // Re-delivery of the same persisted error is idempotent. A later
+            // unrelated provider turn may change the thread projection, but
+            // must not rebind or overwrite this terminal attempt.
+            yield* send({
+              ...eventBase,
+              type: "session.state.changed",
+              eventId: EventId.make("synthetic-provider-process-stopped"),
+              payload: { state: "error", reason: processError },
+            });
+            yield* send({
+              ...eventBase,
+              turnId: TurnId.make("unrelated-late-turn"),
+              type: "turn.started",
+              eventId: EventId.make("synthetic-unrelated-late-turn"),
+              payload: {},
+            });
+            const unchanged = yield* repairService.refresh(accepted.requestId, 1);
+            const latestThread = Option.getOrThrow(
+              yield* projections.getThreadDetailById(attempt.threadId),
+            );
+            assert.equal(unchanged?.status, "failed");
+            assert.equal(unchanged?.providerTurnId, turnId);
+            assert.equal(unchanged?.error, processError);
+            assert.equal(latestThread.session?.activeTurnId, "unrelated-late-turn");
+            assert.equal((yield* requests.get(accepted.requestId))?.status, "failed");
+          }),
+        ).pipe(
+          Effect.provide(
+            makeIntegratedLayer({
+              dbPath: databasePath,
+              candidateRoot,
+              repositoryRoot: fixture.repositoryRoot,
+              upstreamRemote: fixture.upstreamRemote,
+              targetSha: fixture.targetSha,
+              providerService: provider.service,
+              onDispatch: (attempt) => Deferred.succeed(dispatched, attempt),
+            }),
+          ),
+        );
+        yield* firstScope;
+
+        // Reopen the same on-disk SQLite and confirm the native receipt and
+        // terminal provider-turn identity survived scope reconstruction.
+        const reopenedScope = Effect.scoped(
+          Effect.gen(function* () {
+            const repairs = yield* RepairRepository.ForkCompatibilityRepairRepository;
+            const requests = yield* RequestRepository.ForkCompatibilityRequestRepository;
+            const projections = yield* ProjectionSnapshotQuery;
+            const accepted = yield* requests.getByKey("synthetic-provider-stop");
+            assert.ok(accepted);
+            const attempt = yield* repairs.get(accepted.requestId, 1);
+            assert.equal(attempt?.status, "failed");
+            assert.equal(attempt?.providerTurnId, "synthetic-provider-stop-turn");
+            const thread = Option.getOrThrow(
+              yield* projections.getThreadDetailById(attempt!.threadId),
+            );
+            assert.equal(thread.session?.activeTurnId, "unrelated-late-turn");
+            assert.equal((yield* requests.get(accepted!.requestId))?.status, "failed");
+          }),
+        ).pipe(
+          Effect.provide(
+            makeIntegratedLayer({
+              dbPath: databasePath,
+              candidateRoot,
+              repositoryRoot: fixture.repositoryRoot,
+              upstreamRemote: fixture.upstreamRemote,
+              targetSha: fixture.targetSha,
+            }),
+          ),
+        );
+        yield* reopenedScope;
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect(
@@ -676,6 +971,300 @@ it.effect(
         }).pipe(Effect.provide(appLayer));
       }),
     ),
+);
+
+it.effect(
+  "projects an actual Codex appserver process exit through ingestion and fails the native repair turn",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = makeGitFixture();
+        const peerPath = NodePath.join(fixture.root, "fake-appserver.mjs");
+        const launcherPath = NodePath.join(fixture.root, "fake-codex");
+        const fixturePath = NodeURL.fileURLToPath(
+          new URL("../provider/testFixtures/codexMultiAgentWire.json", import.meta.url),
+        );
+        const pidPath = NodePath.join(fixture.root, "appserver.pid");
+        const peerLogPath = NodePath.join(fixture.root, "appserver.methods.jsonl");
+        const runtimeLogPath = NodePath.join(fixture.root, "provider-events.jsonl");
+        const peerSource = `
+import * as fs from "node:fs";
+import * as readline from "node:readline";
+const fixture = JSON.parse(fs.readFileSync(process.env.T3_FAKE_CODEX_FIXTURE, "utf8"));
+fs.writeFileSync(process.env.T3_FAKE_CODEX_PID, String(process.pid));
+const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  fs.appendFileSync(process.env.T3_FAKE_CODEX_LOG, (message.method ?? "response") + "\\n");
+  if (message.method === "initialize") {
+    write({ id: message.id, result: { userAgent: "synthetic-appserver", codexHome: "/tmp", platformFamily: "unix", platformOs: "linux" } });
+  } else if (message.method === "thread/start") {
+    write({ id: message.id, result: fixture.responses.threadStart });
+  } else if (message.method === "turn/start") {
+    write({ id: message.id, result: fixture.responses.turnStart });
+    const threadId = fixture.responses.threadStart.thread.id;
+    const turnId = fixture.responses.turnStart.turn.id;
+    const started = fixture.notifications.find((entry) => entry.method === "turn/started" && entry.params.threadId === threadId);
+    write({ jsonrpc: "2.0", method: "turn/started", params: started.params });
+    write({ jsonrpc: "2.0", id: 7201, method: "item/commandExecution/requestApproval", params: { itemId: "approval-item-1", startedAtMs: Date.now(), threadId, turnId, command: "printf fixture" } });
+  } else if (message.method === "thread/read") {
+    // Deliberately exit without session.error or turn.completed.
+    process.exit(7);
+  }
+});
+`;
+        const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+        NodeFS.writeFileSync(peerPath, peerSource, { mode: 0o600 });
+        NodeFS.writeFileSync(
+          launcherPath,
+          `#!/bin/sh\nexec ${shellQuote(NodeProcess.execPath)} ${shellQuote(peerPath)}\n`,
+          { mode: 0o700 },
+        );
+        NodeFS.chmodSync(launcherPath, 0o700);
+
+        const adapter = yield* makeCodexAdapter(
+          yield* decodeCodexSettings({ binaryPath: launcherPath }),
+          {
+            environment: {
+              PATH: NodeProcess.env.PATH ?? "",
+              T3_FAKE_CODEX_FIXTURE: fixturePath,
+              T3_FAKE_CODEX_PID: pidPath,
+              T3_FAKE_CODEX_LOG: peerLogPath,
+            },
+          },
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ServerConfig.layerTest(process.cwd(), { prefix: "t3-fork-repair-codex-exit-" }),
+              ServerSettingsService.layerTest(),
+              providerSessionDirectoryTestLayer,
+            ).pipe(Layer.provideMerge(NodeServices.layer)),
+          ),
+        );
+        yield* Effect.addFinalizer(() => adapter.stopAll().pipe(Effect.ignore));
+
+        const dispatched = yield* Deferred.make<RepairRepository.RepairAttempt>();
+        const approvalObserved = yield* Deferred.make<ProviderRuntimeEvent>();
+        const providerTurnStarted = yield* Deferred.make<ProviderRuntimeEvent>();
+        const providerService: ProviderServiceShape = {
+          ...unavailableProviderService,
+          streamEvents: adapter.streamEvents.pipe(
+            Stream.tap((event) =>
+              Effect.gen(function* () {
+                NodeFS.appendFileSync(
+                  runtimeLogPath,
+                  `${event.type}\t${event.threadId}\t${event.turnId ?? ""}\t${event.type === "request.opened" ? event.payload.requestType : ""}\t${event.type === "session.state.changed" ? event.payload.state : ""}\n`,
+                );
+                if (event.type === "turn.started") {
+                  yield* Deferred.succeed(providerTurnStarted, event);
+                }
+                if (
+                  event.type === "request.opened" &&
+                  event.payload.requestType === "command_execution_approval"
+                ) {
+                  yield* Deferred.succeed(approvalObserved, event);
+                }
+              }),
+            ),
+          ),
+        };
+        const appLayer = makeIntegratedLayer({
+          dbPath: NodePath.join(fixture.root, "codex-process-exit.sqlite"),
+          candidateRoot: NodePath.join(fixture.root, "codex-process-exit-candidates"),
+          repositoryRoot: fixture.repositoryRoot,
+          upstreamRemote: fixture.upstreamRemote,
+          targetSha: fixture.targetSha,
+          providerService,
+          onDispatch: (attempt) =>
+            Effect.andThen(
+              Deferred.succeed(dispatched, attempt),
+              Effect.andThen(
+                adapter.startSession({
+                  provider: ProviderDriverKind.make("codex"),
+                  threadId: attempt.threadId,
+                  cwd: attempt.candidatePath,
+                  runtimeMode: attempt.runtimeMode,
+                  modelSelection: attempt.modelSelection,
+                }),
+                adapter
+                  .sendTurn({
+                    threadId: attempt.threadId,
+                    input: attempt.prompt,
+                    modelSelection: attempt.modelSelection,
+                  })
+                  .pipe(Effect.asVoid),
+              ),
+            ).pipe(Effect.orDie),
+        });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(fixture.root, { recursive: true, force: true })),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* Native.ForkCompatibilityNativeService;
+          const requests = yield* RequestRepository.ForkCompatibilityRequestRepository;
+          const repairs = yield* RepairRepository.ForkCompatibilityRepairRepository;
+          const repairService = yield* Repair.ForkCompatibilityRepairService;
+          const projections = yield* ProjectionSnapshotQuery;
+          const ingestion = yield* ProviderRuntimeIngestionService;
+          yield* ingestion.start().pipe(Effect.provideService(ServerActivation, undefined));
+
+          const accepted = yield* service.accept({
+            idempotencyKey: "codex-appserver-process-exit",
+            repositoryRoot: fixture.repositoryRoot,
+            repairPolicy: {
+              enabled: true,
+              preservedIntent: "Keep fork behavior while incorporating stable changes.",
+              maxAttempts: 1,
+              allowedPaths: ["README.md"],
+              projectId: null,
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "gpt-6-luna",
+              },
+            },
+          });
+          const dispatchStage = yield* Effect.race(
+            Deferred.await(dispatched).pipe(Effect.as("dispatched" as const)),
+            service.awaitCompletion(accepted.requestId).pipe(Effect.as("terminal" as const)),
+          ).pipe(Effect.timeout("10 seconds"));
+          if (dispatchStage === undefined) {
+            const currentRequest = yield* requests.get(accepted.requestId);
+            const currentAttempt = yield* RepairRepository.ForkCompatibilityRepairRepository.pipe(
+              Effect.flatMap((repository) => repository.get(accepted.requestId, 1)),
+            );
+            assert.fail(
+              `dispatch wait expired: request=${currentRequest?.status}/${currentRequest?.error}; attempt=${currentAttempt?.status}/${currentAttempt?.providerTurnId}`,
+            );
+          }
+          if (dispatchStage === undefined) return;
+          if (dispatchStage === "terminal") {
+            const failedRequest = yield* requests.get(accepted.requestId);
+            assert.fail(`repair terminalized before provider dispatch: ${failedRequest?.error}`);
+          }
+          const boundAttempt = yield* Deferred.await(dispatched);
+          assert.equal(boundAttempt.attempt, 1);
+          assert.equal(boundAttempt.runtimeMode, "approval-required");
+
+          const stage = yield* Effect.race(
+            Deferred.await(approvalObserved).pipe(Effect.as("approval" as const)),
+            service.awaitCompletion(accepted.requestId).pipe(Effect.as("terminal" as const)),
+          ).pipe(Effect.timeout("10 seconds"));
+          if (stage === undefined) {
+            const methods = NodeFS.existsSync(peerLogPath)
+              ? NodeFS.readFileSync(peerLogPath, "utf8")
+              : "no-child-input";
+            assert.fail(`no approval or durable terminal receipt; appserver methods=${methods}`);
+          }
+          if (stage === "terminal") {
+            const failedRequest = yield* requests.get(accepted.requestId);
+            assert.fail(`Codex appserver terminated before approval: ${failedRequest?.error}`);
+          }
+          const startedEvent = yield* Deferred.await(providerTurnStarted);
+          yield* ingestion.drain;
+          assert.equal(startedEvent.type, "turn.started");
+          const waitingThread = Option.getOrThrow(
+            yield* projections.getThreadDetailById(boundAttempt.threadId),
+          );
+          const waitingAttempt = yield* repairService.refresh(accepted.requestId, 1);
+          assert.ok(waitingAttempt?.providerTurnId);
+          assert.equal(waitingAttempt?.providerTurnId, startedEvent.turnId);
+          assert.equal(
+            waitingThread.session?.activeTurnId,
+            waitingAttempt?.providerTurnId,
+            `Codex session must persist the exact turn bound to the repair attempt; status=${waitingAttempt?.status}; turn=${waitingAttempt?.providerTurnId}`,
+          );
+          const approvalEvent = yield* Deferred.await(approvalObserved);
+          if (approvalEvent.type !== "request.opened")
+            assert.fail("expected command approval event");
+          assert.equal(approvalEvent.threadId, boundAttempt.threadId);
+          assert.equal(approvalEvent.payload.requestType, "command_execution_approval");
+          assert.ok(["starting", "turn-bound"].includes(waitingAttempt?.status ?? ""));
+          assert.equal((yield* requests.get(accepted.requestId))?.status, "running");
+
+          const childPid = Number(NodeFS.readFileSync(pidPath, "utf8"));
+          assert.ok(Number.isSafeInteger(childPid) && childPid > 0);
+          const bootId = NodeFS.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+          const readStartTicks = () => {
+            const stat = NodeFS.readFileSync(`/proc/${childPid}/stat`, "utf8");
+            return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+          };
+          const startTicks = readStartTicks();
+          assert.ok(startTicks);
+          assert.equal(
+            NodeFS.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
+            bootId,
+          );
+          assert.equal(readStartTicks(), startTicks);
+
+          // This real adapter request is only a deterministic trigger for the
+          // fixture to exit. Its response is intentionally never sent.
+          yield* adapter.readThread(boundAttempt.threadId).pipe(Effect.ignore, Effect.forkScoped);
+          const completed = yield* service
+            .awaitCompletion(accepted.requestId)
+            .pipe(Effect.as(true), Effect.timeout("10 seconds"));
+          if (completed === undefined) {
+            const currentRequest = yield* requests.get(accepted.requestId);
+            const currentAttempt = yield* repairs.get(accepted.requestId, 1);
+            const currentThread = Option.getOrThrow(
+              yield* projections.getThreadDetailById(boundAttempt.threadId),
+            );
+            const runtimeEvents = NodeFS.existsSync(runtimeLogPath)
+              ? NodeFS.readFileSync(runtimeLogPath, "utf8")
+              : "none";
+            const peerMethods = NodeFS.existsSync(peerLogPath)
+              ? NodeFS.readFileSync(peerLogPath, "utf8")
+              : "none";
+            assert.fail(
+              `exit failed to terminalize: request=${currentRequest?.status}/${currentRequest?.error}; attempt=${currentAttempt?.status}/${currentAttempt?.providerTurnId}; session=${currentThread.session?.status}/${currentThread.session?.activeTurnId}; pidAlive=${NodeFS.existsSync(`/proc/${childPid}/stat`)}; runtimeEvents=${runtimeEvents}; peerMethods=${peerMethods}`,
+            );
+          }
+
+          const request = yield* requests.get(accepted.requestId);
+          const terminalAttempt = yield* repairs.get(accepted.requestId, 1);
+          const stoppedThread = Option.getOrThrow(
+            yield* projections.getThreadDetailById(boundAttempt.threadId),
+          );
+          assert.equal(request?.status, "failed");
+          assert.equal(request?.error, "Codex App Server exited with code 7.");
+          assert.equal(terminalAttempt?.status, "failed");
+          assert.equal(terminalAttempt?.providerTurnId, waitingAttempt?.providerTurnId);
+          assert.equal(terminalAttempt?.error, "Codex App Server exited with code 7.");
+          assert.equal(terminalAttempt?.repairedSha, null);
+          assert.equal(terminalAttempt?.validatedRunId, null);
+          assert.equal(terminalAttempt?.eligibility, null);
+          assert.equal(stoppedThread.session?.status, "error");
+          assert.equal(stoppedThread.session?.activeTurnId, null);
+          assert.equal(git(fixture.repositoryRoot, ["rev-parse", "HEAD"]), fixture.sourceSha);
+
+          // The child has exited and the captured identity is not reused.
+          assert.equal(NodeFS.existsSync(`/proc/${childPid}/stat`), false);
+          const peerMethods = NodeFS.readFileSync(peerLogPath, "utf8")
+            .trim()
+            .split("\n")
+            .map((line) => line);
+          assert.deepEqual(peerMethods, [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "turn/start",
+            "thread/read",
+          ]);
+          yield* adapter.stopAll().pipe(Effect.ignore);
+          const runtimeEvents = NodeFS.readFileSync(runtimeLogPath, "utf8")
+            .trim()
+            .split("\n")
+            .map((line) => line.split("\t"));
+          const terminalSessionErrors = runtimeEvents.filter(
+            (event) => event[0] === "session.state.changed" && event[4] === "error",
+          );
+          assert.equal(terminalSessionErrors.length, 1);
+          assert.equal(terminalSessionErrors[0]?.[2], waitingAttempt?.providerTurnId);
+          assert.equal((yield* repairService.refresh(accepted.requestId, 1))?.status, "failed");
+        }).pipe(Effect.provide(appLayer));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 const repairCompletionRestartScenario = (changeSource: boolean, reviewChange = false) =>

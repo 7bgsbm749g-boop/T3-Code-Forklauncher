@@ -546,6 +546,7 @@ export const makeForkCompatibilityNativeService = (options?: {
           return;
         }
         let usable = run.status === "ready" ? yield* coordinator.getUsable(run.runId) : null;
+        let repairFailure: string | null = null;
         if (
           !usable &&
           request.repairPolicy.enabled &&
@@ -556,6 +557,15 @@ export const makeForkCompatibilityNativeService = (options?: {
             run = repaired;
             usable =
               repaired.status === "ready" ? yield* coordinator.getUsable(repaired.runId) : null;
+          } else if (Option.isSome(repairRepository)) {
+            const attempt = yield* repairRepository.value.latest(request.requestId);
+            if (
+              attempt &&
+              ["failed", "provider-unavailable", "cancelled", "interrupted"].includes(
+                attempt.status,
+              )
+            )
+              repairFailure = attempt.error;
           }
         }
         const status = usable
@@ -567,7 +577,9 @@ export const makeForkCompatibilityNativeService = (options?: {
           request.requestId,
           ownerToken,
           status,
-          usable ? null : (run.error ?? "Candidate evidence is not currently usable."),
+          usable
+            ? null
+            : (repairFailure ?? run.error ?? "Candidate evidence is not currently usable."),
         );
       }).pipe(
         Effect.catch((error) =>

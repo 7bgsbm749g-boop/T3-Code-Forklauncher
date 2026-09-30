@@ -328,6 +328,9 @@ const makeForkCompatibilityRepairService = Effect.gen(function* () {
   ) {
     const attemptRow = yield* repository.get(requestId, attempt);
     if (!attemptRow) return null;
+    // A terminal repair owns its outcome permanently. In particular, a later
+    // unrelated provider session event must not be rebound to this attempt.
+    if (terminal.has(attemptRow.status)) return attemptRow;
     const thread = yield* projections.getThreadDetailById(attemptRow.threadId);
     if (Option.isNone(thread)) return attemptRow;
     const session = thread.value.session;
