@@ -138,7 +138,10 @@ chmod +x "$target/t3"
       "custom",
       "1.2.3",
     );
-    NodeAssert.ok(result.stdout.includes(selected));
+    NodeAssert.equal(
+      await NodeFSP.realpath(NodePath.join(root, "installed-bin", "t3")),
+      NodePath.join(selected, "t3"),
+    );
     NodeAssert.equal(
       await NodeFSP.readFile(NodePath.join(selected, ".install-complete"), "utf8"),
       "1.2.3\ndownstream/custom\nhttps://github.com/downstream/custom/releases/download",

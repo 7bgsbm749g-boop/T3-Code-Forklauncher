@@ -15,6 +15,7 @@
 # Every release feed gets its own cache namespace. Legacy version-only runtimes
 # have unknown provenance and are left untouched.
 $ErrorActionPreference = "Stop"
+$validateOnly = $env:T3CODE_INSTALL_VALIDATE_ONLY -eq "1"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $repo = if ($env:T3CODE_RELEASE_REPOSITORY) { $env:T3CODE_RELEASE_REPOSITORY.Trim() } else { "7bgsbm749g-boop/T3-Code-Forklauncher" }
@@ -49,6 +50,7 @@ if ($interactive -and -not $env:NO_COLOR) {
   $accent = "$esc[94m"; $green = "$esc[32m"
 }
 function Step([string] $message) {
+  if ($validateOnly) { return }
   if ($interactive) { [Console]::Error.Write("`r$esc[2K  $muted$message$reset") }
   else { [Console]::Error.WriteLine("  $message") }
 }
@@ -166,6 +168,11 @@ $owner, $name = $normalizedRepo.Split("/")
 $targetDir = Join-Path (Join-Path (Join-Path (Join-Path $versionsDir ".feeds") $owner) $name) $version
 $expectedMarker = "$version`n$normalizedRepo`n$baseUrl"
 $marker = Join-Path $targetDir ".install-complete"
+
+if ($validateOnly) {
+  [ordered]@{ repository = $normalizedRepo; targetDir = $targetDir; marker = $expectedMarker } | ConvertTo-Json -Compress
+  exit 0
+}
 
 if ((Test-Path $marker) -and ([System.IO.File]::ReadAllText($marker, [System.Text.Encoding]::UTF8) -eq $expectedMarker)) {
   Step "Version $version is already downloaded."
