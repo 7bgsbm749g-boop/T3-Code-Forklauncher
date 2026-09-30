@@ -92,31 +92,33 @@ it("requires operate permission for tool updates even alongside a read-only chec
   expect(requiredScopeForDeviceList({ updateTool: "hub" })).toBe(AuthOrchestrationOperateScope);
 });
 
-it("keeps fork compatibility and GitHub operations on explicit native scopes", () => {
-  for (const method of [
-    WS_METHODS.forkCompatibilityConfigure,
-    WS_METHODS.forkCompatibilityCheck,
-    WS_METHODS.forkGithubConfigure,
-    WS_METHODS.forkGithubSubmitPromotion,
-    WS_METHODS.forkGithubSubmitDraft,
-    WS_METHODS.forkGithubSubmitCustomUpdate,
-    WS_METHODS.forkGithubSubmitPullRequestEvidence,
-  ]) {
-    expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
-    expect(() =>
-      Effect.runSync(
+it.effect("keeps fork compatibility and GitHub operations on explicit native scopes", () =>
+  Effect.gen(function* () {
+    for (const method of [
+      WS_METHODS.forkCompatibilityConfigure,
+      WS_METHODS.forkCompatibilityCheck,
+      WS_METHODS.forkGithubConfigure,
+      WS_METHODS.forkGithubSubmitPromotion,
+      WS_METHODS.forkGithubSubmitDraft,
+      WS_METHODS.forkGithubSubmitCustomUpdate,
+      WS_METHODS.forkGithubSubmitPullRequestEvidence,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+      const error = yield* Effect.flip(
         authorizeRpcEffect([], requiredScopeForRpcMethod(method), Effect.succeed("unreachable")),
-      ),
-    ).toThrow();
-  }
-  for (const method of [
-    WS_METHODS.forkCompatibilityStatus,
-    WS_METHODS.forkCompatibilityScheduleStatus,
-    WS_METHODS.forkGithubRead,
-    WS_METHODS.forkGithubStatus,
-    WS_METHODS.forkGithubCustomUpdateStatus,
-    WS_METHODS.forkGithubPullRequestEvidenceStatus,
-  ]) {
-    expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
-  }
-});
+      );
+      expect(error._tag).toBe("EnvironmentAuthorizationError");
+      expect(error.requiredScope).toBe(AuthOrchestrationOperateScope);
+    }
+    for (const method of [
+      WS_METHODS.forkCompatibilityStatus,
+      WS_METHODS.forkCompatibilityScheduleStatus,
+      WS_METHODS.forkGithubRead,
+      WS_METHODS.forkGithubStatus,
+      WS_METHODS.forkGithubCustomUpdateStatus,
+      WS_METHODS.forkGithubPullRequestEvidenceStatus,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+  }),
+);
