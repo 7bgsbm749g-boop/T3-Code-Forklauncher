@@ -324,14 +324,24 @@ it.effect.skipIf(!linuxX64)("rejects an incomplete or version-tampered offline s
   const candidate = NodePath.join(root, "candidate");
   const scratch = NodePath.join(root, "scratch");
   const snapshotDirectory = NodePath.join(root, `toolchain-${"2".repeat(64)}`);
+  const vitePlusPackagePath = NodePath.join(
+    snapshotDirectory,
+    "pnpm-virtual/vite-plus@0.3.3_fixture/node_modules/vite-plus",
+  );
   for (const directory of [candidate, scratch, snapshotDirectory])
     NodeFS.mkdirSync(directory, { mode: 0o700 });
+  NodeFS.mkdirSync(vitePlusPackagePath, { recursive: true, mode: 0o700 });
+  const vitePlusPackageJson = NodePath.join(vitePlusPackagePath, "package.json");
+  NodeFS.writeFileSync(
+    vitePlusPackageJson,
+    JSON.stringify({ name: "vite-plus", version: "0.3.3", bin: { vp: "./bin/vp" } }),
+  );
   const descriptor = {
     snapshotDirectory,
     nodePath: NodePath.join(snapshotDirectory, "missing-node"),
-    vitePlusPackagePath: NodePath.join(snapshotDirectory, "vp"),
+    vitePlusPackagePath,
     pnpmPackagePath: NodePath.join(snapshotDirectory, "pnpm"),
-    pnpmVirtualStorePath: NodePath.join(snapshotDirectory, "virtual"),
+    pnpmVirtualStorePath: NodePath.join(snapshotDirectory, "pnpm-virtual"),
     pnpmContentStorePath: NodePath.join(snapshotDirectory, "missing-store"),
     pnpmMetadataCachePath: NodePath.join(snapshotDirectory, "pnpm-metadata"),
     pnpmMetadataCacheSha256: "3".repeat(64),
@@ -376,7 +386,7 @@ it.effect.skipIf(!linuxX64)("rejects an incomplete or version-tampered offline s
     profileSha256: "1".repeat(64),
     snapshotSha256: "2".repeat(64),
     nodeVersion: "v24.13.1",
-    vpVersion: "0.3.0",
+    vpVersion: "0.3.3",
     pnpmVersion: "11.10.0",
     criticalFileSha256: {
       "bin/node": "0".repeat(64),
@@ -399,6 +409,29 @@ it.effect.skipIf(!linuxX64)("rejects an incomplete or version-tampered offline s
   const manifestPath = NodePath.join(snapshotDirectory, "snapshot.json");
   NodeFS.writeFileSync(manifestPath, JSON.stringify({ ...descriptor, nodeVersion: "v99.0.0" }));
   assert.throws(() => Sandbox.readOfflineToolchainSnapshot(manifestPath), /pinned versions/);
+  NodeFS.writeFileSync(manifestPath, JSON.stringify(descriptor));
+  assert.equal(Sandbox.readOfflineToolchainSnapshot(manifestPath).vpVersion, "0.3.3");
+  NodeFS.writeFileSync(manifestPath, JSON.stringify({ ...descriptor, vpVersion: "0.3.0" }));
+  assert.throws(() => Sandbox.readOfflineToolchainSnapshot(manifestPath), /pinned versions/);
+  NodeFS.writeFileSync(manifestPath, JSON.stringify(descriptor));
+  NodeFS.writeFileSync(
+    vitePlusPackageJson,
+    JSON.stringify({ name: "vite-plus", version: "0.3.0", bin: { vp: "./bin/vp" } }),
+  );
+  assert.throws(() => Sandbox.readOfflineToolchainSnapshot(manifestPath), /package manifest/);
+  NodeFS.writeFileSync(
+    vitePlusPackageJson,
+    JSON.stringify({ name: "vite-plus", version: "0.3.3", bin: { vp: "./bin/vp" } }),
+  );
+  NodeFS.writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      ...descriptor,
+      vitePlusPackagePath: NodePath.join(snapshotDirectory, "untrusted/vite-plus"),
+    }),
+  );
+  assert.throws(() => Sandbox.readOfflineToolchainSnapshot(manifestPath), /package path/);
+  NodeFS.writeFileSync(manifestPath, JSON.stringify(descriptor));
   NodeFS.writeFileSync(
     manifestPath,
     JSON.stringify({

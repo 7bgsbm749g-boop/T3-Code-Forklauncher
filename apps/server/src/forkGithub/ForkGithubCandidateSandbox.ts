@@ -23,6 +23,7 @@ const DIAGNOSTIC_TAIL_BYTES = MAX_DIAGNOSTIC_BYTES - DIAGNOSTIC_HEAD_BYTES;
 const GUEST_NODE = "/toolchain/bin/node";
 const GUEST_GIT = "/usr/bin/git";
 const GUEST_RUNTIME_LIBRARIES = "/usr/lib/x86_64-linux-gnu";
+const TRUSTED_VITE_PLUS_VERSION = "0.3.3";
 const TRUSTED_PNPM_SNAPSHOT_VERSIONS = new Set(["11.10.0", "11.28.1"]);
 // This is a reviewed command set, not an implicit host PATH. Keep the manifest
 // as a set: its JSON order does not change the executable surface.
@@ -271,7 +272,7 @@ export const readOfflineToolchainSnapshot = (manifestPath: string): OfflineToolc
   const snapshot = value as unknown as OfflineToolchainSnapshot;
   if (
     snapshot.nodeVersion !== "v24.13.1" ||
-    snapshot.vpVersion !== "0.3.0" ||
+    snapshot.vpVersion !== TRUSTED_VITE_PLUS_VERSION ||
     !TRUSTED_PNPM_SNAPSHOT_VERSIONS.has(snapshot.pnpmVersion) ||
     snapshot.shellUtilitiesPackage !== "busybox-static" ||
     snapshot.shellUtilitiesVersion !== "1:1.37.0-7ubuntu1" ||
@@ -301,6 +302,35 @@ export const readOfflineToolchainSnapshot = (manifestPath: string): OfflineToolc
     NodePath.basename(snapshot.snapshotDirectory) !== `toolchain-${snapshot.snapshotSha256}`
   )
     throw new Error("toolchain manifest does not match trusted pinned versions or location");
+  const snapshotRoot = NodePath.resolve(snapshot.snapshotDirectory);
+  const virtualStoreRoot = NodePath.resolve(snapshot.pnpmVirtualStorePath);
+  const vitePlusPath = NodePath.resolve(snapshot.vitePlusPackagePath);
+  const vitePlusRelativePath = NodePath.relative(virtualStoreRoot, vitePlusPath).split(
+    NodePath.sep,
+  );
+  if (
+    virtualStoreRoot !== NodePath.join(snapshotRoot, "pnpm-virtual") ||
+    vitePlusRelativePath.length < 3 ||
+    !vitePlusRelativePath[0]!.startsWith(`vite-plus@${TRUSTED_VITE_PLUS_VERSION}`) ||
+    vitePlusRelativePath.at(-2) !== "node_modules" ||
+    vitePlusRelativePath.at(-1) !== "vite-plus"
+  )
+    throw new Error("toolchain manifest does not point at the pinned Vite+ package path");
+  const canonicalRoot = NodeFS.realpathSync(snapshotRoot);
+  const canonicalVitePlusPath = NodeFS.realpathSync(vitePlusPath);
+  if (!canonicalVitePlusPath.startsWith(`${canonicalRoot}${NodePath.sep}`))
+    throw new Error("Vite+ package path escapes the toolchain snapshot");
+  const vitePlusPackage = JSON.parse(
+    NodeFS.readFileSync(NodePath.join(canonicalVitePlusPath, "package.json"), "utf8"),
+  ) as { readonly name?: unknown; readonly version?: unknown; readonly bin?: unknown };
+  if (
+    vitePlusPackage.name !== "vite-plus" ||
+    vitePlusPackage.version !== TRUSTED_VITE_PLUS_VERSION ||
+    typeof vitePlusPackage.bin !== "object" ||
+    vitePlusPackage.bin === null ||
+    (vitePlusPackage.bin as Record<string, unknown>).vp !== "./bin/vp"
+  )
+    throw new Error("toolchain Vite+ package manifest does not match the trusted pin");
   return snapshot;
 };
 
