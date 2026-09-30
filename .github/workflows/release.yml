@@ -50,10 +50,14 @@ jobs:
     name: Resolve release commit
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
       nightly_version: ${{ steps.resolve.outputs.nightly_version }}
       has_changes: ${{ steps.resolve.outputs.has_changes }}
+      run_started_at: ${{ steps.resolve.outputs.run_started_at }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -73,6 +77,17 @@ jobs:
               shouldReleaseNightly,
               resolveLatestNightlyCommit,
             } = require('./.github/scripts/check-nightly-release.cjs');
+
+            const run = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(context.runId),
+            });
+            const runStartedAt = run.data.run_started_at;
+            if (typeof runStartedAt !== 'string' || Number.isNaN(Date.parse(runStartedAt))) {
+              throw new Error('GitHub did not return a valid workflow run start timestamp');
+            }
+            core.setOutput('run_started_at', runStartedAt);
 
             const dispatchChannel = process.env.DISPATCH_CHANNEL || 'preview';
             const releaseChannel = context.eventName === 'schedule'
@@ -143,12 +158,19 @@ jobs:
           DISPATCH_CHANNEL: ${{ github.event.inputs.channel }}
           DISPATCH_VERSION: ${{ github.event.inputs.version }}
           NIGHTLY_VERSION: ${{ needs.resolve_commit.outputs.nightly_version }}
-          NIGHTLY_DATE: ${{ github.run_started_at }}
+          NIGHTLY_DATE: ${{ needs.resolve_commit.outputs.run_started_at }}
           NIGHTLY_SHA: ${{ needs.resolve_commit.outputs.ref }}
           NIGHTLY_RUN_NUMBER: ${{ github.run_number }}
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" || ( "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${DISPATCH_CHANNEL:-preview}" == "nightly" ) ]]; then
-            nightly_date="$(date -u -d "$NIGHTLY_DATE" +%Y%m%d)"
+            if [[ ! "$NIGHTLY_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+              echo "GitHub did not provide a valid UTC workflow run start timestamp." >&2
+              exit 1
+            fi
+            if ! nightly_date="$(date -u -d "$NIGHTLY_DATE" +%Y%m%d)"; then
+              echo "Could not convert the workflow run start timestamp to a UTC release date." >&2
+              exit 1
+            fi
 
             node scripts/resolve-nightly-release.ts \
               --date "$nightly_date" \
