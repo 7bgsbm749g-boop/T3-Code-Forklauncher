@@ -25,6 +25,7 @@ it.effect("runs fork migration 059 after the fork ledger has reached migration 0
       [60, "ForkGithubPullRequestEvidence"],
       [61, "ForkGithubAutomaticPromotionIntents"],
       [62, "ForkGithubCandidateBuilds"],
+      [63, "ForkGithubCustomUpdateOperations"],
     ]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fork_github_native_operations'
@@ -62,7 +63,7 @@ it.effect("creates the complete GitHub schema on a fresh disk database and repea
   return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const firstRun = yield* runMigrations();
-    assert.deepEqual(firstRun.at(-1), [62, "ForkGithubCandidateBuilds"]);
+    assert.deepEqual(firstRun.at(-1), [63, "ForkGithubCustomUpdateOperations"]);
     assert.isTrue(firstRun.some(([id, name]) => id === 56 && name === "ForkGithubActions"));
 
     const requiredObjects = [
@@ -80,6 +81,8 @@ it.effect("creates the complete GitHub schema on a fresh disk database and repea
       "fork_github_automatic_promotion_runtime_policy",
       "fork_github_candidate_builds",
       "idx_fork_github_candidate_build_state",
+      "fork_github_custom_update_operations",
+      "idx_fork_github_custom_update_state",
     ];
     const objects = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE name IN ${sql.in(requiredObjects)}
@@ -93,7 +96,7 @@ it.effect("creates the complete GitHub schema on a fresh disk database and repea
     const fork = yield* sql<{ readonly migration_id: number; readonly name: string }>`
       SELECT migration_id, name FROM t3_fork_sql_migrations ORDER BY migration_id DESC LIMIT 1
     `;
-    assert.deepEqual(fork, [{ migration_id: 62, name: "ForkGithubCandidateBuilds" }]);
+    assert.deepEqual(fork, [{ migration_id: 63, name: "ForkGithubCustomUpdateOperations" }]);
   }).pipe(
     Effect.provide(NodeSqliteClient.layer({ filename }).pipe(Layer.provide(NodeServices.layer))),
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
