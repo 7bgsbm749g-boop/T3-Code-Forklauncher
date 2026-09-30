@@ -25,6 +25,34 @@ import {
   UPSTREAM_MIGRATIONS_TABLE,
 } from "./Migrations.ts";
 
+it.effect("runs registered official upstream 053/054 on a fresh production database", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-official-lineage-"));
+  const filename = NodePath.join(directory, "state.sqlite");
+  const assertSchema = Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const upstream = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+      SELECT migration_id, name FROM ${sql(UPSTREAM_MIGRATIONS_TABLE)}
+      WHERE migration_id IN (53, 54) ORDER BY migration_id`;
+    const viewed = yield* sql<{ readonly name: string }>`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pull_request_files_viewed'`;
+    const settle = yield* sql<{ readonly name: string }>`
+      SELECT name FROM pragma_table_info('projection_threads')
+      WHERE name = 'auto_settle_disabled_at'`;
+    assert.deepEqual(upstream, [
+      { migration_id: 53, name: "PullRequestFilesViewed" },
+      { migration_id: 54, name: "ProjectionThreadsAutoSettleDisabledAt" },
+    ]);
+    assert.deepEqual(viewed, [{ name: "pull_request_files_viewed" }]);
+    assert.deepEqual(settle, [{ name: "auto_settle_disabled_at" }]);
+  });
+  return Effect.gen(function* () {
+    yield* withProductionSqlite(filename, assertSchema);
+    yield* withProductionSqlite(filename, assertSchema);
+  }).pipe(
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});
+
 // This is the exact committed 226fb3af8 registry: 056 is absent while 057 and
 // 058 remain registered. 059 was later released as an idempotent 056 schema
 // backfill and also appeared without a 056 ledger row.
@@ -244,7 +272,11 @@ it.effect("routes exact nightly 53/54 rows and schema to upstream lineage", () =
       SELECT name FROM pragma_table_info('projection_threads') WHERE name = 'auto_settle_disabled_at'`;
     assert.equal(Number(viewedRows[0]?.count), 1);
     assert.deepEqual(columns, [{ name: "auto_settle_disabled_at" }]);
-  }).pipe(Effect.provide(NodeSqliteClient.layerMemory().pipe(Layer.provide(NodeServices.layer)))),
+  }).pipe(
+    Effect.provide(
+      NodeSqliteClient.layer({ filename: ":memory:" }).pipe(Layer.provide(NodeServices.layer)),
+    ),
+  ),
 );
 
 it.effect("reconciles released gapped fork histories on production startup and reopen", () => {
@@ -398,7 +430,11 @@ it.effect("rejects unknown legacy lineage before creating new tracking tables", 
       SELECT migration_id, name FROM effect_sql_migrations
     `;
     assert.deepEqual(unchanged, [{ migration_id: 53, name: "UnexpectedMigration" }]);
-  }).pipe(Effect.provide(NodeSqliteClient.layerMemory().pipe(Layer.provide(NodeServices.layer)))),
+  }).pipe(
+    Effect.provide(
+      NodeSqliteClient.layer({ filename: ":memory:" }).pipe(Layer.provide(NodeServices.layer)),
+    ),
+  ),
 );
 
 it.effect("rolls back partial tracker seeding when fork lineage validation fails", () =>
@@ -430,5 +466,9 @@ it.effect("rolls back partial tracker seeding when fork lineage validation fails
     assert.deepEqual(upstreamTable, []);
     assert.deepEqual(forkRows, [{ migration_id: 53, name: "WrongForkName" }]);
     assert.deepEqual(legacyLedgerAfter, legacyLedgerBefore);
-  }).pipe(Effect.provide(NodeSqliteClient.layerMemory().pipe(Layer.provide(NodeServices.layer)))),
+  }).pipe(
+    Effect.provide(
+      NodeSqliteClient.layer({ filename: ":memory:" }).pipe(Layer.provide(NodeServices.layer)),
+    ),
+  ),
 );

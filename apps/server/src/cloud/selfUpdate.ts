@@ -187,10 +187,10 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   // optional so callers without one (tests, npm-only hosts) still construct.
   const httpClient = yield* HttpClient.HttpClient;
   const releaseBaseUrl = Option.getOrUndefined(
-    yield* Config.string(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
+    yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
   );
   const configuredRepository = Option.getOrUndefined(
-    yield* Config.string(CLI_RELEASE_REPOSITORY_ENV).pipe(Config.option),
+    yield* Config.String(CLI_RELEASE_REPOSITORY_ENV).pipe(Config.option),
   );
   const releaseRepository = yield* Effect.try({
     try: () => resolveCliReleaseRepository(configuredRepository, BUILT_CLI_RELEASE_REPOSITORY),

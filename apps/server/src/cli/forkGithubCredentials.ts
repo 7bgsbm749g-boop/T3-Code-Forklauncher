@@ -11,6 +11,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { Command, Flag } from "effect/unstable/cli";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
+import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
@@ -31,23 +33,23 @@ export class ForkGithubCredentialInputError extends Schema.TaggedError<ForkGithu
 }
 export const isCredentialInputError = Schema.is(ForkGithubCredentialInputError);
 
-const appIdFileFlag = Flag.string("app-id-file").pipe(
+const appIdFileFlag = Flag.String("app-id-file").pipe(
   Flag.withDescription("File containing the numeric GitHub App id (mode 0600)."),
 );
-const installationIdFileFlag = Flag.string("installation-id-file").pipe(
+const installationIdFileFlag = Flag.String("installation-id-file").pipe(
   Flag.withDescription("File containing the numeric installation id (mode 0600)."),
 );
-const privateKeyFileFlag = Flag.string("private-key-file").pipe(
+const privateKeyFileFlag = Flag.String("private-key-file").pipe(
   Flag.withDescription("File containing the downloaded PEM private key (mode 0600)."),
   Flag.optional,
 );
-const privateKeyStdinFlag = Flag.boolean("private-key-stdin").pipe(
+const privateKeyStdinFlag = Flag.Boolean("private-key-stdin").pipe(
   Flag.withDescription(
     "Read the PEM private key from stdin until EOF; do not pass it as an argument.",
   ),
   Flag.withDefault(false),
 );
-const homeDirFlag = Flag.string("home-dir").pipe(
+const homeDirFlag = Flag.String("home-dir").pipe(
   Flag.withDescription(
     "Required explicit T3 home. Use an isolated disposable home, never the live home.",
   ),
@@ -310,10 +312,11 @@ const provisionCredentials = Effect.fn("cli.fork_github.provision_credentials")(
     traceMaxFiles: 2,
     otlpTracesUrl: undefined,
     otlpMetricsUrl: undefined,
-    otlpExportIntervalMs: 10_000,
-    otlpServiceName: "t3-fork-github-provision",
-    otlpHeaders: undefined,
-    otlpProtocol: "http/json",
+    otlpLogsUrl: undefined,
+    otlpTracesExport: DEFAULT_SIGNAL_EXPORT,
+    otlpMetricsExport: DEFAULT_SIGNAL_EXPORT,
+    otlpLogsExport: DEFAULT_SIGNAL_EXPORT,
+    otelEnvironment: OtelEnvironment.none,
     mode: "web",
     port: 0,
     host: "127.0.0.1",

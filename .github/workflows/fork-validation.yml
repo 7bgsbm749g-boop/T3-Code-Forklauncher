@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - forklauncher
+      - forklauncher-stable-v0.0.44-candidate
 
 permissions:
   contents: read

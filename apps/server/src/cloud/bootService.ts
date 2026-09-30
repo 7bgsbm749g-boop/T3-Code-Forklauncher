@@ -42,6 +42,7 @@ import {
 } from "./serviceProtocol.ts";
 
 const BOOT_SERVICE_NAME = "t3code";
+export const BOOT_SERVICE_LOG_FILE = "boot-service.log";
 const BOOT_SERVICE_UNIT_FILE = `${BOOT_SERVICE_NAME}.service`;
 // `.service` suffix keeps the label distinct from the desktop app's bundle id
 // (com.t3tools.t3code), so launchd and TCC records never collide.
@@ -587,17 +588,17 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
   const uid = yield* HostProcessUserId;
   const httpClient = yield* HttpClient.HttpClient;
   const releaseBaseUrl = Option.getOrUndefined(
-    yield* Config.string(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
+    yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
   );
   const configuredRepository = Option.getOrUndefined(
-    yield* Config.string(CLI_RELEASE_REPOSITORY_ENV).pipe(Config.option),
+    yield* Config.String(CLI_RELEASE_REPOSITORY_ENV).pipe(Config.option),
   );
   const releaseRepository = yield* Effect.try({
     try: () => resolveCliReleaseRepository(configuredRepository, BUILT_CLI_RELEASE_REPOSITORY),
     catch: (cause) => new BootServiceInstallError({ cause }),
   });
-  const homeDir = yield* Config.string("HOME").pipe(Config.withDefault(""));
-  const installerPath = yield* Config.string("PATH").pipe(Config.withDefault(""));
+  const homeDir = yield* Config.String("HOME").pipe(Config.withDefault(""));
+  const installerPath = yield* Config.String("PATH").pipe(Config.withDefault(""));
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const runner = yield* ProcessRunner.ProcessRunner;
@@ -631,7 +632,7 @@ export const make = Effect.fn("cloud.boot_service.make")(function* (input: {
     environmentPath,
   });
   const unitPath = detectedManager?.unitPath ?? "";
-  const logPath = path.join(input.logsDir, "boot-service.log");
+  const logPath = path.join(input.logsDir, BOOT_SERVICE_LOG_FILE);
   const statePath = path.join(input.baseDir, "runtime", SERVICE_STATE_FILE);
   const restartPendingPath = path.join(input.baseDir, "runtime", SERVICE_RESTART_PENDING_FILE);
   const runtimePaths = pinnedRuntimePaths(

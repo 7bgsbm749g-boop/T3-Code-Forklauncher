@@ -66,6 +66,8 @@ import Migration0049 from "./Migrations/049_ProjectionThreadsActiveOrderKey.ts";
 import Migration0050 from "./Migrations/050_ProjectionThreadPullRequests.ts";
 import Migration0051 from "./Migrations/051_ProjectionThreadMessageContext.ts";
 import Migration0052 from "./Migrations/052_ProjectionThreadTitleState.ts";
+import UpstreamMigration0053 from "./Migrations/053_PullRequestFilesViewed.ts";
+import UpstreamMigration0054 from "./Migrations/054_ProjectionThreadsAutoSettleDisabledAt.ts";
 import Migration0053 from "./Migrations/053_ForkCompatibilityRuns.ts";
 import Migration0054 from "./Migrations/054_ForkCompatibilityRequests.ts";
 import Migration0055 from "./Migrations/055_ForkCompatibilityRepair.ts";
@@ -172,13 +174,9 @@ const forkEntries = migrationEntries.filter(([id]) => id >= 53);
 // New upstream migrations are added here when they arrive above the shared
 // legacy range. They are applied in their own ledger once their lineage and
 // postconditions are registered below.
-const upstreamEntries = [...legacyUpstreamEntries];
+const upstreamEntries = [...legacyUpstreamEntries] as const satisfies ReadonlyArray<MigrationEntry>;
 
 export const forkMigrationManifest = forkEntries.map(([id, name]) => [id, name] as const);
-/** Entries this checkout actually executes through the upstream ledger. */
-export const currentUpstreamMigrationManifest = upstreamEntries.map(
-  ([id, name]) => [id, name] as const,
-);
 
 const nightlyUpstreamLineage = [
   {
@@ -574,6 +572,9 @@ const reconcileMigrationLineages = Effect.fn("reconcileMigrationLineages")(funct
       return yield* new MigrationLineageError({ reason: "upstream-ledger", migrationId: id });
     }
     yield* validateObjects(extension.requiredObjects, id);
+    if (extension.requiredColumns !== undefined) {
+      yield* validateColumns(extension.requiredColumns, id);
+    }
   }
   yield* validateForkSchemaFor(legacyForkRows.map(([id]) => id));
   if (preflight) return;
@@ -628,6 +629,14 @@ const reconcileMigrationLineages = Effect.fn("reconcileMigrationLineages")(funct
           yield* validateObjects(requiredObjects, id);
         }
       }
+      for (const { id, requiredColumns } of upstreamExtensions) {
+        if (
+          requiredColumns !== undefined &&
+          upstreamTracked.some((row) => Number(row.migration_id) === id)
+        ) {
+          yield* validateColumns(requiredColumns, id);
+        }
+      }
       for (const [id] of upstreamEntries.filter(([id]) => id > 52)) {
         if (!nightlyUpstreamLineage.some((entry) => entry.id === id)) {
           return yield* new MigrationLineageError({ reason: "schema-proof", migrationId: id });
@@ -662,7 +671,45 @@ export interface UpstreamMigrationExtension {
   readonly migration: typeof Migration0056;
   /** At least one schema object created by the migration, used as a replay proof. */
   readonly requiredObjects: ReadonlyArray<string>;
+  /** Column-level proof for migrations that alter an existing table. */
+  readonly requiredColumns?: Readonly<Record<string, ReadonlyArray<string>>>;
 }
+
+// Official migrations omitted from historical fork registries are registered
+// through the independent upstream ledger, never the fork migration sequence.
+const productionUpstreamExtensions: ReadonlyArray<UpstreamMigrationExtension> = [
+  {
+    id: 53,
+    name: "PullRequestFilesViewed",
+    migration: UpstreamMigration0053,
+    requiredObjects: ["pull_request_files_viewed"],
+    requiredColumns: {
+      pull_request_files_viewed: [
+        "provider",
+        "host",
+        "repository",
+        "number",
+        "viewer",
+        "path",
+        "revision",
+        "viewed_at",
+      ],
+    },
+  },
+  {
+    id: 54,
+    name: "ProjectionThreadsAutoSettleDisabledAt",
+    migration: UpstreamMigration0054,
+    requiredObjects: ["projection_threads"],
+    requiredColumns: { projection_threads: ["auto_settle_disabled_at"] },
+  },
+];
+
+/** Entries this checkout actually executes through the upstream ledger. */
+export const currentUpstreamMigrationManifest = [
+  ...upstreamEntries.map(([id, name]) => [id, name] as const),
+  ...productionUpstreamExtensions.map(({ id, name }) => [id, name] as const),
+];
 
 const validateUpstreamExtensions = (extensions: ReadonlyArray<UpstreamMigrationExtension>) => {
   const ids = extensions.map(({ id }) => id).toSorted((left, right) => left - right);
@@ -728,5 +775,5 @@ export const runMigrationsWithUpstreamExtensions = (
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
 }: RunMigrationsOptions = {}) {
-  return yield* runMigrationsWithExtensions({ toMigrationInclusive }, []);
+  return yield* runMigrationsWithExtensions({ toMigrationInclusive }, productionUpstreamExtensions);
 });
