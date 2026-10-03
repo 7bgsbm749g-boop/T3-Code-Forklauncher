@@ -1,4 +1,5 @@
 import {
+  ApprovalRequestId,
   EventId,
   MAX_SCRIPT_ID_LENGTH,
   SCRIPT_RUN_COMMAND_PATTERN,
@@ -144,7 +145,7 @@ const abandonApprovals = Effect.fn("abandonApprovals")(function* (
       aggregateId: thread.id,
       occurredAt: createdAt,
       commandId: command.commandId,
-      metadata: { requestId },
+      metadata: { requestId: ApprovalRequestId.make(requestId) },
     });
     events.push({
       ...base,
