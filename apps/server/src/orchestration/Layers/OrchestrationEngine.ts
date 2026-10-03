@@ -31,6 +31,8 @@ import {
 } from "../../observability/Metrics.ts";
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { ProjectionThreadActivityRepository } from "../../persistence/Services/ProjectionThreadActivities.ts";
+import { ProjectionThreadActivityRepositoryLive } from "../../persistence/Layers/ProjectionThreadActivities.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import {
   isOrchestrationCommandRejection,
@@ -87,6 +89,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const activityRepository = yield* ProjectionThreadActivityRepository;
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const crypto = yield* Crypto.Crypto;
 
@@ -242,9 +245,57 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           envelope.command.type === "thread.user-input.dismiss"
             ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
             : Option.none();
+        // The command model omits history at startup and caps it afterwards.
+        // Stops need retained approval evidence even if a legacy lifecycle event
+        // already closed the projection row without recording abandonment.
+        let decisionReadModel = commandReadModel;
+        if (
+          envelope.command.type === "thread.session.stop" ||
+          envelope.command.type === "thread.turn.interrupt" ||
+          (envelope.command.type === "thread.session.set" &&
+            envelope.command.session.status === "stopped")
+        ) {
+          const threadId = envelope.command.threadId;
+          const approvalKinds = [
+            "approval.requested",
+            "approval.resolved",
+            "approval.abandoned",
+            "provider.approval.respond.failed",
+          ];
+          const rows = yield* activityRepository.listByThreadId({
+            threadId,
+            activityKinds: approvalKinds,
+          });
+          const activities = rows.map((row) => ({
+            id: row.activityId,
+            tone: row.tone,
+            kind: row.kind,
+            summary: row.summary,
+            payload: row.payload,
+            turnId: row.turnId,
+            createdAt: row.createdAt,
+            ...(row.sequence === undefined ? {} : { sequence: row.sequence }),
+          }));
+          decisionReadModel = {
+            ...commandReadModel,
+            threads: commandReadModel.threads.map((thread) =>
+              thread.id === threadId
+                ? {
+                    ...thread,
+                    activities: [
+                      ...thread.activities.filter(
+                        (activity) => !approvalKinds.includes(activity.kind),
+                      ),
+                      ...activities,
+                    ],
+                  }
+                : thread,
+            ),
+          };
+        }
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
-          readModel: commandReadModel,
+          readModel: decisionReadModel,
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
             : {}),
@@ -470,4 +521,4 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 export const OrchestrationEngineLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
-);
+).pipe(Layer.provide(ProjectionThreadActivityRepositoryLive));

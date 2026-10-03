@@ -107,6 +107,7 @@ async function createOrchestrationSystem(
   return {
     engine,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
+    readArchivedShell: () => runtime.runPromise(snapshotQuery.getArchivedShellSnapshot()),
     readThread: (threadId: ThreadId) =>
       runtime.runPromise(snapshotQuery.getThreadDetailById(threadId)),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
@@ -130,6 +131,165 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("records abandonment from durable approvals after restart on an archived stopped thread", async () => {
+    const directory = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "t3-archived-approvals-"),
+    );
+    let system = await createOrchestrationSystem(NodePath.join(directory, "state.sqlite"));
+    const threadId = ThreadId.make("archived-approval-thread");
+    const projectId = ProjectId.make("archived-approval-project");
+    const createdAt = now();
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("approval-project"),
+          projectId,
+          title: "Approvals",
+          workspaceRoot: directory,
+          defaultModelSelection: null,
+          createdAt,
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("approval-thread"),
+          threadId,
+          projectId,
+          title: "Approvals",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        }),
+      );
+      // A late provider request on a stopped session creates a closed row
+      // without a lifecycle activity, just like the legacy cleanup defect.
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("initial-stopped-session"),
+          threadId,
+          session: {
+            threadId,
+            status: "stopped",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        }),
+      );
+      for (const [kind, requestId] of [
+        ["approval.requested", "old-command"],
+        ["user-input.requested", "later-question"],
+      ]) {
+        await system.run(
+          system.engine.dispatch({
+            type: "thread.activity.append",
+            commandId: CommandId.make(requestId!),
+            threadId,
+            activity: {
+              id: EventId.make(requestId!),
+              tone: "approval",
+              kind: kind!,
+              summary: kind!,
+              payload: { requestId },
+              turnId: null,
+              createdAt,
+            },
+            createdAt,
+          }),
+        );
+      }
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("archive-approvals"),
+          threadId,
+        }),
+      );
+      await system.dispose();
+      system = await createOrchestrationSystem(NodePath.join(directory, "state.sqlite"));
+      // Cold command snapshots deliberately contain no timeline. Read lifecycle
+      // evidence from persistence, including rows already closed by legacy stops.
+      const stop = {
+        type: "thread.session.stop" as const,
+        threadId,
+        createdAt,
+        commandId: CommandId.make("fresh-archived-stop"),
+      };
+      const receipt = await system.run(system.engine.dispatch(stop));
+      const events = await system.run(
+        system.engine
+          .readThreadEvents({
+            threadId,
+            fromSequenceExclusive: 0,
+            toSequenceInclusive: Number.MAX_SAFE_INTEGER,
+          })
+          .pipe(Stream.runCollect),
+      );
+      const abandoned = events.filter(
+        (event) =>
+          event.type === "thread.activity-appended" &&
+          event.payload.activity.kind === "approval.abandoned",
+      );
+      expect(abandoned).toHaveLength(1);
+      expect(abandoned[0]).toMatchObject({
+        commandId: stop.commandId,
+        payload: { activity: { payload: { requestId: "old-command", reason: "session-stop" } } },
+      });
+      expect(events.some((event) => event.type === "thread.approval-response-requested")).toBe(
+        false,
+      );
+      const snapshot = await system.readModel();
+      const thread = snapshot.threads.find((thread) => thread.id === threadId)!;
+      expect(thread.archivedAt).not.toBeNull();
+      expect(thread.activities.some((activity) => activity.kind === "user-input.requested")).toBe(
+        true,
+      );
+      const archivedShell = (await system.readArchivedShell()).threads.find(
+        (thread) => thread.id === threadId,
+      )!;
+      expect(archivedShell.hasPendingApprovals).toBe(false);
+      expect(archivedShell.hasPendingUserInput).toBe(true);
+      expect(await system.run(system.engine.dispatch(stop))).toEqual(receipt);
+      await system.dispose();
+      system = await createOrchestrationSystem(NodePath.join(directory, "state.sqlite"));
+      await system.run(
+        system.engine.dispatch({ ...stop, commandId: CommandId.make("later-archived-stop") }),
+      );
+      const replayShell = (await system.readArchivedShell()).threads.find(
+        (thread) => thread.id === threadId,
+      )!;
+      expect(replayShell.hasPendingApprovals).toBe(false);
+      expect(replayShell.hasPendingUserInput).toBe(true);
+      const replay = await system.run(
+        system.engine
+          .readThreadEvents({
+            threadId,
+            fromSequenceExclusive: 0,
+            toSequenceInclusive: Number.MAX_SAFE_INTEGER,
+          })
+          .pipe(Stream.runCollect),
+      );
+      expect(
+        replay.filter(
+          (event) =>
+            event.type === "thread.activity-appended" &&
+            event.payload.activity.kind === "approval.abandoned",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
   it.each(["running", "stopped"] as const)(
     "sends async answers with a %s session and rejects old duplicate replies",
     async (status) => {
