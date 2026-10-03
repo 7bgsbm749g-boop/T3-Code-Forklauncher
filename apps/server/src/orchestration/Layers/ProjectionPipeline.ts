@@ -1791,6 +1791,38 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
           return;
 
+        case "thread.turn-interrupt-requested":
+        case "thread.session-stop-requested":
+        case "thread.session-set": {
+          if (event.type === "thread.session-set" && event.payload.session.status !== "stopped") {
+            return;
+          }
+          const stoppedAt =
+            event.type === "thread.session-set"
+              ? event.payload.session.updatedAt
+              : event.payload.createdAt;
+          const rows = yield* projectionPendingApprovalRepository.listByThreadId({
+            threadId: event.payload.threadId,
+          });
+          for (const row of rows) {
+            if (row.status !== "pending" || row.createdAt > stoppedAt) continue;
+            if (
+              event.type === "thread.turn-interrupt-requested" &&
+              (event.payload.turnId === undefined || row.turnId !== event.payload.turnId)
+            )
+              continue;
+            // Closing an abandoned request is a projection of the real stop
+            // event, not a fabricated provider approval resolution.
+            yield* projectionPendingApprovalRepository.upsert({
+              ...row,
+              status: "resolved",
+              decision: null,
+              resolvedAt: stoppedAt,
+            });
+          }
+          return;
+        }
+
         case "thread.activity-appended": {
           const requestId =
             extractActivityRequestId(event.payload.activity.payload) ??
@@ -1802,13 +1834,62 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const existingRow = yield* projectionPendingApprovalRepository.getByRequestId({
             requestId,
           });
-          if (event.payload.activity.kind === "approval.resolved") {
+          const turnId = Option.isSome(existingRow)
+            ? existingRow.value.turnId
+            : event.payload.activity.turnId;
+          const session = yield* projectionThreadSessionRepository.getByThreadId({
+            threadId: event.payload.threadId,
+          });
+          const turn =
+            turnId === null
+              ? Option.none()
+              : yield* projectionTurnRepository.getByTurnId({
+                  threadId: event.payload.threadId,
+                  turnId,
+                });
+          const abandoned =
+            (Option.isSome(session) && session.value.status === "stopped") ||
+            (Option.isSome(turn) && turn.value.state === "interrupted");
+          if (
+            abandoned &&
+            (event.payload.activity.kind === "approval.requested" ||
+              event.payload.activity.kind === "provider.approval.respond.failed")
+          ) {
+            if (Option.isSome(existingRow) && existingRow.value.status === "pending") {
+              yield* projectionPendingApprovalRepository.upsert({
+                ...existingRow.value,
+                status: "resolved",
+                decision: null,
+                resolvedAt: event.payload.activity.createdAt,
+              });
+            } else if (
+              Option.isNone(existingRow) &&
+              event.payload.activity.kind === "approval.requested"
+            ) {
+              yield* projectionPendingApprovalRepository.upsert({
+                requestId,
+                threadId: event.payload.threadId,
+                turnId,
+                status: "resolved",
+                decision: null,
+                createdAt: event.payload.activity.createdAt,
+                resolvedAt: event.payload.activity.createdAt,
+              });
+            }
+            return;
+          }
+          if (
+            event.payload.activity.kind === "approval.resolved" ||
+            event.payload.activity.kind === "approval.abandoned"
+          ) {
             const resolvedDecisionRaw =
-              typeof event.payload.activity.payload === "object" &&
-              event.payload.activity.payload !== null &&
-              "decision" in event.payload.activity.payload
-                ? (event.payload.activity.payload as { decision?: unknown }).decision
-                : null;
+              event.payload.activity.kind === "approval.abandoned"
+                ? null
+                : typeof event.payload.activity.payload === "object" &&
+                    event.payload.activity.payload !== null &&
+                    "decision" in event.payload.activity.payload
+                  ? (event.payload.activity.payload as { decision?: unknown }).decision
+                  : null;
             const resolvedDecision =
               resolvedDecisionRaw === "accept" ||
               resolvedDecisionRaw === "acceptForSession" ||
@@ -1835,6 +1916,14 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             return;
           }
           if (event.payload.activity.kind === "provider.approval.respond.failed") {
+            // No decision was sent for lifecycle abandonment (or a stale
+            // request). A late provider failure cannot reopen that row.
+            if (
+              Option.isSome(existingRow) &&
+              existingRow.value.status === "resolved" &&
+              existingRow.value.decision === null
+            )
+              return;
             const payload =
               typeof event.payload.activity.payload === "object" &&
               event.payload.activity.payload !== null

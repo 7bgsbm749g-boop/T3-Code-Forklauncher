@@ -1,4 +1,5 @@
 import {
+  type OrchestrationEvent,
   ApprovalRequestId,
   CheckpointRef,
   CommandId,
@@ -4870,3 +4871,135 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
     }),
   );
 });
+
+it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-approval-abandonment-")))(
+  "approval lifecycle",
+  (it) => {
+    it.effect(
+      "closes abandoned commands, preserves newer approvals, and replays without resurrection",
+      () =>
+        Effect.gen(function* () {
+          const pipeline = yield* OrchestrationProjectionPipeline;
+          const store = yield* OrchestrationEventStore;
+          const sql = yield* SqlClient.SqlClient;
+          const threadId = ThreadId.make("approval-lifecycle-thread"),
+            projectId = ProjectId.make("approval-lifecycle-project");
+          const t0 = "2026-10-03T12:00:00.000Z",
+            t1 = "2026-10-03T12:00:01.000Z",
+            stopAt = "2026-10-03T12:00:02.000Z",
+            later = "2026-10-03T12:00:03.000Z";
+          let counter = 0;
+          const emit = <T extends OrchestrationEvent["type"]>(
+            type: T,
+            payload: Extract<OrchestrationEvent, { type: T }>["payload"],
+            occurredAt = t0,
+          ) => {
+            const input = {
+              type,
+              payload,
+              eventId: EventId.make(`lifecycle-${++counter}`),
+              aggregateKind: type === "project.created" ? "project" : "thread",
+              aggregateId: type === "project.created" ? projectId : threadId,
+              occurredAt,
+              commandId: CommandId.make(`lifecycle-command-${counter}`),
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+            } as Parameters<typeof store.append>[0];
+            return store
+              .append(input)
+              .pipe(Effect.flatMap((event) => pipeline.projectEvent(event)));
+          };
+          const request = (
+            requestId: string,
+            turnId: string | null,
+            createdAt: string,
+            kind = "approval.requested",
+          ) =>
+            emit(
+              "thread.activity-appended",
+              {
+                threadId,
+                activity: {
+                  id: EventId.make(`${kind}-${requestId}-${counter}`),
+                  tone: "approval",
+                  kind,
+                  summary: kind,
+                  payload: {
+                    requestId,
+                    requestKind: "command",
+                    detail: "No active provider session is bound to this thread.",
+                  },
+                  turnId: turnId === null ? null : TurnId.make(turnId),
+                  createdAt,
+                },
+              },
+              createdAt,
+            );
+          yield* emit("project.created", {
+            projectId,
+            title: "Lifecycle",
+            workspaceRoot: "/tmp/lifecycle",
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: t0,
+            updatedAt: t0,
+          });
+          yield* emit("thread.created", {
+            threadId,
+            projectId,
+            title: "Lifecycle",
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: t0,
+            updatedAt: t0,
+          });
+          yield* request("old-command", null, t1);
+          // A delayed stop must not consume a request belonging to a later turn.
+          yield* request("new-command", "new-turn", later);
+          yield* emit("thread.session-stop-requested", { threadId, createdAt: stopAt }, stopAt);
+          yield* request("old-command", null, later, "provider.approval.respond.failed");
+          yield* request("old-command", null, later);
+          yield* request("interrupt-command", "interrupted-turn", later);
+          yield* emit(
+            "thread.turn-interrupt-requested",
+            { threadId, turnId: TurnId.make("interrupted-turn"), createdAt: later },
+            later,
+          );
+          yield* request(
+            "interrupt-command",
+            "interrupted-turn",
+            later,
+            "provider.approval.respond.failed",
+          );
+          yield* request("late-interrupted-command", "interrupted-turn", later);
+          yield* request("later-question", null, later, "user-input.requested");
+          const rows = () =>
+            sql<{
+              requestId: string;
+              status: string;
+              decision: string | null;
+            }>`SELECT request_id AS "requestId", status, decision FROM projection_pending_approvals WHERE thread_id = ${threadId} ORDER BY request_id`;
+          const expected = [
+            { requestId: "interrupt-command", status: "resolved", decision: null },
+            { requestId: "late-interrupted-command", status: "resolved", decision: null },
+            { requestId: "new-command", status: "pending", decision: null },
+            { requestId: "old-command", status: "resolved", decision: null },
+          ];
+          assert.deepEqual(yield* rows(), expected);
+          // Rebuild a disposable test database from the persisted real events.
+          yield* sql`DELETE FROM projection_state`;
+          yield* sql`DELETE FROM projection_pending_approvals WHERE thread_id = ${threadId}`;
+          yield* pipeline.bootstrap;
+          assert.deepEqual(yield* rows(), expected);
+          const summaries = yield* sql<{
+            count: number;
+          }>`SELECT pending_approval_count AS count FROM projection_threads WHERE thread_id = ${threadId}`;
+          assert.deepEqual(summaries, [{ count: 1 }]);
+        }),
+    );
+  },
+);

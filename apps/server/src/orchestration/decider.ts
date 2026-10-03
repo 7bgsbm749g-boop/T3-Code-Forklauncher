@@ -82,8 +82,12 @@ function isStaleRequestFailureDetail(payload: Record<string, unknown> | null): b
 // Scans the read model's activities, which the projector caps at the most
 // recent 500 plus pending async questions. Async questions remain actionable
 // while the agent works, so they must not expire with the activity window.
-function openRequests(thread: Pick<OrchestrationThread, "activities">) {
+function openRequests(
+  thread: Pick<OrchestrationThread, "activities" | "session" | "latestTurn">,
+  filterAbandoned = true,
+) {
   const requests = new Map<string, OrchestrationThreadActivity>();
+  const closedApprovals = new Set<string>();
   for (const activity of thread.activities) {
     const payload =
       typeof activity.payload === "object" && activity.payload !== null
@@ -92,8 +96,15 @@ function openRequests(thread: Pick<OrchestrationThread, "activities">) {
     const requestId = typeof payload?.requestId === "string" ? payload.requestId : null;
     if (requestId === null) continue;
     if (activity.kind === "approval.requested" || activity.kind === "user-input.requested") {
+      if (activity.kind === "approval.requested" && closedApprovals.has(requestId)) continue;
       requests.set(requestId, activity);
-    } else if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") {
+    } else if (
+      activity.kind === "approval.resolved" ||
+      activity.kind === "approval.abandoned" ||
+      activity.kind === "user-input.resolved"
+    ) {
+      if (activity.kind === "approval.resolved" || activity.kind === "approval.abandoned")
+        closedApprovals.add(requestId);
       requests.delete(requestId);
     } else if (
       (activity.kind === "provider.approval.respond.failed" ||
@@ -103,8 +114,57 @@ function openRequests(thread: Pick<OrchestrationThread, "activities">) {
       requests.delete(requestId);
     }
   }
+  for (const [id, activity] of requests) {
+    if (!filterAbandoned || activity.kind !== "approval.requested") continue;
+    if (
+      (thread.session?.status === "stopped" && activity.createdAt <= thread.session.updatedAt) ||
+      (thread.latestTurn?.state === "interrupted" && activity.turnId === thread.latestTurn.turnId)
+    ) {
+      requests.delete(id);
+    }
+  }
   return requests;
 }
+
+// Abandonment records the real lifecycle action without sending a provider
+// decision. It remains terminal in clients even after a newer turn starts.
+const abandonApprovals = Effect.fn("abandonApprovals")(function* (
+  thread: OrchestrationThread,
+  command: Pick<OrchestrationCommand, "commandId">,
+  createdAt: string,
+  reason: "interrupt" | "session-stop",
+  turnId?: OrchestrationThreadActivity["turnId"],
+) {
+  const events: Array<Omit<OrchestrationEvent, "sequence">> = [];
+  for (const [requestId, activity] of openRequests(thread, false)) {
+    if (activity.kind !== "approval.requested" || activity.createdAt > createdAt) continue;
+    if (reason === "interrupt" && (turnId == null || activity.turnId !== turnId)) continue;
+    const base = yield* withEventBase({
+      aggregateKind: "thread",
+      aggregateId: thread.id,
+      occurredAt: createdAt,
+      commandId: command.commandId,
+      metadata: { requestId },
+    });
+    events.push({
+      ...base,
+      type: "thread.activity-appended",
+      payload: {
+        threadId: thread.id,
+        activity: {
+          id: base.eventId,
+          tone: "info",
+          kind: "approval.abandoned",
+          summary: "Command approval abandoned",
+          payload: { requestId, reason },
+          turnId: activity.turnId,
+          createdAt,
+        },
+      },
+    });
+  }
+  return events;
+});
 
 /** Apply the shared shell-level rule to the detailed command read model. */
 function hasQueuedTurnStartForThread(
@@ -1566,12 +1626,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.turn.interrupt": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
-      return {
+      const event: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
@@ -1585,6 +1645,16 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           createdAt: command.createdAt,
         },
       };
+      return [
+        event,
+        ...(yield* abandonApprovals(
+          thread,
+          command,
+          command.createdAt,
+          "interrupt",
+          command.turnId ?? thread.session?.activeTurnId ?? thread.latestTurn?.turnId,
+        )),
+      ];
     }
 
     case "thread.approval.respond": {
@@ -1866,7 +1936,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           });
         }
       }
-      return {
+      const event: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
@@ -1879,6 +1949,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           createdAt: command.createdAt,
         },
       };
+      return [
+        event,
+        ...(yield* abandonApprovals(thread, command, command.createdAt, "session-stop")),
+      ];
     }
 
     case "thread.session.set": {
@@ -1913,6 +1987,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command.session.status === "starting" || command.session.status === "running";
       // Real activity resets ANY override (settled wakes, active unpins).
       if (thread.settledOverride === null || !isSessionActivity) {
+        if (command.session.status === "stopped") {
+          const abandoned = yield* abandonApprovals(
+            thread,
+            command,
+            command.session.updatedAt,
+            "session-stop",
+          );
+          if (abandoned.length) return [sessionSetEvent, ...abandoned];
+        }
         return sessionSetEvent;
       }
       const unsettledEvent: Omit<OrchestrationEvent, "sequence"> = {

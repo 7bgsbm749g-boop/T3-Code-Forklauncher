@@ -89,6 +89,7 @@ function parseQuestions(value: unknown): UserInputQuestion[] {
 const requestActivityKinds = new Set([
   "approval.requested",
   "approval.resolved",
+  "approval.abandoned",
   "provider.approval.respond.failed",
   "user-input.requested",
   "user-input.resolved",
@@ -172,6 +173,7 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
       });
     } else if (
       activity.kind === "approval.resolved" ||
+      activity.kind === "approval.abandoned" ||
       (activity.kind === "provider.approval.respond.failed" &&
         isStaleRequestFailure(activity.kind, payload))
     ) {

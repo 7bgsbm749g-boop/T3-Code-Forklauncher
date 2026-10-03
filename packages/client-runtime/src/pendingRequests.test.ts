@@ -514,3 +514,23 @@ describe.each(["approval", "user-input"])("%s request completion", (requestKind)
     });
   });
 });
+
+it("abandonment survives late failures, duplicate requests, and a newer active approval", () => {
+  const requested = makeActivity({ kind: "approval.requested", payload: { requestId: "old" } });
+  const abandoned = makeActivity({
+    kind: "approval.abandoned",
+    payload: { requestId: "old", reason: "session-stop" },
+  });
+  const failed = makeActivity({
+    kind: "provider.approval.respond.failed",
+    payload: { requestId: "old", detail: "No active provider session is bound to this thread." },
+  });
+  const current = makeActivity({ kind: "approval.requested", payload: { requestId: "new" } });
+  for (const activities of [
+    [requested, abandoned, failed, requested, current],
+    [abandoned, failed, requested, current],
+  ])
+    expect(derivePendingRequests(activities).approvals.map((request) => request.requestId)).toEqual(
+      ["new"],
+    );
+});

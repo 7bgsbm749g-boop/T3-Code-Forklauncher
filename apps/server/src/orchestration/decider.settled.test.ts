@@ -5,6 +5,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
   type OrchestrationEvent,
   type OrchestrationReadModel,
   type OrchestrationSession,
@@ -848,6 +849,92 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       expect(unconditionalEvents.map((event) => event.type)).toEqual([
         "thread.session-stop-requested",
       ]);
+    }),
+  );
+});
+
+it.layer(NodeServices.layer)("abandoned command approvals", (it) => {
+  it.effect(
+    "a stopped historical thread can clean commands through stop without resolving questions",
+    () =>
+      Effect.gen(function* () {
+        const activity = (
+          kind: string,
+          requestId: string,
+          turnId: string | null,
+        ): OrchestrationThread["activities"][number] => ({
+          id: EventId.make(requestId),
+          tone: "approval",
+          kind,
+          summary: kind,
+          payload: { requestId },
+          turnId: turnId ? TurnId.make(turnId) : null,
+          createdAt: SETTLED_AT,
+        });
+        const readModel = makeReadModel(null, NOW, makeSession("stopped"), [
+          activity("approval.requested", "old-command", "old-turn"),
+          activity("user-input.requested", "later-question", null),
+        ]);
+        const result = yield* decideOrchestrationCommand({
+          readModel,
+          command: {
+            type: "thread.session.stop",
+            commandId: CommandId.make("cleanup-historical-stop"),
+            threadId: ThreadId.make("thread-1"),
+            createdAt: NOW,
+          },
+        });
+        const events = Array.isArray(result) ? result : [result];
+        expect(events.map((event) => event.type)).toEqual([
+          "thread.session-stop-requested",
+          "thread.activity-appended",
+        ]);
+        expect(events[1]).toMatchObject({
+          payload: {
+            activity: {
+              kind: "approval.abandoned",
+              payload: { requestId: "old-command", reason: "session-stop" },
+            },
+          },
+        });
+        expect(events.some((event) => event.type === "thread.approval-response-requested")).toBe(
+          false,
+        );
+      }),
+  );
+  it.effect("interrupt abandons its own turn without disturbing a newer turn", () =>
+    Effect.gen(function* () {
+      const activity = (
+        requestId: string,
+        turnId: string,
+      ): OrchestrationThread["activities"][number] => ({
+        id: EventId.make(requestId),
+        tone: "approval",
+        kind: "approval.requested",
+        summary: "approval",
+        payload: { requestId },
+        turnId: TurnId.make(turnId),
+        createdAt: SETTLED_AT,
+      });
+      const result = yield* decideOrchestrationCommand({
+        readModel: makeReadModel(null, null, makeSession("running"), [
+          activity("old", "old-turn"),
+          activity("new", "new-turn"),
+        ]),
+        command: {
+          type: "thread.turn.interrupt",
+          commandId: CommandId.make("interrupt-old-turn"),
+          threadId: ThreadId.make("thread-1"),
+          turnId: TurnId.make("old-turn"),
+          createdAt: NOW,
+        },
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(
+        events
+          .filter((event) => event.type === "thread.activity-appended")
+          .map((event) => event.payload.activity.payload),
+      ).toEqual([{ requestId: "old", reason: "interrupt" }]);
     }),
   );
 });
