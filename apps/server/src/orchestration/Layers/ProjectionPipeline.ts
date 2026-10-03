@@ -148,6 +148,7 @@ function shouldRefreshThreadShellSummary(event: OrchestrationEvent): boolean {
   switch (event.payload.activity.kind) {
     case "approval.requested":
     case "approval.resolved":
+    case "approval.abandoned":
     case "provider.approval.respond.failed":
     case "user-input.requested":
     case "user-input.resolved":
@@ -1037,7 +1038,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         case "thread.proposed-plan-upserted":
         case "thread.activity-appended":
         case "thread.approval-response-requested":
-        case "thread.user-input-response-requested": {
+        case "thread.user-input-response-requested":
+        // The pending-approval projector runs first and closes abandoned rows.
+        // Refresh the cached badge in the same transaction as those changes.
+        case "thread.turn-interrupt-requested":
+        case "thread.session-stop-requested": {
           const existingRow = yield* projectionThreadRepository.getById({
             threadId: event.payload.threadId,
           });
